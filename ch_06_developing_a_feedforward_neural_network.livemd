@@ -1,0 +1,1801 @@
+# Chapter 6. Developing a Feedforward Neural Network
+
+```elixir
+Mix.install([
+  {:nx, "1.0.0"},
+  {:kino, "0.19.1"},
+  {:kino_vega_lite, "0.1.13"}
+])
+
+# Reference configuration: CPU, f64, no native backend required.
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+alias VegaLite, as: Vl
+```
+
+## Reader's guide
+
+**Neuroevolution through Elixir**  
+Part II - Neuroevolution: Taking the First Step
+
+**One genotype. Three executable phenotypes.** First preserve Sher's process
+architecture, then express the same computation in Nx, then put the tensor network
+inside a supervised actor. Compare the results before comparing the costs.
+
+This notebook remasters Gene I. Sher's Chapter 6, printed pp. 153-185, from the
+supplied PDF. Its first PDF page is the introduction to Part II; PDF page 2 is
+printed p. 153. References marked **[S]** refer to that source. Sections **6.1-6.7**
+retain its progression. The tensor and hybrid implementations, safety checks,
+comparison experiments, and GES commentary are **remaster additions**.
+
+The source builds a **static**, fully connected, layered network with one sensor
+and one actuator. We keep that scope. There is no training, topology mutation,
+fitness selection, or claim of intelligence in this chapter. Those come later.
+
+### The three passes
+
+| Pass               | What represents the phenotype?                            | What stays the same?                                   |
+| ------------------ | --------------------------------------------------------- | ------------------------------------------------------ |
+| Thesis: actor      | A sensor, a process per neuron, an actuator, and a cortex | Ordered inputs, weights, biases, tanh, outputs         |
+| Antithesis: tensor | A tuple of weight/bias tensors and an Nx numerical graph  | The same genotype and numerical mapping                |
+| Synthesis: hybrid  | One supervised network actor containing that tensor graph | The same tensor kernel; a different lifecycle boundary |
+
+The complete actor implementation comes first in 6.6A, followed by the complete
+Nx implementation in 6.6B and the hybrid in 6.6C. Earlier sections establish the
+neuron, interfaces, architecture, genotype, and constructor used by all three.
+
+### Run this notebook
+
+Evaluate the setup cell, then the remaining cells in order. No previous notebook
+is needed. Elixir 1.17 or later in the 1.x series is required by the pinned Nx
+release. Initial package installation needs network access or a prepared cache.
+The experiments themselves use no external data. [D1]
+
+Every **computed data table** has Interactive, Markdown, and CSV tabs. Explanatory
+tables remain ordinary Markdown. Every handwritten named function has an `@spec`;
+anonymous callbacks are covered by their enclosing API's types.
+
+The reference configuration uses `Nx.BinaryBackend` and `Nx.Defn.Evaluator` with
+`f64` tensors. The hybrid worker sets these defaults in its own process too.
+The benchmark measures this configuration, not GPU acceleration. Changing
+backends requires updating both the setup and `Chapter06.Hybrid.init/1`.
+
+All network examples close their owned processes in `after` blocks. They use no
+globally registered neuron or cortex names. A deliberate worker-failure test may
+produce an OTP diagnostic. It is separate from normal inference.
+
+**Validation status:** independent Python/NumPy reference checks covered the source
+neuron result, matrix packing, scalar/dense parity, shuffled signal delivery,
+and parameter round-trips. Static notebook checks were also performed. These
+reference models are not an execution of the Elixir code. Elixir/BEAM and
+Livebook are unavailable there: the Elixir cells, OTP behavior, and rendered Kino
+widgets have **not** been executed here. The notebook's own checks and benchmark
+produce actual results in your runtime; no timing results are invented.
+
+### Chapter map
+
+| Section | Main question                                  | Deliverable                                             |
+| ------- | ---------------------------------------------- | ------------------------------------------------------- |
+| 6.1     | How does one neuron process a vector?          | Scalar arithmetic and a neuron process                  |
+| 6.2     | What turns that neuron into a system?          | Sensor, neuron, actuator, cortex protocol               |
+| 6.3     | What must all implementations preserve?        | Ordered signals and a cycle boundary                    |
+| 6.4     | What information must survive shutdown?        | A portable, validated genotype                          |
+| 6.5     | How do high-level dimensions become a network? | Constructor and checkpoint codec                        |
+| 6.6     | How does stored data become executable?        | Actor, tensor, hybrid; parity and lifecycle experiments |
+| 6.7     | What have we established?                      | Checks, interpretation, and the bridge to Chapter 7     |
+
+### Notebook utilities
+
+These helpers handle presentation, assertions, scalar arithmetic, and the source's
+`rng` sensor / `pts` actuator. A CSV download callback returns a **binary**, not a
+list of row maps. The table helper does not transform ordinary Markdown tables.
+[D4, D5]
+
+````elixir
+defmodule Chapter06.Tables do
+  @moduledoc false
+  @type column :: atom() | String.t()
+
+  @spec tabs([map()], [column()], String.t()) :: term()
+  def tabs(rows, columns, filename) do
+    text_csv = csv(rows, columns)
+
+    Kino.Layout.tabs([
+      {"Interactive", Kino.DataTable.new(rows, keys: columns)},
+      {"Markdown", Kino.Markdown.new(markdown(rows, columns))},
+      {"CSV", Kino.Layout.grid([
+        Kino.Markdown.new("```csv\n" <> text_csv <> "\n```"),
+        Kino.Download.new(fn -> text_csv end, filename: filename, label: "Download CSV")
+      ])}
+    ])
+  end
+
+  @spec csv([map()], [column()]) :: String.t()
+  def csv(rows, columns) do
+    records = [columns | Enum.map(rows, fn row -> Enum.map(columns, &Map.fetch!(row, &1)) end)]
+    Enum.map_join(records, "\r\n", fn record ->
+      Enum.map_join(record, ",", fn value ->
+        "\"" <> String.replace(text(value), "\"", "\"\"") <> "\""
+      end)
+    end) <> "\r\n"
+  end
+
+  @spec markdown([map()], [column()]) :: String.t()
+  def markdown(rows, columns) do
+    records = [columns, List.duplicate("---", length(columns)) |
+      Enum.map(rows, fn row -> Enum.map(columns, &Map.fetch!(row, &1)) end)]
+
+    Enum.map_join(records, "\n", fn record ->
+      "| " <> Enum.map_join(record, " | ", &escape/1) <> " |"
+    end)
+  end
+
+  @spec text(term()) :: String.t()
+  defp text(value) when is_binary(value), do: value
+  defp text(value) when is_atom(value) or is_number(value), do: to_string(value)
+  defp text(value), do: inspect(value, limit: :infinity, printable_limit: :infinity)
+
+  @spec escape(term()) :: String.t()
+  defp escape(value) do
+    value |> text() |> String.replace("\\", "\\\\") |> String.replace("|", "\\|")
+    |> String.replace("\r\n", "<br>") |> String.replace("\n", "<br>")
+  end
+end
+
+defmodule Chapter06.Support do
+  @moduledoc false
+
+  @spec check!(boolean(), String.t()) :: map()
+  def check!(true, label), do: %{check: label, result: "PASS"}
+  def check!(false, label), do: raise("Check failed: #{label}")
+
+  @spec max_error(Nx.Tensor.t(), Nx.Tensor.t()) :: number()
+  def max_error(a, b) do
+    unless Nx.shape(a) == Nx.shape(b), do: raise(ArgumentError, "shape mismatch")
+    a |> Nx.subtract(b) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+  end
+
+  @spec close?(Nx.Tensor.t(), Nx.Tensor.t(), float()) :: boolean()
+  def close?(a, b, tolerance) do
+    Nx.shape(a) == Nx.shape(b) and
+      (a |> Nx.subtract(b) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()) <= tolerance
+  end
+
+  @spec raises_argument?((-> term())) :: boolean()
+  def raises_argument?(fun) do
+    try do
+      fun.()
+      false
+    rescue
+      ArgumentError -> true
+    end
+  end
+end
+
+defmodule Chapter06.Math do
+  @moduledoc "Scalar arithmetic used by the actor baseline; no Nx calls."
+
+  @spec vector!([number()], pos_integer()) :: [number()]
+  def vector!(values, width) do
+    unless is_list(values) and length(values) == width and Enum.all?(values, &is_number/1) do
+      raise ArgumentError, "expected a numerical vector of length #{width}"
+    end
+    values
+  end
+
+  @spec dot([number()], [number()]) :: number()
+  def dot(x, weights) do
+    vector!(x, length(weights))
+    Enum.zip(x, weights) |> Enum.reduce(0.0, fn {a, b}, sum -> sum + a * b end)
+  end
+
+  @spec neuron([number()], [number()], number()) :: float()
+  def neuron(x, weights, bias), do: :math.tanh(dot(x, weights) + bias)
+end
+
+defmodule Chapter06.Interface do
+  @moduledoc "A reproducible rng sensor and a print-to-screen actuator."
+
+  @spec rng(pos_integer(), :rand.state()) :: {[float()], :rand.state()}
+  def rng(width, state) when is_integer(width) and width > 0 do
+    Enum.map_reduce(1..width, state, fn _, key -> :rand.uniform_s(key) end)
+  end
+
+  @spec tape(non_neg_integer(), pos_integer(), :rand.state()) :: {[[float()]], :rand.state()}
+  def tape(count, width, state) when is_integer(count) and count >= 0 do
+    Enum.map_reduce(List.duplicate(nil, count), state, fn _, key -> rng(width, key) end)
+  end
+
+  @spec pts([number()]) :: :ok
+  def pts(values) do
+    IO.inspect(values, label: "Actuator pts")
+    :ok
+  end
+end
+````
+
+## 6.1 Simulating a Neuron
+
+*Source: [S], pp. 155-158; Fig. 6.2 and `simple_neuron.erl`.*
+
+A neuron combines an input vector with its weights, adds a bias, and applies an
+activation function. Here that function is tanh:
+
+$$
+y=\tanh\!\left(\sum_{i=1}^{d}w_i x_i+b\right).
+$$
+
+Appending a constant input of 1 and an extra weight of $b$ produces the same
+calculation. A bias of zero removes the bias's effect. Sher's interface packages
+one neuron's output as a one-element vector, $[y]$; we preserve that convention.
+
+**Terminology note:** the source calls tanh an approximation of a sigmoid. This
+remaster uses **tanh**, exactly as the code does, rather than silently replacing
+it with the logistic function.
+
+### Thesis: a neuron owns its weights
+
+`SimpleNeuron` replaces the registered `neuron` process with an explicitly passed
+PID. `GenServer.call/3` provides a correlated request/reply operation with a timeout.
+The callback performs ordinary Elixir arithmetic and retains its parameters.
+This is a scalar actor baseline, not an Nx implementation. [D2]
+
+```elixir
+defmodule Chapter06.SimpleNeuron do
+  use GenServer, restart: :temporary
+  @moduledoc "The first thesis: one process owns one neuron's parameters."
+
+  @spec start_link({[number()], number()}) :: GenServer.on_start()
+  def start_link({weights, bias}), do: GenServer.start_link(__MODULE__, {weights, bias})
+
+  @spec sense(pid(), [number()]) :: [float()]
+  def sense(pid, input), do: GenServer.call(pid, {:sense, input}, 5_000)
+
+  @impl true
+  @spec init({[number()], number()}) :: {:ok, {[number()], number()}}
+  def init({weights, bias}) do
+    Chapter06.Math.vector!(weights, length(weights))
+    unless weights != [] and is_number(bias), do: raise(ArgumentError, "invalid neuron parameters")
+    {:ok, {weights, bias}}
+  end
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), {[number()], number()}) :: tuple()
+  def handle_call({:sense, input}, _from, {weights, bias} = state) do
+    {:reply, [Chapter06.Math.neuron(input, weights, bias)], state}
+  end
+end
+
+# Printed example on p. 157, not a newly randomized neuron.
+weights_single = [0.44581636451986995, 0.0014907142064750634]
+bias_single = -0.18867324519560702
+
+result_single =
+  with {:ok, pid} <- Chapter06.SimpleNeuron.start_link({weights_single, bias_single}) do
+    try do
+      [output] = Chapter06.SimpleNeuron.sense(pid, [1.0, 2.0])
+      %{input: "[1, 2]", output: output,
+        scalar: Chapter06.Math.neuron([1.0, 2.0], weights_single, bias_single)}
+    after
+      GenServer.stop(pid)
+    end
+  end
+
+Chapter06.Tables.tabs([result_single], [:input, :output, :scalar], "ch_06_tbl_01_single_neuron.csv")
+```
+
+The source's printed example produces approximately **0.2544120226**. Repeated
+calls with the same input give the same output because neither the weights nor
+any recurrent state changes. The `after` block terminates this example's process.
+
+The general network below checks input dimensions before starting an evaluation.
+This small introductory server assumes valid messages; an invalid callback input
+can terminate it. Its job is to expose the neuron computation, not yet to provide
+a fault-tolerant service.
+
+## 6.2 A One-Neuron Neural Network
+
+*Source: [S], pp. 158-161; Fig. 6.3 and `simplest_nn.erl`.*
+
+A neuron alone has neither a source of observations nor an interpretation of its
+output. Sher adds three roles:
+
+| Role     | Responsibility                                      | What it does not do here        |
+| -------- | --------------------------------------------------- | ------------------------------- |
+| Sensor   | Obtain a vector and fan it out                      | Learn parameters                |
+| Neuron   | Match incoming signals to weights and produce $[y]$ | Know what the environment means |
+| Actuator | Gather outputs in a specified order and act         | Judge fitness                   |
+| Cortex   | Start a cycle and wait for its completion           | Optimize the network            |
+
+```mermaid
+sequenceDiagram
+    participant U as Caller
+    participant C as Cortex
+    participant S as Sensor
+    participant N as Neuron
+    participant A as Actuator
+    U->>C: Step(input)
+    C->>S: Sync(epoch, step, input)
+    S->>N: Forward(epoch, step, vector)
+    N->>A: Forward(epoch, step, [output])
+    A->>C: Acted(epoch, step, output)
+    C->>U: Completed output
+```
+
+*Figure R6.1 - The one-neuron cycle. The four source roles are preserved; epoch
+and step identifiers are remaster additions.*
+
+Sher's `rng` sensor generates random values, while `pts` prints the result. For a
+controlled comparison, generate the random input sequence **once** and replay it
+to every implementation. That is equivalent for this open-loop random sensor;
+it is not a general replacement for an environment whose next observation depends
+on the preceding action.
+
+The generalized actor mapper in 6.6A executes this one-neuron topology too.
+Rather than maintain a second, almost identical four-process implementation,
+we reuse it with the four-record fixture defined in 6.4.
+
+```elixir
+{tape_demo, sensor_rng_after} =
+  Chapter06.Interface.tape(6, 2, :rand.seed_s(:exsss, {6, 62, 620}))
+
+tbl_inputs = Enum.with_index(tape_demo, 1) |> Enum.map(fn {[x1, x2], step} ->
+  %{step: step, x1: x1, x2: x2}
+end)
+Chapter06.Tables.tabs(tbl_inputs, [:step, :x1, :x2], "ch_06_tbl_02_sensor_tape.csv")
+```
+
+The sensor RNG is explicit state: `tape/3` returns both the observations and the
+updated state. Reusing the old state deliberately repeats the sequence. This
+avoids coupling the experiment to the notebook process's implicit random state.
+
+## 6.3 Planning Our Neural Network System's Architecture
+
+*Source: [S], pp. 162-166; Figs. 6.4-6.6.*
+
+A feedforward network has no recurrent edges. Each neuron waits for all required
+incoming vectors. An actuator assembles its result in **fanin order**, not message
+arrival order. The cortex opens the next cycle only after the current actuator
+has finished. Sher also mentions pipelining; this chapter deliberately uses the
+simpler one-cycle-at-a-time protocol.
+
+### One contract for three implementations
+
+For neuron $j$, whose ordered incoming links carry vectors $x^{(k)}$:
+
+$$
+z_j=b_j+\sum_k\langle w_j^{(k)},x^{(k)}\rangle,
+\qquad y_j=\tanh(z_j).
+$$
+
+For a batch of independent observations and a fully connected layer:
+
+$$
+H_{\ell+1}=\tanh(H_\ell W_\ell+b_\ell),
+\qquad H_0=X.
+$$
+
+We store **one column per neuron** in $W_\ell$. Its shape is
+$\{d_\ell,d_{\ell+1}\}$; the bias shape is $\{d_{\ell+1}\}$.
+
+| Invariant            | Actor interpretation                    | Tensor interpretation                     |
+| -------------------- | --------------------------------------- | ----------------------------------------- |
+| Input ordering       | Ordered sender/weight pairs             | Ordered rows of the weight matrix         |
+| Output ordering      | Actuator `fanin_ids`                    | Ordered columns of the final layer        |
+| Bias                 | Added once after all link contributions | Added once per layer output               |
+| Timing               | One completed sense-think-act cycle     | One independent row's forward computation |
+| Parameters           | Fixed process-owned values              | Fixed parameter tensors                   |
+| Numerical comparison | Scalar floating-point arithmetic        | `f64`, checked within tolerance           |
+
+A neural connection is a **signal route**, not an OTP process link. Likewise,
+the cortex's synchronization role is distinct from the supervisor's ownership
+and shutdown role. In this remaster, OTP supervision supplies lifecycle
+management; it does not silently replace a crashed neuron with a new PID inside
+an already wired graph.
+
+## 6.4 Developing a Genotype Representation
+
+*Source: [S], pp. 166-168; the four records and Fig. 6.7.*
+
+The genotype stores stable IDs and parameters. The phenotype adds runtime
+resources. PIDs must never become hereditary identifiers or checkpoint data.
+We replace Erlang records with Elixir maps while retaining the source's fields:
+
+| Kind     | Preserved fields                                | Interpretation                                         |
+| -------- | ----------------------------------------------- | ------------------------------------------------------ |
+| Sensor   | `id`, `cx_id`, `name`, `vl`, `fanout_ids`       | Source interface and its outgoing routes               |
+| Actuator | `id`, `cx_id`, `name`, `vl`, `fanin_ids`        | Destination interface and ordered incoming routes      |
+| Neuron   | `id`, `cx_id`, `af`, `input_idps`, `output_ids` | Activation, incoming weighted vectors, outgoing routes |
+| Cortex   | `id`, `sensor_ids`, `actuator_ids`, `nids`      | The complete network's elements                        |
+
+Each map also has a `kind` field replacing the Erlang record tag.
+`input_idps` retains the form `[{source_id, weights}, ..., {:bias, value}]`.
+The actor mapper separates the bias from PID routes; the tensor mapper separates
+it from matrix entries. Neither version interprets `:bias` as an incoming sender.
+
+IDs are deterministic and **local to a genotype**. For example,
+`{:neuron, {2, 3}}` identifies neuron 3 in layer 2. Two independent networks may
+reuse these IDs because each has its own ID-to-PID map. A future population-level
+store will additionally need a genome namespace.
+
+### Validate before mapping
+
+The validator checks the exact scope constructed in this chapter: one sensor,
+one actuator, adjacent fully connected layers, contiguous IDs, canonical input
+ordering, correct vector lengths, and tanh neurons. It intentionally rejects
+arbitrary sparse, skip-connected, or recurrent graphs. Supporting them later
+requires changing both the validator and the execution plan, not just disabling
+checks.
+
+```elixir
+defmodule Chapter06.Genotype do
+  @moduledoc "One portable, PID-free genotype shared by all three implementations."
+  @type id :: {:sensor | :actuator | :cortex, pos_integer()} |
+              {:neuron, {pos_integer(), pos_integer()}}
+  @type input :: {id(), [number()]} | {:bias, number()}
+  @type record :: map()
+  @type t :: [record()]
+
+  @spec one(t(), atom()) :: record()
+  def one(genotype, kind) do
+    case Enum.filter(genotype, &(&1.kind == kind)) do
+      [record] -> record
+      _ -> raise ArgumentError, "expected exactly one #{kind} record"
+    end
+  end
+
+  @spec layers(t()) :: [[record()]]
+  def layers(genotype) do
+    genotype
+    |> Enum.filter(&(&1.kind == :neuron))
+    |> Enum.group_by(fn %{id: {:neuron, {layer, _}}} -> layer end)
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(fn {_layer, nodes} -> Enum.sort_by(nodes, & &1.id) end)
+  end
+
+  @spec links_and_bias(record()) :: {[{id(), [number()]}], number()}
+  def links_and_bias(node) do
+    {links, tail} = Enum.split_while(node.input_idps, fn {id, _} -> id != :bias end)
+    case tail do
+      [{:bias, bias}] when is_number(bias) -> {links, bias}
+      _ -> raise ArgumentError, "each neuron needs one final {:bias, value} entry"
+    end
+  end
+
+  @spec replace_inputs(t(), %{id() => [input()]}) :: t()
+  def replace_inputs(genotype, updates) do
+    Enum.map(genotype, fn
+      %{kind: :neuron} = n -> %{n | input_idps: Map.fetch!(updates, n.id)}
+      other -> other
+    end) |> validate!()
+  end
+
+  @spec validate!(t()) :: t()
+  def validate!(genotype) do
+    expect!(is_list(genotype) and genotype != [], "genotype must be a nonempty list")
+    expect!(Enum.all?(genotype, &is_map/1), "records must be maps")
+    expect!(Enum.all?(genotype, &(&1.kind in [:sensor, :actuator, :neuron, :cortex])), "unknown record kind")
+    ids = Enum.map(genotype, & &1.id)
+    expect!(length(ids) == length(Enum.uniq(ids)), "duplicate genotype IDs")
+    cx = one(genotype, :cortex)
+    sensor = one(genotype, :sensor)
+    actuator = one(genotype, :actuator)
+    expect!(match?({:cortex, n} when is_integer(n) and n > 0, cx.id), "invalid cortex ID")
+    expect!(match?({:sensor, n} when is_integer(n) and n > 0, sensor.id), "invalid sensor ID")
+    expect!(match?({:actuator, n} when is_integer(n) and n > 0, actuator.id), "invalid actuator ID")
+    expect!(sensor.name == :rng and actuator.name == :pts, "unsupported interface name")
+    expect!(is_integer(sensor.vl) and sensor.vl > 0, "invalid sensor width")
+    expect!(is_integer(actuator.vl) and actuator.vl > 0, "invalid actuator width")
+    expect!(cx.sensor_ids == [sensor.id] and cx.actuator_ids == [actuator.id], "cortex interface IDs disagree")
+    expect!(Enum.all?(Enum.reject(genotype, &(&1.kind == :cortex)), &(&1.cx_id == cx.id)), "cortex references disagree")
+
+    layers = layers(genotype)
+    expect!(layers != [], "at least one neural layer is required")
+    layer_ids = Enum.map(layers, fn layer -> Enum.map(layer, & &1.id) end)
+    expect!(cx.nids == List.flatten(layer_ids), "cortex neuron IDs are not in canonical layer order")
+    expect!(sensor.fanout_ids == hd(layer_ids), "sensor fan-out disagrees with first layer")
+    expect!(actuator.fanin_ids == List.last(layer_ids), "actuator fan-in order disagrees")
+    expect!(length(actuator.fanin_ids) == actuator.vl, "actuator width disagrees with output layer")
+
+    Enum.with_index(layers, 1) |> Enum.each(fn {nodes, layer} ->
+      expected_ids = Enum.map(1..length(nodes), &{:neuron, {layer, &1}})
+      expect!(Enum.map(nodes, & &1.id) == expected_ids, "layer IDs must be contiguous and ordered")
+      inputs = if layer == 1, do: [{sensor.id, sensor.vl}],
+        else: Enum.map(Enum.at(layer_ids, layer - 2), &{&1, 1})
+      outputs = if layer == length(layers), do: [actuator.id], else: Enum.at(layer_ids, layer)
+
+      Enum.each(nodes, fn node ->
+        {links, _bias} = links_and_bias(node)
+        expect!(node.af == :tanh, "this chapter supports only tanh")
+        expect!(node.output_ids == outputs, "neuron fan-out disagrees with next layer")
+        expect!(Enum.map(links, &elem(&1, 0)) == Enum.map(inputs, &elem(&1, 0)), "ordered fan-in mismatch")
+        Enum.zip(links, inputs) |> Enum.each(fn {{_id, weights}, {_source, width}} ->
+          Chapter06.Math.vector!(weights, width)
+        end)
+      end)
+    end)
+    genotype
+  end
+
+  @spec expect!(boolean(), String.t()) :: :ok
+  defp expect!(true, _message), do: :ok
+  defp expect!(false, message), do: raise(ArgumentError, message)
+end
+```
+
+### A four-record fixture
+
+This uses the weights from the source's single-neuron example. It is data only:
+creating the genotype starts no process and executes no neural computation.
+
+```elixir
+genotype_single = [
+  %{
+    kind: :cortex,
+    id: {:cortex, 1},
+    sensor_ids: [{:sensor, 1}],
+    actuator_ids: [{:actuator, 1}],
+    nids: [{:neuron, {1, 1}}]
+  },
+  %{
+    kind: :sensor,
+    id: {:sensor, 1},
+    cx_id: {:cortex, 1},
+    name: :rng,
+    vl: 2,
+    fanout_ids: [{:neuron, {1, 1}}]
+  },
+  %{
+    kind: :actuator,
+    id: {:actuator, 1},
+    cx_id: {:cortex, 1},
+    name: :pts,
+    vl: 1,
+    fanin_ids: [{:neuron, {1, 1}}]
+  },
+  %{
+    kind: :neuron,
+    id: {:neuron, {1, 1}},
+    cx_id: {:cortex, 1},
+    af: :tanh,
+    input_idps: [{{:sensor, 1}, weights_single}, {:bias, bias_single}],
+    output_ids: [{:actuator, 1}]
+  }
+]
+Chapter06.Genotype.validate!(genotype_single)
+```
+
+## 6.5 Programming the Genotype Constructor
+
+*Source: [S], pp. 168-174; Figs. 6.8-6.9 and `constructor.erl`.*
+
+The hidden-density list does **not** include the output layer. Append the
+actuator's vector length to obtain the complete list of neural layer densities:
+
+$$
+\text{densities}=\text{hidden densities}\mathbin{+\!+}[\text{actuator width}].
+$$
+
+Thus `construct(:rng, :pts, [1, 3], rng)` uses the source's two-value sensor and
+one-value actuator, producing **2 inputs -> 1 -> 3 -> 1 neurons**. An empty hidden
+list produces a single output layer, not an empty network. The generalized
+`new/4` additionally accepts explicit input and output widths for parity tests.
+
+The constructor generates all layer IDs first, then uses them to build incoming
+and outgoing references. All weights and biases are drawn as `uniform - 0.5`,
+matching the source's initialization form. The random state is passed and returned
+explicitly; ID generation does not depend on wall-clock time.
+
+```elixir
+defmodule Chapter06.Constructor do
+  alias Chapter06.Genotype
+  @moduledoc "Fully connected adjacent layers; output density comes from actuator width."
+
+  @spec construct(:rng, :pts, [pos_integer()], :rand.state()) :: {Genotype.t(), :rand.state()}
+  def construct(:rng, :pts, hidden, state), do: new(2, hidden, 1, state)
+
+  @spec new(pos_integer(), [pos_integer()], pos_integer(), :rand.state()) :: {Genotype.t(), :rand.state()}
+  def new(input_width, hidden, output_width, state) do
+    unless is_integer(input_width) and input_width > 0 and
+      is_integer(output_width) and output_width > 0 and is_list(hidden) and
+      Enum.all?(hidden, &(is_integer(&1) and &1 > 0)) do
+      raise ArgumentError, "widths must be positive integers; hidden may be []"
+    end
+
+    layer_ids =
+      (hidden ++ [output_width])
+      |> Enum.with_index(1)
+      |> Enum.map(fn {width, layer} -> Enum.map(1..width, &{:neuron, {layer, &1}}) end)
+
+    cx_id = {:cortex, 1}
+    s_id = {:sensor, 1}
+    a_id = {:actuator, 1}
+
+    {layers, state} =
+      layer_ids |> Enum.with_index() |> Enum.map_reduce(state, fn {ids, index}, key ->
+        inputs = if index == 0, do: [{s_id, input_width}],
+          else: Enum.map(Enum.at(layer_ids, index - 1), &{&1, 1})
+        outputs = Enum.at(layer_ids, index + 1, [a_id])
+        Enum.map_reduce(ids, key, fn id, key ->
+          {input_idps, key} =
+            Enum.map_reduce(inputs, key, fn {source, width}, key ->
+              {weights, key} = weights(width, key)
+              {{source, weights}, key}
+            end)
+          {bias, key} = :rand.uniform_s(key)
+          node = %{kind: :neuron, id: id, cx_id: cx_id, af: :tanh,
+            input_idps: input_idps ++ [{:bias, bias - 0.5}], output_ids: outputs}
+          {node, key}
+        end)
+      end)
+
+    cortex = %{kind: :cortex, id: cx_id, sensor_ids: [s_id], actuator_ids: [a_id],
+      nids: List.flatten(layer_ids)}
+    sensor = %{kind: :sensor, id: s_id, cx_id: cx_id, name: :rng, vl: input_width,
+      fanout_ids: hd(layer_ids)}
+    actuator = %{kind: :actuator, id: a_id, cx_id: cx_id, name: :pts, vl: output_width,
+      fanin_ids: List.last(layer_ids)}
+    genotype = [cortex, sensor, actuator | List.flatten(layers)]
+    {Genotype.validate!(genotype), state}
+  end
+
+  @spec weights(pos_integer(), :rand.state()) :: {[float()], :rand.state()}
+  defp weights(width, state) do
+    Enum.map_reduce(1..width, state, fn _, key ->
+      {value, key} = :rand.uniform_s(key)
+      {value - 0.5, key}
+    end)
+  end
+end
+
+defmodule Chapter06.Checkpoint do
+  alias Chapter06.Genotype
+  @moduledoc "Versioned data snapshots, never executable Elixir source."
+
+  @spec encode(Genotype.t()) :: binary()
+  def encode(genotype), do: :erlang.term_to_binary({:chapter06, 1, Genotype.validate!(genotype)})
+
+  @spec decode(binary()) :: Genotype.t()
+  def decode(binary) do
+    case :erlang.binary_to_term(binary, [:safe]) do
+      {:chapter06, 1, genotype} -> Genotype.validate!(genotype)
+      _ -> raise ArgumentError, "unsupported Chapter 6 checkpoint"
+    end
+  end
+
+  @spec save!(Genotype.t(), String.t()) :: :ok
+  def save!(genotype, path), do: File.write!(path, encode(genotype))
+
+  @spec load!(String.t()) :: Genotype.t()
+  def load!(path), do: path |> File.read!() |> decode()
+end
+```
+
+```elixir
+constructor_rng = :rand.seed_s(:exsss, {6, 65, 650})
+{genotype_demo, constructor_rng_after} =
+  Chapter06.Constructor.construct(:rng, :pts, [1, 3], constructor_rng)
+
+tbl_genotype = Enum.map(genotype_demo, fn record ->
+  inputs = Map.get(record, :input_idps, Map.get(record, :fanin_ids, []))
+  outputs = Map.get(record, :output_ids, Map.get(record, :fanout_ids, Map.get(record, :nids, [])))
+  %{kind: record.kind, id: inspect(record.id),
+    incoming: inspect(inputs, limit: :infinity), outgoing: inspect(outputs, limit: :infinity)}
+end)
+Chapter06.Tables.tabs(tbl_genotype, [:kind, :id, :incoming, :outgoing], "ch_06_tbl_03_genotype.csv")
+```
+
+The example contains **5 neurons and 13 numerical parameters**, including biases.
+The sensor, actuator, and cortex add three records, not extra neurons.
+
+### Store the genotype, not the runtime
+
+Sher writes textual Erlang terms and reloads them with `file:consult/1`. Our
+checkpoint is a versioned Erlang external-term binary. The format changes are
+explicit: the encoded data is still the genotype, never executable source or
+PIDs. `save!/2` and `load!/1` support local files; the cell below only creates a
+notebook download.
+
+**Use checkpoints created by this notebook or another trusted source.**
+`binary_to_term(..., [:safe])` is not a complete hostile-file security boundary.
+Validation enforces our network constraints but is not a resource-exhaustion defense.
+
+```elixir
+checkpoint_demo = Chapter06.Checkpoint.encode(genotype_demo)
+genotype_reloaded = Chapter06.Checkpoint.decode(checkpoint_demo)
+true = genotype_reloaded == genotype_demo
+
+Kino.Download.new(fn -> checkpoint_demo end,
+  filename: "ch_06_genotype.etf", label: "Download the portable genotype")
+```
+
+## 6.6 Developing the Genotype-to-Phenotype Mapping Module
+
+*Source: [S], pp. 174-184; Fig. 6.10; `cortex`, `sensor`, `actuator`, `neuron`,
+and `exoself` modules.*
+
+Mapping changes the **execution representation**, not the network being tested.
+
+```mermaid
+flowchart TD
+    G[Validated genotype: IDs and parameters]
+    G --> A[Thesis: allocate and wire neuron actors]
+    G --> T[Antithesis: pack layer tensors]
+    G --> H[Synthesis: start a network actor with layer tensors]
+    A --> OA[Ordered outputs and parameter backup]
+    T --> OT[Ordered outputs and parameter backup]
+    H --> OH[Ordered outputs and parameter backup]
+    OA --> C[Compare under one numerical contract]
+    OT --> C
+    OH --> C
+```
+
+*Figure R6.2 - One inherited design, three phenotype mappings. Remaster addition.*
+
+### A. Thesis - preserve the actor architecture
+
+The mapper first starts every process, then replaces graph IDs with their PIDs.
+Only after all units are wired does it configure the cortex. That preserves the
+source's two-phase construction while avoiding initialization races.
+
+Messages carry an epoch identifying the network instance and a cycle number.
+A unit only accepts its expected cycle. Duplicate sender messages and foreign
+or stale messages are ignored. Valid input vectors are combined in the stored
+fanin order, even when messages arrive out of order. This is a trusted local
+protocol, not authentication of the PID written inside a message.
+
+| Remaster message                          | Source role                 | Meaning                                     |
+| ----------------------------------------- | --------------------------- | ------------------------------------------- |
+| `{:sync, epoch, step, cortex, input}`     | Cortex -> sensor            | Release this recorded observation           |
+| `{:forward, epoch, step, sender, vector}` | Sensor/neuron -> downstream | Deliver a signal for one cycle              |
+| `{:acted, epoch, step, actuator, output}` | Actuator -> cortex          | The ordered output is complete              |
+| `:snapshot` request                       | Cortex/exoself -> neurons   | Read current parameters at an idle boundary |
+
+The default actuator collects its ordered output instead of printing on every
+cycle. This is a notebook instrumentation choice: it preserves the numerical
+action vector and lets tests inspect it. `Interface.pts/1` remains available for
+the source's print-to-screen action. No physical actuator is connected.
+
+#### A1. Sensor, neuron, and actuator workers
+
+The three roles share their small lifecycle shell but have distinct completion
+rules. `Unit`'s neuron path contains **no Nx operation**. It retains the source's
+vector-valued neural messages and one-element neural outputs.
+
+```elixir
+defmodule Chapter06.Actor.Unit do
+  use GenServer, restart: :temporary
+  alias Chapter06.Math
+  @moduledoc "Sensor, neuron, or actuator. Neural signals are ordinary BEAM messages."
+
+  @spec start_link(map()) :: GenServer.on_start()
+  def start_link(record), do: GenServer.start_link(__MODULE__, record)
+
+  @spec wire(pid(), map()) :: :ok
+  def wire(pid, wiring), do: GenServer.call(pid, {:wire, wiring})
+
+  @spec snapshot(pid()) :: map()
+  def snapshot(pid), do: GenServer.call(pid, :snapshot)
+
+  @impl true
+  @spec init(map()) :: {:ok, map()}
+  def init(record) do
+    {
+      :ok,
+      %{
+        record: record,
+        cortex: nil,
+        epoch: nil,
+        next_step: 1,
+        inputs: [],
+        outputs: [],
+        bias: 0.0,
+        pending: %{},
+        emit: false,
+      }
+    }
+  end
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: tuple()
+  def handle_call({:wire, wiring}, _from, state) do
+    {:reply, :ok, Map.merge(state, wiring)}
+  end
+  def handle_call(:snapshot, _from, state) do
+    # These are runtime PID routes, not a copy of the original genotype.
+    {:reply, %{id: state.record.id, input_pidps: state.inputs, bias: state.bias}, state}
+  end
+
+  @impl true
+  @spec handle_info(term(), map()) :: {:noreply, map()}
+  def handle_info({:sync, epoch, step, cx, input},
+      %{epoch: epoch, next_step: step, cortex: cx, record: %{kind: :sensor}} = state) do
+    Math.vector!(input, state.record.vl)
+    fanout(state, step, input)
+    {:noreply, %{state | next_step: step + 1}}
+  end
+  def handle_info({:forward, epoch, step, source, input},
+      %{epoch: epoch, next_step: step, record: %{kind: kind}} = state)
+      when kind in [:neuron, :actuator] do
+    case List.keyfind(state.inputs, source, 0) do
+      nil -> {:noreply, state}
+      {_pid, weights} ->
+        # Duplicate, stale, and foreign-epoch messages cannot advance a cycle.
+        if Map.has_key?(state.pending, source) do
+          {:noreply, state}
+        else
+          Math.vector!(input, length(weights))
+          state = %{state | pending: Map.put(state.pending, source, input)}
+          if map_size(state.pending) == length(state.inputs) do
+            complete(state, step)
+            {:noreply, %{state | pending: %{}, next_step: step + 1}}
+          else
+            {:noreply, state}
+          end
+        end
+    end
+  end
+  def handle_info(_message, state), do: {:noreply, state}
+
+  @spec fanout(map(), pos_integer(), [number()]) :: :ok
+  defp fanout(state, step, output) do
+    Enum.each(state.outputs, &send(&1, {:forward, state.epoch, step, self(), output}))
+  end
+
+  @spec complete(map(), pos_integer()) :: :ok
+  defp complete(%{record: %{kind: :neuron}} = state, step) do
+    # Arrival order is irrelevant: accumulate in the genotype's input order.
+    sum = Enum.reduce(state.inputs, 0.0, fn {source, weights}, acc ->
+      acc + Math.dot(Map.fetch!(state.pending, source), weights)
+    end)
+    fanout(state, step, [:math.tanh(sum + state.bias)])
+  end
+  defp complete(%{record: %{kind: :actuator}} = state, step) do
+    output = Enum.flat_map(state.inputs, fn {source, _} -> Map.fetch!(state.pending, source) end)
+    Math.vector!(output, state.record.vl)
+    if state.emit, do: Chapter06.Interface.pts(output)
+    send(state.cortex, {:acted, state.epoch, step, self(), output})
+    :ok
+  end
+end
+```
+
+`pending` is a map indexed by sender PID. The map is only a receiving buffer;
+it does not determine numerical order. The ordered `inputs` list does that.
+Once complete, a unit clears its buffer and advances its expected cycle.
+
+#### A2. Cortex - close the current cycle before another begins
+
+The cortex replies to the caller only after the actuator acknowledges. It does
+not trigger a speculative next observation. Therefore, requesting zero cycles
+runs none, and requesting $N$ cycles completes exactly $N$.
+
+A failed worker or an expired cycle deadline halts this phenotype. Further calls
+return an operational error. They do not silently assign the network low fitness,
+and they do not reuse a partially completed cycle.
+
+```elixir
+defmodule Chapter06.Actor.Cortex do
+  use GenServer, restart: :temporary
+  @moduledoc "One in-flight cycle. The actuator acknowledgement closes that cycle."
+
+  @spec start_link(term()) :: GenServer.on_start()
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil)
+
+  @spec configure(pid(), map()) :: :ok
+  def configure(pid, config), do: GenServer.call(pid, {:configure, config})
+
+  @impl true
+  @spec init(nil) :: {:ok, map()}
+  def init(nil) do
+    {:ok, %{sensor: nil, actuator: nil, epoch: nil, width: nil,
+      monitors: %{}, completed: 0, pending: nil, halted: nil, timeout: 10_000}}
+  end
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: tuple()
+  def handle_call({:configure, config}, _from, state) do
+    monitors = Map.new(config.workers, fn pid -> {pid, Process.monitor(pid)} end)
+    state = Map.merge(state, Map.delete(config, :workers))
+    {:reply, :ok, %{state | monitors: monitors}}
+  end
+  def handle_call(:status, _from, state) do
+    {:reply, %{completed: state.completed, busy: state.pending != nil, halted: state.halted}, state}
+  end
+  def handle_call({:step, _input}, _from, %{halted: reason} = state) when reason != nil do
+    {:reply, {:error, reason}, state}
+  end
+  def handle_call({:step, _input}, _from, %{pending: pending} = state) when pending != nil do
+    {:reply, {:error, :busy}, state}
+  end
+  def handle_call({:step, input}, from, state) do
+    Chapter06.Math.vector!(input, state.width)
+    step = state.completed + 1
+    timer = Process.send_after(self(), {:deadline, state.epoch, step}, state.timeout)
+    send(state.sensor, {:sync, state.epoch, step, self(), input})
+    {:noreply, %{state | pending: %{from: from, step: step, timer: timer}}}
+  end
+
+  @impl true
+  @spec handle_info(term(), map()) :: {:noreply, map()}
+  def handle_info({:acted, epoch, step, actuator, output},
+      %{epoch: epoch, actuator: actuator, pending: %{step: step} = pending} = state) do
+    Process.cancel_timer(pending.timer)
+    GenServer.reply(pending.from, {:ok, output})
+    {:noreply, %{state | completed: step, pending: nil}}
+  end
+  def handle_info({:deadline, epoch, step},
+      %{epoch: epoch, pending: %{step: step}} = state) do
+    {:noreply, halt(state, {:cycle_timeout, step})}
+  end
+  def handle_info({:DOWN, ref, :process, pid, reason}, state) do
+    if Map.get(state.monitors, pid) == ref do
+      {:noreply, halt(state, {:worker_down, reason})}
+    else
+      {:noreply, state}
+    end
+  end
+  def handle_info(_message, state), do: {:noreply, state}
+
+  @spec halt(map(), term()) :: map()
+  defp halt(state, reason) do
+    if state.pending != nil do
+      Process.cancel_timer(state.pending.timer)
+      GenServer.reply(state.pending.from, {:error, reason})
+    end
+    %{state | pending: nil, halted: reason}
+  end
+end
+```
+
+#### A3. Exoself - map, run, back up, close
+
+`Actor.open/1` is our version of exoself's mapper. It builds both ID-to-PID and
+PID-to-ID maps. `backup/1` reads runtime weight routes and translates them back
+to persistent IDs, preserving the source's phenotype-to-genotype path.
+
+The supervisor owns all workers. Children are **temporary**: replacing a single
+neuron would otherwise leave neighboring actors with obsolete PIDs. In this
+chapter, recovery means closing and rebuilding the whole phenotype from a
+checkpoint. Automatic graph rewiring and recovery of in-flight work are not
+implemented. The caller must use the handle exclusively during backup. [D2, D3]
+
+```elixir
+defmodule Chapter06.Actor do
+  alias Chapter06.{Genotype, Math}
+  alias Chapter06.Actor.{Unit, Cortex}
+  @moduledoc "Exoself: spawn, wire, execute, back up, and close an actor phenotype."
+  @type handle :: %{supervisor: pid(), cortex: pid(), by_id: map(), by_pid: map(),
+                    genotype: Genotype.t(), epoch: reference(), width: pos_integer()}
+
+  @spec open(Genotype.t()) :: handle()
+  def open(genotype) do
+    Genotype.validate!(genotype)
+    {:ok, supervisor} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    try do
+      {:ok, cortex} = DynamicSupervisor.start_child(supervisor, {Cortex, nil})
+      cx = Genotype.one(genotype, :cortex)
+      units = Enum.reject(genotype, &(&1.kind == :cortex))
+      by_id = Enum.reduce(units, %{cx.id => cortex}, fn record, map ->
+        {:ok, pid} = DynamicSupervisor.start_child(supervisor, {Unit, record})
+        Map.put(map, record.id, pid)
+      end)
+      epoch = make_ref()
+      Enum.each(units, fn record ->
+        wiring = wiring(record, by_id, cortex, epoch)
+        :ok = Unit.wire(Map.fetch!(by_id, record.id), wiring)
+      end)
+      sensor = Genotype.one(genotype, :sensor)
+      actuator = Genotype.one(genotype, :actuator)
+      :ok = Cortex.configure(cortex, %{sensor: Map.fetch!(by_id, sensor.id),
+        actuator: Map.fetch!(by_id, actuator.id), epoch: epoch, width: sensor.vl,
+        workers: Enum.map(units, &Map.fetch!(by_id, &1.id))})
+      %{supervisor: supervisor, cortex: cortex, by_id: by_id,
+        by_pid: Map.new(by_id, fn {id, pid} -> {pid, id} end),
+        genotype: genotype, epoch: epoch, width: sensor.vl}
+    rescue
+      error ->
+        Supervisor.stop(supervisor)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  @spec wiring(map(), map(), pid(), reference()) :: map()
+  defp wiring(record, by_id, cortex, epoch) do
+    common = %{cortex: cortex, epoch: epoch}
+    case record.kind do
+      :sensor -> Map.merge(common, %{outputs: Enum.map(record.fanout_ids, &Map.fetch!(by_id, &1))})
+      :actuator -> Map.merge(common, %{inputs: Enum.map(record.fanin_ids, &{Map.fetch!(by_id, &1), [1.0]})})
+      :neuron ->
+        {links, bias} = Genotype.links_and_bias(record)
+        Map.merge(common, %{bias: bias,
+          inputs: Enum.map(links, fn {id, weights} -> {Map.fetch!(by_id, id), weights} end),
+          outputs: Enum.map(record.output_ids, &Map.fetch!(by_id, &1))})
+    end
+  end
+
+  @spec step(handle(), [number()]) :: {:ok, [float()]} | {:error, term()}
+  def step(handle, input) do
+    Math.vector!(input, handle.width)
+    GenServer.call(handle.cortex, {:step, input}, 11_000)
+  end
+
+  @spec run(handle(), [[number()]]) :: [[float()]]
+  def run(handle, tape) do
+    Enum.map(tape, fn input ->
+      case step(handle, input) do
+        {:ok, output} -> output
+        {:error, reason} -> raise "Actor evaluation aborted: #{inspect(reason)}"
+      end
+    end)
+  end
+
+  @spec status(handle()) :: map()
+  def status(handle), do: GenServer.call(handle.cortex, :status)
+
+  @spec backup(handle()) :: Genotype.t()
+  def backup(handle) do
+    state = status(handle)
+    unless not state.busy and state.halted == nil do
+      raise ArgumentError, "backup requires a healthy cycle boundary"
+    end
+    updates =
+      Genotype.one(handle.genotype, :cortex).nids
+      |> Map.new(fn id ->
+        snapshot = Unit.snapshot(Map.fetch!(handle.by_id, id))
+        links = Enum.map(snapshot.input_pidps, fn {pid, weights} ->
+          {Map.fetch!(handle.by_pid, pid), weights}
+        end)
+        {id, links ++ [{:bias, snapshot.bias}]}
+        end)
+    Genotype.replace_inputs(handle.genotype, updates)
+  end
+
+  @spec close(handle()) :: :ok
+  def close(handle) do
+    if Process.alive?(handle.supervisor), do: Supervisor.stop(handle.supervisor)
+    :ok
+  end
+
+  @spec using(Genotype.t(), (handle() -> term())) :: term()
+  def using(genotype, fun) do
+    handle = open(genotype)
+    try do
+      fun.(handle)
+    after
+      close(handle)
+    end
+  end
+end
+```
+
+#### A4. Run both source topologies
+
+The first run is the four-role, one-neuron system. The second is the constructed
+`[1, 3, 1]` network. Both are mapped from data; neither has learned anything.
+
+```elixir
+actor_single = Chapter06.Actor.using(genotype_single, fn mod_actor ->
+  {:ok, output} = Chapter06.Actor.step(mod_actor, [1.0, 2.0])
+  output
+end)
+
+actor_demo = Chapter06.Actor.using(genotype_demo, fn mod_actor ->
+  outputs = Chapter06.Actor.run(mod_actor, tape_demo)
+  %{outputs: outputs, backup: Chapter06.Actor.backup(mod_actor),
+    status: Chapter06.Actor.status(mod_actor)}
+end)
+
+tbl_actor = Enum.zip(tape_demo, actor_demo.outputs) |> Enum.with_index(1)
+  |> Enum.map(fn {{input, output}, step} ->
+    %{step: step, input: inspect(input), actor_output: inspect(output)}
+  end)
+Chapter06.Tables.tabs(tbl_actor, [:step, :input, :actor_output], "ch_06_tbl_04_actor_cycles.csv")
+```
+
+```elixir
+# Enable the source's print-to-screen actuator for one complete actor cycle.
+Chapter06.Actor.using(genotype_single, fn mod_actor ->
+  actuator_id = Chapter06.Genotype.one(genotype_single, :actuator).id
+  :ok = Chapter06.Actor.Unit.wire(Map.fetch!(mod_actor.by_id, actuator_id), %{emit: true})
+  {:ok, _output} = Chapter06.Actor.step(mod_actor, [1.0, 2.0])
+  :ok
+end)
+```
+
+The backup equals the starting genotype because this chapter never changes
+weights. That equality is a checkpoint test, **not a learning result**.
+
+### B. Antithesis - replace neuron actors with tensors
+
+The same genotype can be packed into a tuple of layer parameter pairs:
+
+$$
+\Theta=((W_1,b_1),\ldots,(W_L,b_L)).
+$$
+
+`compile/1` below means **pack a phenotype representation**. It is not an XLA
+compilation claim. `forward/2` is an Nx numerical definition. Its transform
+unrolls the fixed tuple of layers while building the numerical graph; inference
+then consists of tensor operations, not one host-side function call per neuron.
+[D6]
+
+"Pure tensor" refers to neural execution: there are no application neuron,
+sensor, or cortex actors. Ordinary Elixir still loads data and constructs the
+parameter tuple, and Livebook still has its own processes.
+
+Because this chapter has fixed weights and an open-loop input tape, all rows can
+be evaluated together. That batching would need reconsideration for recurrent
+state, online plasticity, or observations affected by previous actions.
+
+```elixir
+defmodule Chapter06.Tensor do
+  import Nx.Defn
+  alias Chapter06.Genotype
+  @moduledoc "The antithesis: tensor parameters and a numerical graph, without application actors."
+  @type params :: tuple()
+
+  @spec compile(Genotype.t()) :: params()
+  def compile(genotype) do
+    Genotype.validate!(genotype)
+    genotype |> Genotype.layers() |> Enum.map(fn nodes ->
+      columns = Enum.map(nodes, fn node ->
+        {links, _} = Genotype.links_and_bias(node)
+        Enum.flat_map(links, &elem(&1, 1))
+      end)
+      rows = columns |> Enum.zip() |> Enum.map(&Tuple.to_list/1)
+      biases = Enum.map(nodes, fn node -> elem(Genotype.links_and_bias(node), 1) end)
+      {Nx.tensor(rows, type: :f64), Nx.tensor(biases, type: :f64)}
+    end) |> List.to_tuple()
+  end
+
+  @spec neuron(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn neuron(x, weights, bias) do
+    Nx.tanh(Nx.dot(x, weights) + bias)
+  end
+
+  @spec forward(params(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn forward(params, x) do
+    apply_layers(params, x)
+  end
+
+  @spec apply_layers(params(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  deftransformp apply_layers(params, x) do
+    # This Elixir loop runs while constructing the numerical graph.
+    # The resulting graph contains every layer; no messages or scalar host loop.
+    params |> Tuple.to_list() |> Enum.reduce(x, fn {weights, bias}, values ->
+      Nx.tanh(Nx.add(Nx.dot(values, weights), bias))
+    end)
+  end
+
+  @spec backup(Genotype.t(), params()) :: Genotype.t()
+  def backup(template, params) do
+    layers = Genotype.layers(template)
+    parameter_layers = Tuple.to_list(params)
+    unless length(layers) == length(parameter_layers), do: raise(ArgumentError, "layer count mismatch")
+
+    updates = Enum.zip(layers, parameter_layers) |> Enum.flat_map(fn {nodes, {w, b}} ->
+      {first_links, _} = Genotype.links_and_bias(hd(nodes))
+      input_width = Enum.reduce(first_links, 0, fn {_, weights}, acc -> acc + length(weights) end)
+      unless Nx.shape(w) == {input_width, length(nodes)} and Nx.shape(b) == {length(nodes)} do
+        raise ArgumentError, "parameter shapes disagree with genotype"
+      end
+      columns = w |> Nx.transpose() |> Nx.to_flat_list() |> Enum.chunk_every(input_width)
+      Enum.zip([nodes, columns, Nx.to_flat_list(b)]) |> Enum.map(fn {node, weights, bias} ->
+        {links, _} = Genotype.links_and_bias(node)
+        {updated_links, []} = Enum.map_reduce(links, weights, fn {source, old}, remaining ->
+          {slice, rest} = Enum.split(remaining, length(old))
+          {{source, slice}, rest}
+        end)
+        {node.id, updated_links ++ [{:bias, bias}]}
+      end)
+    end) |> Map.new()
+    Genotype.replace_inputs(template, updates)
+  end
+end
+```
+
+The transpose in `backup/2` converts matrix columns back into per-neuron
+weight lists. It then splits those lists at the original incoming-link widths.
+No flattening operation is allowed to erase which source owns which weights.
+
+```elixir
+y_single_tensor = Chapter06.Tensor.neuron(
+  Nx.tensor([1.0, 2.0], type: :f64), Nx.tensor(weights_single, type: :f64),
+  Nx.tensor(bias_single, type: :f64))
+
+mod_tensor = Chapter06.Tensor.compile(genotype_demo)
+x_demo = Nx.tensor(tape_demo, type: :f64)
+y_tensor = Chapter06.Tensor.forward(mod_tensor, x_demo)
+
+tbl_shapes = mod_tensor |> Tuple.to_list() |> Enum.with_index(1)
+  |> Enum.map(fn {{w, b}, layer} ->
+    %{layer: layer, weight_shape: inspect(Nx.shape(w)), bias_shape: inspect(Nx.shape(b)),
+      parameters: Nx.size(w) + Nx.size(b)}
+  end)
+Chapter06.Tables.tabs(tbl_shapes, [:layer, :weight_shape, :bias_shape, :parameters],
+  "ch_06_tbl_05_tensor_shapes.csv")
+```
+
+For the `[1, 3, 1]` example the matrices have shapes `{2, 1}`, `{1, 3}`, and
+`{3, 1}`. The output has shape `{6, 1}`: six recorded observations, one actuator
+component each.
+
+### C. Synthesis - move the actor boundary
+
+Keep one supervised actor for the **whole neural network**, rather than one for
+every neuron. The worker owns the parameter tuple, accepts a batch, runs the
+same Nx kernel, and exposes a backup operation.
+
+```mermaid
+flowchart LR
+    S[Recorded sensor vectors]
+    subgraph WORKER[Supervised network actor]
+      P[Owned tensor parameters] --> K[Nx forward graph]
+      K --> B[Ordered output batch]
+    end
+    S --> K
+    B --> A[Actuator interpretation]
+    P --> C[Portable checkpoint]
+```
+
+*Figure R6.3 - The synthesis changes the ownership boundary, not the neural
+calculation. Remaster addition.*
+
+A batch of 32 rows is **one request and 32 independent forward evaluations**.
+It is not 32 concurrent neural actors. This first hybrid deliberately chooses
+one network per worker; layer-level modules and cross-agent batching remain
+future alternatives, not assumptions about an optimal design.
+
+```elixir
+defmodule Chapter06.Hybrid do
+  use GenServer, restart: :temporary
+  alias Chapter06.{Genotype, Tensor}
+  @moduledoc "The synthesis: one supervised actor owns a whole tensor network."
+  @type handle :: %{supervisor: pid(), worker: pid()}
+
+  @spec start_link(Genotype.t()) :: GenServer.on_start()
+  def start_link(genotype), do: GenServer.start_link(__MODULE__, genotype)
+
+  @spec open(Genotype.t()) :: handle()
+  def open(genotype) do
+    Genotype.validate!(genotype)
+    {:ok, supervisor} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    case DynamicSupervisor.start_child(supervisor, {__MODULE__, genotype}) do
+      {:ok, worker} -> %{supervisor: supervisor, worker: worker}
+      {:error, reason} ->
+        Supervisor.stop(supervisor)
+        raise "Hybrid initialization failed: #{inspect(reason)}"
+    end
+  end
+
+  @spec forward(handle(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  def forward(handle, x), do: GenServer.call(handle.worker, {:forward, x}, 30_000)
+
+  @spec backup(handle()) :: Genotype.t()
+  def backup(handle), do: GenServer.call(handle.worker, :backup)
+
+  @spec status(handle()) :: map()
+  def status(handle), do: GenServer.call(handle.worker, :status)
+
+  @spec close(handle()) :: :ok
+  def close(handle) do
+    if Process.alive?(handle.supervisor), do: Supervisor.stop(handle.supervisor)
+    :ok
+  end
+
+  @spec using(Genotype.t(), (handle() -> term())) :: term()
+  def using(genotype, fun) do
+    handle = open(genotype)
+    try do
+      fun.(handle)
+    after
+      close(handle)
+    end
+  end
+
+  @impl true
+  @spec init(Genotype.t()) :: {:ok, map()}
+  def init(genotype) do
+    # Nx process defaults must be set in this worker as well as the notebook caller.
+    Nx.default_backend(Nx.BinaryBackend)
+    Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+    {:ok, %{genotype: genotype, params: Tensor.compile(genotype),
+      width: Genotype.one(genotype, :sensor).vl, calls: 0, examples: 0}}
+  end
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: tuple()
+  def handle_call({:forward, x}, _from, state) do
+    case Nx.shape(x) do
+      {batch, width} when batch > 0 and width == state.width ->
+        output = Tensor.forward(state.params, x)
+        {:reply, output, %{state | calls: state.calls + 1, examples: state.examples + batch}}
+      other -> raise ArgumentError, "expected {batch, #{state.width}}, got #{inspect(other)}"
+    end
+  end
+  def handle_call(:backup, _from, state) do
+    {:reply, Tensor.backup(state.genotype, state.params), state}
+  end
+  def handle_call(:status, _from, state) do
+    {:reply, Map.take(state, [:calls, :examples]), state}
+  end
+end
+```
+
+```elixir
+hybrid_demo = Chapter06.Hybrid.using(genotype_demo, fn mod_hybrid ->
+  output = Chapter06.Hybrid.forward(mod_hybrid, x_demo)
+  %{output: output, backup: Chapter06.Hybrid.backup(mod_hybrid),
+    status: Chapter06.Hybrid.status(mod_hybrid)}
+end)
+
+y_actor = Nx.tensor(actor_demo.outputs, type: :f64)
+y_hybrid = hybrid_demo.output
+true = Chapter06.Support.close?(y_actor, y_tensor, 1.0e-10)
+true = Chapter06.Support.close?(y_hybrid, y_tensor, 1.0e-10)
+
+tbl_parity = Enum.zip([Nx.to_flat_list(y_actor), Nx.to_flat_list(y_tensor),
+  Nx.to_flat_list(y_hybrid)]) |> Enum.with_index(1) |> Enum.map(fn {{a, t, h}, step} ->
+    %{step: step, actor: a, tensor: t, hybrid: h, max_difference: max(abs(a - t), abs(h - t))}
+  end)
+Chapter06.Tables.tabs(tbl_parity, [:step, :actor, :tensor, :hybrid, :max_difference],
+  "ch_06_tbl_06_three_way_parity.csv")
+```
+
+The comparison is numerical, not architectural identity. The actor version has
+per-neuron mailboxes; the tensor version has none of those mailboxes; the hybrid
+has a network-level mailbox. Equal outputs do not imply equal failure boundaries
+or equal execution costs.
+
+### D. Test the contract, not just one example
+
+An independent scalar reference helps distinguish an Nx packing error from an
+actor routing error. The shape suite includes no hidden layer, unequal layer
+widths, and multi-component actuators. Every case also checks backup equality,
+completed-cycle counts, and process cleanup.
+
+The ordering experiment sends contributions in reverse order, duplicates a
+contribution, and injects a foreign epoch. The failure experiment kills a neuron,
+requires an explicit error, then rebuilds a fresh network from the original
+genotype. It does not pretend to restore an interrupted computation.
+
+```elixir
+defmodule Chapter06.Experiments do
+  alias Chapter06.{Actor, Constructor, Genotype, Hybrid, Interface, Math, Support, Tensor}
+  @moduledoc false
+
+  @spec reference(Genotype.t(), [number()]) :: [float()]
+  def reference(genotype, input) do
+    Enum.reduce(Genotype.layers(genotype), input, fn nodes, values ->
+      Enum.map(nodes, fn node ->
+        {links, bias} = Genotype.links_and_bias(node)
+        Math.neuron(values, Enum.flat_map(links, &elem(&1, 1)), bias)
+      end)
+    end)
+  end
+
+  @spec parity_case({pos_integer(), [pos_integer()], pos_integer()}, pos_integer()) :: map()
+  def parity_case({input_width, hidden, output_width}, seed) do
+    {g, _} = Constructor.new(input_width, hidden, output_width, :rand.seed_s(:exsss, {6, seed, 601}))
+    {random_rows, _} = Interface.tape(5, input_width, :rand.seed_s(:exsss, {60, seed, 602}))
+    tape = [List.duplicate(0.0, input_width), List.duplicate(-0.5, input_width) | random_rows]
+    x = Nx.tensor(tape, type: :f64)
+    expected = Nx.tensor(Enum.map(tape, &reference(g, &1)), type: :f64)
+    params = Tensor.compile(g)
+    numerical = Tensor.forward(params, x)
+
+    {result, pids} = Actor.using(g, fn actor ->
+      Hybrid.using(g, fn hybrid ->
+        actor_y = Nx.tensor(Actor.run(actor, tape), type: :f64)
+        hybrid_y = Hybrid.forward(hybrid, x)
+        row = %{shape: inspect([input_width | hidden ++ [output_width]]),
+          examples: length(tape), actor_error: Support.max_error(actor_y, expected),
+          tensor_error: Support.max_error(numerical, expected),
+          hybrid_error: Support.max_error(hybrid_y, expected),
+          cycles: Actor.status(actor).completed,
+          backups_equal: Actor.backup(actor) == g and Tensor.backup(g, params) == g and Hybrid.backup(hybrid) == g}
+        {row, Map.values(actor.by_id) ++ [actor.supervisor, hybrid.worker, hybrid.supervisor]}
+      end)
+    end)
+    Map.put(result, :cleaned_up, Enum.all?(pids, &(not Process.alive?(&1))))
+  end
+
+  @spec out_of_order() :: map()
+  def out_of_order do
+    {:ok, supervisor} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    epoch = make_ref()
+    try do
+      {:ok, neuron} = DynamicSupervisor.start_child(supervisor,
+        {Chapter06.Actor.Unit, %{kind: :neuron, id: {:neuron, {1, 1}}}})
+      {:ok, actuator} = DynamicSupervisor.start_child(supervisor,
+        {Chapter06.Actor.Unit, %{kind: :actuator, id: {:actuator, 1}, vl: 2}})
+      # Two distinct real PID labels, used by a test harness to inject signals.
+      first = self()
+      second = supervisor
+      :ok = Chapter06.Actor.Unit.wire(neuron, %{epoch: epoch, cortex: self(),
+        inputs: [{first, [0.5]}, {second, [-0.2]}], outputs: [self()], bias: 0.1})
+      :ok = Chapter06.Actor.Unit.wire(actuator, %{epoch: epoch, cortex: self(),
+        inputs: [{first, [1.0]}, {second, [1.0]}]})
+
+      send(neuron, {:forward, epoch, 1, second, [3.0]})
+      send(neuron, {:forward, epoch, 1, second, [999.0]}) # duplicate: ignored
+      send(neuron, {:forward, epoch, 1, first, [2.0]})
+      neural_output = receive do
+        {:forward, ^epoch, 1, ^neuron, [value]} -> value
+      after
+        2_000 -> raise "neuron ordering test timed out"
+      end
+
+      send(actuator, {:forward, make_ref(), 1, first, [999.0]}) # foreign epoch
+      send(actuator, {:forward, epoch, 1, second, [22.0]})
+      send(actuator, {:forward, epoch, 1, first, [7.0]})
+      ordered_output = receive do
+        {:acted, ^epoch, 1, ^actuator, values} -> values
+      after
+        2_000 -> raise "actuator ordering test timed out"
+      end
+      %{neuron: neural_output, expected: :math.tanh(0.5), ordered_actuator: ordered_output}
+    after
+      Supervisor.stop(supervisor)
+    end
+  end
+
+  @spec failure_case(Genotype.t(), [number()]) :: map()
+  def failure_case(g, input) do
+    {reply, pids} = Actor.using(g, fn actor ->
+      [neuron_id | _] = Genotype.one(g, :cortex).nids
+      victim = Map.fetch!(actor.by_id, neuron_id)
+      monitor = Process.monitor(victim)
+      Process.exit(victim, :kill)
+      receive do
+        {:DOWN, ^monitor, :process, ^victim, _reason} -> :ok
+      after
+        2_000 -> raise "failure injection timed out"
+      end
+      # The cortex either already knows the failure or detects it while waiting.
+      {Actor.step(actor, input), [actor.supervisor | Map.values(actor.by_id)]}
+    end)
+    repaired = Actor.using(g, fn actor ->
+      {:ok, output} = Actor.step(actor, input)
+      output
+    end)
+    %{reply: inspect(reply), rejected: match?({:error, _}, reply),
+      cleaned_up: Enum.all?(pids, &(not Process.alive?(&1))),
+      restored_error: Support.max_error(Nx.tensor(repaired, type: :f64),
+        Nx.tensor(reference(g, input), type: :f64))}
+  end
+end
+```
+
+```elixir
+tbl_shape_parity = [
+  {2, [], 1},
+  {2, [1, 3], 1},
+  {3, [3, 2], 2},
+  {2, [4, 4], 2}
+] |> Enum.with_index(1) |> Enum.map(fn {shape, seed} ->
+  Chapter06.Experiments.parity_case(shape, seed)
+end)
+Chapter06.Tables.tabs(tbl_shape_parity,
+  [:shape, :examples, :actor_error, :tensor_error, :hybrid_error, :cycles, :backups_equal, :cleaned_up],
+  "ch_06_tbl_07_shape_parity.csv")
+```
+
+```elixir
+ordering_result = Chapter06.Experiments.out_of_order()
+
+tbl_ordering = [
+  %{test: "Reverse arrival plus duplicate", observed: inspect(ordering_result.neuron),
+    expected: inspect(ordering_result.expected)},
+  %{test: "Actuator fan-in order plus foreign epoch", observed: inspect(ordering_result.ordered_actuator),
+    expected: "[7.0, 22.0]"}
+]
+Chapter06.Tables.tabs(tbl_ordering, [:test, :observed, :expected], "ch_06_tbl_08_message_order.csv")
+```
+
+```elixir
+failure_result = Chapter06.Experiments.failure_case(genotype_demo, hd(tape_demo))
+Chapter06.Tables.tabs([failure_result], [:reply, :rejected, :cleaned_up, :restored_error],
+  "ch_06_tbl_09_failure_and_rebuild.csv")
+```
+
+### E. Measure without preselecting a winner
+
+There are two comparisons: **one request per observation**, and **one request per
+batch**. Compare actor, tensor, and hybrid in the first group; compare tensor and
+hybrid in the second. Do not attribute the entire difference between a batched
+kernel and a scalar actor to message passing alone.
+
+Inputs and tensor conversion are prepared outside the steady-state timing.
+Every invocation shape is warmed and numerically checked. Tensor results are
+materialized with `Nx.to_flat_list/1` inside the timed function, so the measured
+work includes obtaining completed numerical output. These are local exploratory
+measurements, not a statistical performance study.
+
+The separate setup table measures process creation/wiring or tensor packing;
+it does not claim to measure a clean, cold compiler cache. "Owned processes"
+counts application-owned workers and their supervisor, not all BEAM or library
+processes. The numerical-only version therefore reports zero in that column.
+
+```elixir
+defmodule Chapter06.Benchmark do
+  alias Chapter06.{Actor, Genotype, Hybrid, Support, Tensor}
+  @moduledoc "Measures completed work; results are produced locally, not predicted."
+
+  @spec run(Genotype.t(), [[number()]], pos_integer()) :: {[map()], [map()]}
+  def run(genotype, tape, repetitions) do
+    unless tape != [] and repetitions > 0, do: raise(ArgumentError, "nonempty workload required")
+    x = Nx.tensor(tape, type: :f64)
+    x_rows = Enum.map(tape, &Nx.tensor([&1], type: :f64))
+    {actor_setup, actor} = :timer.tc(fn -> Actor.open(genotype) end)
+    try do
+      {tensor_setup, params} = :timer.tc(fn -> Tensor.compile(genotype) end)
+      {hybrid_setup, hybrid} = :timer.tc(fn -> Hybrid.open(genotype) end)
+      try do
+        workloads = [
+          {"Actor", "single", fn -> Actor.run(actor, tape) |> List.flatten() end},
+          {"Tensor", "single", fn -> Enum.flat_map(x_rows, &(Tensor.forward(params, &1) |> Nx.to_flat_list())) end},
+          {"Hybrid", "single", fn -> Enum.flat_map(x_rows, &(Hybrid.forward(hybrid, &1) |> Nx.to_flat_list())) end},
+          {"Tensor", "batch", fn -> Tensor.forward(params, x) |> Nx.to_flat_list() end},
+          {"Hybrid", "batch", fn -> Hybrid.forward(hybrid, x) |> Nx.to_flat_list() end}
+        ]
+        expected = Tensor.forward(params, x) |> Nx.to_flat_list() |> Nx.tensor(type: :f64)
+        # Warm every invocation shape and check parity before measuring it.
+        Enum.each(workloads, fn {_name, _mode, fun} ->
+          unless Support.close?(Nx.tensor(fun.(), type: :f64), expected, 1.0e-10) do
+            raise "benchmark parity check failed"
+          end
+        end)
+        timings = Enum.map(workloads, fn {name, mode, fun} ->
+          samples = Enum.map(1..repetitions, fn _ -> elem(:timer.tc(fun), 0) end) |> Enum.sort()
+          median = Enum.at(samples, div(length(samples), 2))
+          %{implementation: name, mode: mode, examples: length(tape), repetitions: repetitions,
+            median_us: median, us_per_example: median / length(tape)}
+        end)
+        setup = [
+          %{implementation: "Actor", setup_us: actor_setup, owned_processes: map_size(actor.by_id) + 1},
+          %{implementation: "Tensor", setup_us: tensor_setup, owned_processes: 0},
+          %{implementation: "Hybrid", setup_us: hybrid_setup, owned_processes: 2}
+        ]
+        {timings, setup}
+      after
+        Hybrid.close(hybrid)
+      end
+    after
+      Actor.close(actor)
+    end
+  end
+end
+```
+
+```elixir
+{genotype_benchmark, _} = Chapter06.Constructor.new(3, [8, 8], 2,
+  :rand.seed_s(:exsss, {6, 66, 660}))
+{tape_benchmark, _} = Chapter06.Interface.tape(32, 3,
+  :rand.seed_s(:exsss, {6, 67, 670}))
+
+{tbl_benchmark, tbl_setup} = Chapter06.Benchmark.run(genotype_benchmark, tape_benchmark, 3)
+Chapter06.Tables.tabs(tbl_benchmark,
+  [:implementation, :mode, :examples, :repetitions, :median_us, :us_per_example],
+  "ch_06_tbl_10_steady_state_benchmark.csv")
+```
+
+```elixir
+Chapter06.Tables.tabs(tbl_setup, [:implementation, :setup_us, :owned_processes],
+  "ch_06_tbl_11_setup_cost.csv")
+```
+
+```elixir
+tbl_benchmark_plot = Enum.map(tbl_benchmark, fn row ->
+  Map.put(row, :label, row.implementation <> " / " <> row.mode)
+end)
+fig_benchmark = Vl.new(width: 640, height: 280,
+  title: "R6.4 - Local steady-state time per example (BinaryBackend)")
+  |> Vl.data_from_values(tbl_benchmark_plot)
+  |> Vl.mark(:bar)
+  |> Vl.encode_field(:x, "label", type: :nominal, title: "Implementation / invocation mode")
+  |> Vl.encode_field(:y, "us_per_example", type: :quantitative,
+    title: "Microseconds per example; lower is faster")
+  |> Vl.encode_field(:color, "mode", type: :nominal)
+fig_benchmark
+```
+
+Small networks on BinaryBackend may favor scalar arithmetic. A larger batch or
+a native numerical backend may change the result. This notebook makes neither
+outcome a requirement. Repeat measurements, record the backend and machine,
+separate initialization from steady state, and compare equal workloads before
+making an architectural claim.
+
+## 6.7 Summary
+
+*Source: [S], pp. 184-185. The comparative synthesis and checks are additions.*
+
+Sher's progression is now complete: neuron -> sensor/neuron/actuator system ->
+architecture -> genotype -> constructor -> mapper -> live execution -> backup.
+We have retained that progression and implemented three execution choices.
+
+| Question                              | Actor                                     | Tensor                                      | Hybrid                             |
+| ------------------------------------- | ----------------------------------------- | ------------------------------------------- | ---------------------------------- |
+| Where are weights owned?              | Individual neuron processes               | Explicit parameter tuple                    | A network worker's state           |
+| How is computation scheduled?         | Messages and a cortex barrier             | Tensor graph dependencies                   | A request invokes the tensor graph |
+| What can be checkpointed?             | ID-mapped runtime parameters              | Tensor parameters converted back to records | The worker's tensor parameters     |
+| What does a worker failure mean here? | Abort and rebuild the whole wired network | No neural worker exists to restart          | Recreate the network worker        |
+| What remains to be added?             | Optimization and evolution                | Optimization and evolution                  | Optimization and evolution         |
+
+**Thesis-antithesis-synthesis is our implementation method. GES is our
+evolutionary method.** They answer different questions.
+
+| GES stage  | What Chapter 6 supplies                              | What it does not yet supply                   |
+| ---------- | ---------------------------------------------------- | --------------------------------------------- |
+| Generation | A constructor for legal candidate networks           | Evolutionary variation or offspring policies  |
+| Evaluation | Executable phenotypes and inspectable action vectors | A task-specific fitness or novelty measure    |
+| Selection  | Nothing yet                                          | Survival, reproduction, and archive decisions |
+
+### Executable checks
+
+Run this cell after the preceding experiments. Checks fail loudly rather than
+printing a plausible-looking table after a mismatch. They cover the demonstrated
+scope, not arbitrary neural graphs or all backend/runtime combinations.
+
+```elixir
+# Deliberately changing a parameter is a backup test, not a training algorithm.
+{first_w, first_b} = elem(mod_tensor, 0)
+mod_modified = put_elem(mod_tensor, 0, {first_w, Nx.add(first_b, 0.125)})
+genotype_modified = Chapter06.Tensor.backup(genotype_demo, mod_modified)
+y_modified = Chapter06.Tensor.forward(mod_modified, x_demo)
+y_recompiled = Chapter06.Tensor.forward(Chapter06.Tensor.compile(genotype_modified), x_demo)
+
+{genotype_repeat, _} = Chapter06.Constructor.construct(:rng, :pts, [1, 3], constructor_rng)
+parameter_count = Enum.reduce(tbl_shapes, 0, &(&1.parameters + &2))
+
+genotype_bad = Enum.map(genotype_demo, fn
+  %{kind: :neuron} = n ->
+    [{id, weights} | rest] = n.input_idps
+    %{n | input_idps: [{id, weights ++ [0.0]} | rest]}
+  other -> other
+end)
+
+boundary_checks = Chapter06.Actor.using(genotype_demo, fn actor ->
+  empty = Chapter06.Actor.run(actor, [])
+  before = Chapter06.Actor.status(actor)
+  rejected = Chapter06.Support.raises_argument?(fn -> Chapter06.Actor.step(actor, [1.0]) end)
+  {:ok, output} = Chapter06.Actor.step(actor, hd(tape_demo))
+  after_step = Chapter06.Actor.status(actor)
+  %{zero: empty == [] and before.completed == 0,
+    bad_input_rejected: rejected, still_healthy: after_step.completed == 1 and after_step.halted == nil,
+    output: output}
+end)
+
+coexist = Chapter06.Actor.using(genotype_single, fn a ->
+  Chapter06.Actor.using(genotype_single, fn b ->
+    {:ok, ya} = Chapter06.Actor.step(a, [1.0, 2.0])
+    {:ok, yb} = Chapter06.Actor.step(b, [1.0, 2.0])
+    a.cortex != b.cortex and ya == yb
+  end)
+end)
+
+csv_probe = Chapter06.Tables.csv([%{a: "comma, quote\" and line\n"}], [:a])
+checks = [
+  {abs(result_single.output - 0.25441202264242263) < 1.0e-12, "Printed single-neuron result"},
+  {abs(hd(actor_single) - result_single.output) < 1.0e-12, "Four-role network agrees with simple neuron"},
+  {abs(Nx.to_number(y_single_tensor) - result_single.output) < 1.0e-12, "Nx neuron agrees with the printed example"},
+  {length(Chapter06.Genotype.one(genotype_demo, :cortex).nids) == 5, "Hidden [1,3] creates five neurons"},
+  {parameter_count == 13, "Constructor creates thirteen parameters including biases"},
+  {genotype_repeat == genotype_demo, "Explicit RNG state reproduces the genotype"},
+  {genotype_reloaded == genotype_demo, "Checkpoint encode/decode preserves the genotype"},
+  {Chapter06.Support.raises_argument?(fn -> Chapter06.Genotype.validate!(genotype_bad) end), "Bad weight dimensions are rejected"},
+  {Chapter06.Support.raises_argument?(fn -> Chapter06.Constructor.new(2, [0], 1, constructor_rng) end), "Zero-width hidden layer is rejected"},
+  {actor_demo.status.completed == length(tape_demo), "Exactly N requested actor cycles complete"},
+  {actor_demo.status.busy == false and actor_demo.status.halted == nil, "Actor finishes at a healthy barrier"},
+  {actor_demo.backup == genotype_demo, "Actor backup maps runtime PIDs back to IDs"},
+  {Nx.shape(y_tensor) == {length(tape_demo), 1}, "Tensor output preserves batch and actuator dimensions"},
+  {Chapter06.Support.close?(y_actor, y_tensor, 1.0e-10), "Actor and tensor numerical parity"},
+  {Chapter06.Support.close?(y_hybrid, y_tensor, 1.0e-10), "Hybrid and tensor numerical parity"},
+  {hybrid_demo.status.calls == 1 and hybrid_demo.status.examples == length(tape_demo), "One hybrid batch call accounts for all examples"},
+  {hybrid_demo.backup == genotype_demo, "Hybrid parameter backup round-trip"},
+  {Chapter06.Tensor.backup(genotype_demo, mod_tensor) == genotype_demo, "Tensor parameter backup round-trip"},
+  {genotype_modified != genotype_demo, "Modified tensor parameters reach the backup"},
+  {Chapter06.Support.close?(y_modified, y_recompiled, 1.0e-10), "Modified backup replays the modified network"},
+  {Enum.all?(tbl_shape_parity, &(&1.actor_error < 1.0e-10 and &1.tensor_error < 1.0e-10 and &1.hybrid_error < 1.0e-10)), "All tested shapes match the scalar reference"},
+  {Enum.all?(tbl_shape_parity, &(&1.cycles == &1.examples)), "Cycle count remains correct across shapes"},
+  {Enum.all?(tbl_shape_parity, & &1.backups_equal), "All tested shapes preserve their parameters"},
+  {Enum.all?(tbl_shape_parity, & &1.cleaned_up), "Both actor architectures release owned processes"},
+  {abs(ordering_result.neuron - ordering_result.expected) < 1.0e-12, "Reverse arrival and duplicate sender do not change the neuron"},
+  {ordering_result.ordered_actuator == [7.0, 22.0], "Actuator order and epoch isolation"},
+  {failure_result.rejected, "Worker failure produces an operational error"},
+  {failure_result.cleaned_up, "Failed network's remaining processes are closed"},
+  {failure_result.restored_error < 1.0e-10, "Fresh mapping reproduces the stored network"},
+  {boundary_checks.zero, "Zero requested cycles produce zero actions"},
+  {boundary_checks.bad_input_rejected and boundary_checks.still_healthy, "Invalid input is rejected before disturbing the running network"},
+  {coexist, "Independent networks coexist without global names"},
+  {is_binary(csv_probe) and String.ends_with?(csv_probe, "\r\n"), "CSV callback content is a CRLF-terminated binary"}
+]
+tbl_checks = Enum.map(checks, fn {passed, label} -> Chapter06.Support.check!(passed, label) end)
+Chapter06.Tables.tabs(tbl_checks, [:check, :result], "ch_06_tbl_12_executable_checks.csv")
+```
+
+### Exercises
+
+| Change                        | Prediction to write before running                          | Check                                                        |
+| ----------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------ |
+| Use `hidden = []`             | Which layer now receives the sensor vector?                 | Output shape, parameter count, parity                        |
+| Give the actuator two outputs | Which neuron determines each output position?               | Reverse-arrival ordering test and shape suite                |
+| Change one bias, then back up | Which record must change?                                   | Recompile and compare outputs                                |
+| Increase input-batch size     | Which request overheads are amortized?                      | Compare single-request and batch groups separately           |
+| Kill a neuron                 | Does restarting only that PID repair its neighbors' routes? | Explain why this implementation rebuilds the whole phenotype |
+| Add a recurrent edge on paper | Which cycle semantics would need to change?                 | Do not bypass the feedforward validator                      |
+
+**The main insight:** an inherited neural design and its runtime realization are
+separable. Actors, tensors, and a hybrid can implement the same signal-processing
+contract while exposing different ownership, scheduling, and failure boundaries.
+
+**Next:** Chapter 7 adds stochastic hill climbing. The three phenotype paths can
+then share a perturbation/evaluation protocol instead of independently changing
+the optimization problem.
+
+### Source-to-remaster map
+
+| Source component                                | Location          | Remaster implementation                                 |
+| ----------------------------------------------- | ----------------- | ------------------------------------------------------- |
+| `simple_neuron:create`, `sense`, `loop`, `dot`  | pp. 156-157       | `SimpleNeuron`, `Math`                                  |
+| `simplest_nn`: four interacting roles           | pp. 159-161       | One-neuron fixture executed by the general actor mapper |
+| `records.hrl`                                   | pp. 167, 170      | Maps with the original fields plus `kind`               |
+| `construct_Genotype`, layer/node/weight helpers | pp. 170-174       | `Constructor.construct/4`, `new/4`, `weights/2`         |
+| `generate_id`                                   | pp. 173-174       | Deterministic, genotype-local structured IDs            |
+| Cortex synchronization and backup               | pp. 176-177       | `Actor.Cortex`, `Actor.backup/1`                        |
+| Sensor `rng`, actuator `pts`                    | pp. 178-179       | `Interface` plus actor sensor/actuator roles            |
+| Neuron loop and ordered weighted inputs         | pp. 179-180       | `Actor.Unit` neuron role                                |
+| Exoself allocation, wiring, ID/PID conversion   | pp. 181-183       | `Actor.open/1`, `wiring/4`, inverse map during backup   |
+| File backup and demonstration                   | pp. 181-184       | `Checkpoint` and actor/tensor/hybrid round-trips        |
+| Tensor and hybrid alternatives                  | Not in the source | Explicitly labeled remaster implementations             |
+
+### Corrections and deliberate changes
+
+These are not attributed to Sher as if they were in the original implementation.
+
+| Source detail                                                          | Treatment here                                                                                                   |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Neuron termination is spelled `termiante` twice on p. 177              | Use supervisor-owned shutdown rather than copy the misspelled message                                            |
+| Cortex sends another sensor sync before decrementing to zero on p. 177 | Complete each requested cycle before returning; never start an unrequested final cycle                           |
+| `random` and timestamp-derived floating-point IDs                      | Explicit `:rand` state and deterministic local IDs                                                               |
+| Registered names `neuron` and `cortex` in the early examples           | Pass PIDs explicitly so independent networks can coexist                                                         |
+| Broad pipeline possibility on pp. 163-164                              | Keep one cycle in flight; pipelining is not implemented                                                          |
+| Record list, ETS ID/PID lookup, textual file storage                   | Maps retain record fields; immutable maps provide lookup; versioned binary stores the genotype                   |
+| `rng` inside each sensor process                                       | Generate once, then replay the same observations for controlled comparison                                       |
+| Actuator prints every result                                           | Collect results for tests and timing; demonstrate `pts/1` explicitly                                             |
+| Backup anticipates learning                                            | Retain the path, but do not claim weights were learned in this static chapter                                    |
+| Source constructor supports only `rng` width 2 and `pts` width 1       | Keep that compatibility entry point; add explicit dimensions for comparison tests                                |
+| Cortex described as potentially supervisory                            | Separate synchronization from OTP ownership; fail-stop and rebuild rather than claim automatic in-place recovery |
+
+The source explicitly converts `{:bias, value}` into a standalone runtime bias
+on p. 183. That is a representation conversion, **not** a defect being corrected.
+The two concrete control-flow issues above are visible in the printed listing;
+this notebook does not claim to have audited a different repository version.
+
+### References
+
+**[S]** Gene I. Sher. *Handbook of Neuroevolution Through Erlang*. Springer, 2013.
+Chapter 6, "Developing a Feed Forward Neural Network," printed pp. 153-185.
+DOI: `10.1007/978-1-4614-4463-3_6`. The supplied PDF is the chapter source.
+Its diagrams were inspected; diagrams R6.1-R6.3 and the benchmark plot are new
+remaster figures, not extracted illustrations.
+
+| Key | Official software reference                                                                                                         | Use                                                      |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| D1  | [Nx 1.0.0 package configuration](https://hex.pm/packages/nx/1.0.0/files/mix.exs)                                                    | Pinned release and Elixir requirement                    |
+| D2  | [Elixir GenServer](https://hexdocs.pm/elixir/GenServer.html)                                                                        | Callbacks, requests, state, lifecycle                    |
+| D3  | [Elixir DynamicSupervisor](https://hexdocs.pm/elixir/DynamicSupervisor.html)                                                        | Supervised dynamic children and temporary restart policy |
+| D4  | [Kino.Layout](https://kino.hexdocs.pm/Kino.Layout.html), [Kino.DataTable](https://kino.hexdocs.pm/Kino.DataTable.html)              | Tabs and computed tables                                 |
+| D5  | [Kino.Download](https://hexdocs.pm/kino/Kino.Download.html)                                                                         | Binary-producing download callbacks                      |
+| D6  | [Nx.Defn 1.0.0 source](https://hex.pm/packages/nx/1.0.0/files/lib/nx/defn.ex?fallback=default), [Nx](https://nx.hexdocs.pm/Nx.html) | Numerical definitions, transforms, tensor operations     |
+
+Software APIs were checked against official documentation/search excerpts on
+2026-11-05. This is not a claim of runtime execution. The pinned configuration
+and executable checks define the reproducibility target.
+
+**End of Chapter 6.**

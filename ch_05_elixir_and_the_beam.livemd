@@ -1,0 +1,1150 @@
+# Chapter 5. Elixir and the BEAM
+
+```elixir
+Mix.install([
+  {:nx, "1.0.0"},
+  {:kino, "0.19.1"}
+])
+```
+
+## Reader's guide
+
+**Neuroevolution through Elixir**  
+Part I - Foundations
+
+**The central idea:** give independently acting components explicit identities,
+state, and message interfaces. Then specify who detects failures, who restarts
+components, and which information survives.
+
+This chapter remasters Gene I. Sher's *Handbook of Neuroevolution Through Erlang*
+(2013), Chapter 5, **"The Unintentional Neural Network Programming Language,"**
+printed pp. 143-150. The source's Sections **5.1-5.6** and argument are retained.
+References to **[S5]** use printed page numbers; PDF page 1 is printed p. 143.
+
+Sher argues for Erlang because its process-oriented architecture closely matches
+his neural-network architecture. His claims of a *perfect* mapping and an ideal
+language are presented as **his architectural position**, not as a benchmark or
+an established ranking of programming languages. [S5, pp. 143-148]
+
+**Remaster additions:** all executable Elixir/Nx examples, implementation
+qualifications, new diagrams, checks, and the Generation-Evaluation-Selection
+(GES) connection. The original chapter contains an architectural argument and
+one mapping figure, not the implementations below.
+
+### Chapter map
+
+| Section                                                          | Source question                                       | Remaster focus                                                      |
+| ---------------------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------- |
+| 5.1 The Necessary Features                                       | What should the language support?                     | Concurrency, communication, recovery, upgrades, hardware interfaces |
+| 5.2 Erlang: From Telecommunications Networks To Neural Networks  | Why does a telecom language fit this problem?         | Erlang, Elixir, BEAM, and OTP                                       |
+| 5.3 The Conceptual Mapping of a NN to Erlang's Architecture      | What corresponds to a neuron, connection, and signal? | Mailboxes, process identities, a small pipeline, Nx parity          |
+| 5.4 Robustness and Fault Tolerance in Computational Intelligence | How can a system continue despite component failures? | Supervision, restart state, controlled code replacement             |
+| 5.5 I've Done This Once Before; And We Are On Our Way            | What does the rest of the book build?                 | GES orchestration and isolated evaluation jobs                      |
+| 5.6 References                                                   | What supports the chapter?                            | Source references and official implementation documentation         |
+
+### Run this notebook
+
+Evaluate the setup cell, then the remaining cells in order. Nothing from an
+earlier notebook is required. Nx and Kino retain the versions used in Chapters
+2-4. No chart package, GPU, native tensor backend, dataset, remote BEAM node, or
+hardware device is required. Initial package installation needs network access
+or a prepared package cache.
+
+Only **computed data tables** have **Interactive / Markdown / CSV** tabs.
+Explanatory tables remain ordinary Markdown. Every named function written in
+this notebook has an `@spec`; a specification documents a contract, but is not
+runtime input validation. [D8]
+
+The demonstrations create short-lived local processes and stop them in `after`
+blocks. They do not register global process names, start an indefinite service,
+change logger settings, or open a network port. The code-replacement experiment
+uses one dedicated module name and two fixed source strings.
+
+**Expected diagnostics:** the failure demonstrations may print process or
+supervisor reports; the code-replacement demonstration may print a module
+redefinition warning. Their checks determine whether the intended behavior
+occurred. A cell that raises an assertion or exits unexpectedly is not a pass.
+
+**Validation status:** the authoring environment has no Elixir/BEAM runtime.
+Source coverage, notebook structure, named-function specification coverage, and
+independent numerical examples were checked. The actual Elixir/Nx execution,
+process lifecycle behavior, and Livebook rendering have **not** been executed
+here. The final cell checks those behaviors in your runtime.
+
+### Shared support
+
+`tbl_` names table rows; `mod_` names a model. Processes use descriptive `pid_`
+names. Data-table CSV callbacks return **binary text**, not row maps. [D6, D7]
+
+```elixir
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+
+defmodule Chapter05.Tables do
+  @moduledoc false
+  @type row :: %{optional(atom()) => term()}
+
+  @spec new([row()], [atom()], String.t()) :: Kino.Layout.t()
+  def new(rows, columns, filename) do
+    csv_text = csv(rows, columns)
+
+    Kino.Layout.tabs([
+      {"Interactive", Kino.DataTable.new(rows, keys: columns)},
+      {"Markdown", Kino.Markdown.new(markdown(rows, columns))},
+      {"CSV",
+       Kino.Layout.grid([
+         Kino.Download.new(fn -> csv_text end,
+           filename: filename,
+           label: "Download CSV"
+         ),
+         Kino.Text.new(csv_text)
+       ], columns: 1)}
+    ])
+  end
+
+  @spec csv([row()], [atom()]) :: binary()
+  def csv(rows, columns) do
+    records = [Enum.map(columns, &Atom.to_string/1) | values(rows, columns)]
+
+    Enum.map_join(records, "\r\n", fn record ->
+      Enum.map_join(record, ",", &csv_field/1)
+    end) <> "\r\n"
+  end
+
+  @spec markdown([row()], [atom()]) :: String.t()
+  def markdown(rows, columns) do
+    records = [
+      Enum.map(columns, &Atom.to_string/1),
+      Enum.map(columns, fn _ -> "---" end)
+      | values(rows, columns)
+    ]
+
+    Enum.map_join(records, "\n", fn record ->
+      "| " <> Enum.map_join(record, " | ", &markdown_field/1) <> " |"
+    end)
+  end
+
+  @spec values([row()], [atom()]) :: [[String.t()]]
+  defp values(rows, columns) do
+    Enum.map(rows, fn row ->
+      Enum.map(columns, fn key -> row |> Map.fetch!(key) |> text() end)
+    end)
+  end
+
+  @spec text(term()) :: String.t()
+  defp text(nil), do: ""
+  defp text(value) when is_binary(value), do: value
+  defp text(value) when is_atom(value) or is_number(value), do: to_string(value)
+  defp text(value), do: inspect(value, limit: :infinity)
+
+  @spec csv_field(String.t()) :: String.t()
+  defp csv_field(value), do: "\"" <> String.replace(value, "\"", "\"\"") <> "\""
+
+  @spec markdown_field(String.t()) :: String.t()
+  defp markdown_field(value) do
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("&", "&amp;")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+    |> String.replace("|", "\\|")
+    |> String.replace("\r\n", "<br>")
+    |> String.replace("\n", "<br>")
+    |> String.replace("\r", "<br>")
+  end
+end
+
+defmodule Chapter05.Check do
+  @moduledoc false
+
+  @spec row!({boolean(), String.t()}) :: %{check: String.t(), result: String.t()}
+  def row!({true, label}), do: %{check: label, result: "PASS"}
+  def row!({false, label}), do: raise("Check failed: #{label}")
+
+  @spec down!(reference(), pid()) :: term()
+  def down!(monitor, pid) do
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, reason} -> reason
+    after
+      2_000 ->
+        Process.demonitor(monitor, [:flush])
+        raise "Timed out waiting for process termination"
+    end
+  end
+
+  @spec started!(reference(), atom()) :: pid()
+  def started!(tag, id) do
+    receive do
+      {:chapter05_started, ^tag, ^id, pid} -> pid
+    after
+      2_000 -> raise "Timed out waiting for #{inspect(id)} to start"
+    end
+  end
+end
+```
+
+## 5.1 The Necessary Features
+
+*Source: [S5], Section 5.1, pp. 144-146; opening motivation on p. 143.*
+
+Sher asks us to design a language around the system we want to express.
+His starting point is a network of independently acting neurons that communicate
+through signals. He then adds the requirements of a long-running system:
+recovery, live maintenance, distribution, and interaction with hardware.
+
+| Requirement in Sher's argument                | What it makes possible                                      |
+| --------------------------------------------- | ----------------------------------------------------------- |
+| Many independent concurrent units             | Represent neurons and other active components directly      |
+| Messages between those units                  | Represent signals and connections                           |
+| Failure detection and recovery                | Notice a failed component and restore service               |
+| Code replacement during operation             | Change an implementation without stopping the entire system |
+| Distribution across machines                  | Place communicating components on more than one computer    |
+| Hardware interfaces                           | Connect sensors and actuators to the computational system   |
+| Timing, reliability, and continuous operation | Coordinate a system that must keep serving its environment  |
+
+Sher reinforces this list with telecommunications requirements attributed to
+Bjarne Dacker: numerous concurrent activities, timing constraints, distribution,
+hardware control, large and interacting software components, long uptime, live
+maintenance, reliability, and fault tolerance. His point is that **telecom
+systems already demanded much of the infrastructure he wants for neural systems**.
+[S5, pp. 145-146]
+
+### Remaster qualification - a capability is not a guarantee
+
+A runtime feature and an application-level result are different things.
+
+| Available mechanism  | The application still has to decide                                  |
+| -------------------- | -------------------------------------------------------------------- |
+| Concurrent processes | Which work is independent, and which work must wait                  |
+| Message passing      | Message format, ordering assumptions, request identity, and timeouts |
+| Supervision          | Restart boundaries, restart limits, and state reconstruction         |
+| Code loading         | Compatibility, state migration, testing, and rollback                |
+| Distribution         | Placement, connection security, partitions, and retry semantics      |
+| Hardware integration | Device protocols, safety limits, and handling unavailable devices    |
+
+These are implementation qualifications added for the remaster, not a replacement
+for Sher's feature list. Our examples demonstrate small local mechanisms; they
+do not prove uninterrupted operation, hard real-time deadlines, or autonomous
+bug repair. [D1-D5]
+
+## 5.2 Erlang: From Telecommunications Networks To Neural Networks
+
+*Source: [S5], Section 5.2, pp. 146-147.*
+
+Sher describes Erlang as a concurrency-oriented language developed at Ericsson
+for telecommunications. In his account, fault isolation, lightweight concurrency,
+failure detection, location-transparent messaging, and dynamic code upgrades
+provide the foundation. Storage, device interfaces, and operational libraries
+complete the system. [S5, p. 146]
+
+The practical lesson is to reuse an architecture built for many interacting,
+long-lived components rather than rebuild that infrastructure inside every
+neural-network experiment.
+
+### Remaster bridge - why Elixir keeps the relevant machinery
+
+Elixir is our language for expressing the program. It uses the Erlang runtime
+and OTP facilities; changing the source language does not discard the process
+and supervision model. [D1-D3, D9]
+
+| Name              | Role in this remaster                                              |
+| ----------------- | ------------------------------------------------------------------ |
+| Elixir            | Modules, functions, pattern matching, and the syntax we write      |
+| BEAM              | The runtime that executes processes and routes their messages      |
+| Erlang/OTP        | Libraries and conventions for servers, supervision, and operations |
+| Nx                | Tensor computations inside clearly defined numerical kernels       |
+| Livebook and Kino | Executable explanations and inspection of results                  |
+
+**Concurrency** means that multiple activities can make progress over overlapping
+periods. **Parallelism** means that work actually executes simultaneously.
+One BEAM process is not one operating-system process or one dedicated CPU core.
+Creating more processes does not remove dependencies between computations.
+[D1, D4]
+
+Sher also invokes linguistic determinism to argue that a language affects the
+ideas a programmer can comfortably express. We retain that as his motivation.
+The supplied chapter does not present a comparative experiment establishing that
+other languages prevent those ideas or that a process-per-neuron implementation
+is always faster. [S5, pp. 143, 147]
+
+## 5.3 The Conceptual Mapping of a NN to Erlang's Architecture
+
+*Source: [S5], Section 5.3, pp. 147-149; Fig. 5.1 on p. 148.*
+
+Sher's figure maps the **whole agent interface**, not only its internal neurons.
+The sensor, neuron, and actuator nodes in the upper diagram become communicating
+processes in the lower diagram; the connection pattern is preserved.
+
+| Neural-system element in Fig. 5.1 | Process-oriented representation                     |
+| --------------------------------- | --------------------------------------------------- |
+| Sensor                            | Process that obtains and encodes an observation     |
+| Neuron                            | Process that holds parameters and transforms inputs |
+| Connection                        | A destination identity and a message protocol       |
+| Signal                            | A message containing the relevant numerical values  |
+| Actuator                          | Process that interprets outputs as actions          |
+| Network                           | A graph of these communicating components           |
+
+```mermaid
+flowchart TB
+    subgraph Model[Conceptual neural system]
+        S[Sensor] --> N1[Neuron 1]
+        N1 --> N2[Neuron 2]
+        N2 --> A[Actuator]
+    end
+    subgraph Program[Process-oriented implementation]
+        PS[Sensor process] -->|input message| P1[Neuron process 1]
+        P1 -->|signal message| P2[Neuron process 2]
+        P2 -->|output message| PA[Actuator process]
+    end
+    S -. maps to .-> PS
+    N1 -. maps to .-> P1
+    N2 -. maps to .-> P2
+    A -. maps to .-> PA
+```
+
+*Figure R5.1 - A smaller, newly drawn version of the architectural correspondence
+in Sher's Fig. 5.1. The two-neuron chain is our illustration, not his topology.*
+
+A logical connection does not require an operating-system pipe or a permanent
+runtime link. In particular, a neural connection and an Erlang **process link**
+serve different purposes: the former routes model signals; the latter relates
+process lifetimes and exit signals. [D1, D4]
+
+### Experiment 1 - A neuron with a mailbox
+
+**Remaster implementation.** Start a process, send it a complete input vector,
+and receive its output. Its parameters remain in the arguments of its receive
+loop. A request reference identifies the reply; a monitor detects termination of
+the expected output process. [D1, D4]
+
+The computation is the familiar one:
+
+$$
+y=\tanh\left(\sum_i w_i x_i+b\right).
+$$
+
+The support module implements that calculation both with ordinary numbers and
+with Nx. Nx is not needed to create, monitor, or supervise a process.
+
+```elixir
+defmodule Chapter05.Kernels do
+  import Nx.Defn
+
+  @spec valid_vector?(term()) :: boolean()
+  def valid_vector?(values) do
+    is_list(values) and values != [] and Enum.all?(values, &is_number/1)
+  end
+
+  @spec scalar([number()], [number()], number()) :: float()
+  def scalar(inputs, weights, bias) do
+    unless valid_vector?(inputs) and valid_vector?(weights) and
+             length(inputs) == length(weights) and is_number(bias) do
+      raise ArgumentError, "inputs and weights must be nonempty numeric lists of equal length"
+    end
+
+    z = Enum.zip(inputs, weights)
+        |> Enum.reduce(bias, fn {x, w}, total -> total + x * w end)
+    :math.tanh(z)
+  end
+
+  # x: {batch, inputs}; w1: {inputs}; b1, w2, b2: scalars.
+  @spec pipeline(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t() | number(),
+                 Nx.Tensor.t() | number(), Nx.Tensor.t() | number()) :: Nx.Tensor.t()
+  defn pipeline(x, w1, b1, w2, b2) do
+    hidden = Nx.tanh(Nx.dot(x, w1) + b1)
+    Nx.tanh(hidden * w2 + b2)
+  end
+end
+
+defmodule Chapter05.RawNeuron do
+  @moduledoc false
+
+  @spec start([number()], number(), :reply | pid()) :: pid()
+  def start(weights, bias, output) do
+    unless Chapter05.Kernels.valid_vector?(weights) and is_number(bias) and
+             (output == :reply or is_pid(output)) do
+      raise ArgumentError, "invalid neuron configuration"
+    end
+
+    owner = self()
+    spawn(fn ->
+      owner_monitor = Process.monitor(owner)
+      loop(weights, bias, output, owner_monitor)
+    end)
+  end
+
+  @spec predict(pid(), pid(), [number()]) :: {:ok, float()} | {:error, term()}
+  def predict(entry, terminal, inputs) do
+    request = make_ref()
+    monitor = Process.monitor(terminal)
+    send(entry, {:signal, self(), request, inputs})
+
+    result =
+      receive do
+        {:output, ^request, ^terminal, value} -> {:ok, value}
+        {:DOWN, ^monitor, :process, ^terminal, reason} -> {:error, {:down, reason}}
+      after
+        2_000 -> {:error, :timeout}
+      end
+
+    Process.demonitor(monitor, [:flush])
+    result
+  end
+
+  @spec stop(pid()) :: :ok
+  def stop(pid) do
+    monitor = Process.monitor(pid)
+    send(pid, :stop)
+
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+    after
+      1_000 ->
+        Process.exit(pid, :kill)
+        Chapter05.Check.down!(monitor, pid)
+        :ok
+    end
+  end
+
+  @spec loop([number()], number(), :reply | pid(), reference()) :: :ok
+  defp loop(weights, bias, output, owner_monitor) do
+    receive do
+      {:signal, reply_to, request, inputs} ->
+        value = Chapter05.Kernels.scalar(inputs, weights, bias)
+
+        case output do
+          :reply -> send(reply_to, {:output, request, self(), value})
+          next_pid -> send(next_pid, {:signal, reply_to, request, [value]})
+        end
+
+        loop(weights, bias, output, owner_monitor)
+
+      :stop ->
+        :ok
+
+      {:DOWN, ^owner_monitor, :process, _owner, _reason} ->
+        :ok
+
+      _other ->
+        loop(weights, bias, output, owner_monitor)
+    end
+  end
+end
+```
+
+```elixir
+pid_single = Chapter05.RawNeuron.start([2.0, -0.5], -0.25, :reply)
+
+{tbl_mailbox, checks_mailbox} =
+  try do
+    {:ok, first} = Chapter05.RawNeuron.predict(pid_single, pid_single, [0.5, -1.0])
+    {:ok, second} = Chapter05.RawNeuron.predict(pid_single, pid_single, [0.0, 0.0])
+
+    rows = [
+      %{request: 1, process: inspect(pid_single), input: "[0.5, -1.0]", output: first},
+      %{request: 2, process: inspect(pid_single), input: "[0.0, 0.0]", output: second}
+    ]
+
+    checks = [
+      {abs(first - :math.tanh(1.25)) < 1.0e-12, "Mailbox neuron computes tanh(1.25)"},
+      {abs(second - :math.tanh(-0.25)) < 1.0e-12, "Second request uses the same parameters"},
+      {Process.alive?(pid_single), "Neuron remains alive between requests"}
+    ]
+
+    {rows, checks}
+  after
+    Chapter05.RawNeuron.stop(pid_single)
+  end
+
+checks_mailbox = checks_mailbox ++ [
+  {not Process.alive?(pid_single), "Standalone mailbox neuron is cleaned up"}
+]
+
+Chapter05.Tables.new(tbl_mailbox, [:request, :process, :input, :output],
+  "ch_05_tbl_01_mailbox.csv")
+```
+
+The first output should be about **0.848284**; the second about **-0.244919**.
+Different inputs changed the output, not the weights.
+
+The tail call to `loop/4` is the last action in each continuing branch: there is
+no unfinished calculation waiting for the next iteration to return. The state is
+passed explicitly. Tail recursion does not imply that an unconsumed mailbox is
+bounded. [D1, D4]
+
+**Protocol limits:** every message contains all inputs for one evaluation. We are
+not yet collecting signals from multiple upstream neurons or defining recurrent
+delays. A request timeout is not cancellation of a signal already sent. Reference
+matching prevents a late reply being mistaken for a newer reply, but this small
+raw protocol does not remove late replies automatically. The later examples use
+OTP interfaces rather than treating this as a production RPC implementation.
+
+### Experiment 2 - The same pipeline as processes and tensors
+
+Connect a second neuron to the first. The first process now sends its result
+**directly to the second process**. The notebook receives only the terminal reply.
+
+$$
+h=\tanh(2x_1-0.5x_2-0.25),\qquad
+ y=\tanh(1.5h+0.1).
+$$
+
+The process graph and the batched tensor expression implement the same specified
+computation. This is a numerical parity check, **not a speed benchmark**.
+
+```elixir
+inputs_pipeline = [[0.5, -1.0], [0.0, 0.0], [1.0, 1.0], [-1.0, 0.5]]
+x_pipeline = Nx.tensor(inputs_pipeline, type: :f32)
+w_pipeline = Nx.tensor([2.0, -0.5], type: :f32)
+
+y_pipeline_nx =
+  Chapter05.Kernels.pipeline(x_pipeline, w_pipeline, -0.25, 1.5, 0.1)
+  |> Nx.to_flat_list()
+
+pid_output = Chapter05.RawNeuron.start([1.5], 0.1, :reply)
+pid_hidden = Chapter05.RawNeuron.start([2.0, -0.5], -0.25, pid_output)
+
+{tbl_pipeline, checks_pipeline} =
+  try do
+    rows =
+      Enum.zip(inputs_pipeline, y_pipeline_nx)
+      |> Enum.map(fn {[x1, x2] = inputs, nx_output} ->
+        {:ok, process_output} = Chapter05.RawNeuron.predict(pid_hidden, pid_output, inputs)
+        scalar_hidden = Chapter05.Kernels.scalar(inputs, [2.0, -0.5], -0.25)
+        scalar_output = Chapter05.Kernels.scalar([scalar_hidden], [1.5], 0.1)
+
+        %{x1: x1, x2: x2, process_output: process_output,
+          scalar_output: scalar_output, nx_output: nx_output,
+          absolute_error: abs(process_output - nx_output)}
+      end)
+
+    checks = [
+      {pid_hidden != pid_output, "Pipeline neurons are separate processes"},
+      {Enum.all?(rows, &(abs(&1.process_output - &1.scalar_output) < 1.0e-12)),
+       "Process pipeline agrees with scalar composition"},
+      {Enum.all?(rows, &(&1.absolute_error < 1.0e-5)),
+       "Process pipeline agrees with the batched Nx kernel"}
+    ]
+    {rows, checks}
+  after
+    Chapter05.RawNeuron.stop(pid_hidden)
+    Chapter05.RawNeuron.stop(pid_output)
+  end
+
+checks_pipeline = checks_pipeline ++ [
+  {not Process.alive?(pid_hidden) and not Process.alive?(pid_output),
+   "Both pipeline processes are cleaned up"}
+]
+
+Chapter05.Tables.new(tbl_pipeline,
+  [:x1, :x2, :process_output, :scalar_output, :nx_output, :absolute_error],
+  "ch_05_tbl_02_pipeline_parity.csv")
+```
+
+### Remaster architecture - preserve the model, choose the granularity
+
+Sher's process-per-neuron mapping is useful for understanding his design. Our
+remaster also permits a process to own a **whole network, agent, or evaluation
+job**, with Nx performing its internal numerical work. That is our implementation
+choice, not a claim that Sher used Nx. [D1, D2, D10]
+
+| Work                                              | Representation we can choose                        |
+| ------------------------------------------------- | --------------------------------------------------- |
+| Individual educational signal processors          | One process per neuron                              |
+| Regular dense inference                           | A tensor kernel, optionally batched across examples |
+| Independent candidate evaluations                 | Separate tasks or supervised workers                |
+| Dynamic topology, lifecycle, experiment state     | Elixir data structures and explicit coordination    |
+| Numerical mutation, distance measures, or ranking | Nx where shapes and semantics make it useful        |
+
+**BEAM coordinates activities; Nx expresses numerical work.** This is not a rule
+that generation must use BEAM and evaluation must use Nx. Nor is it a requirement
+to create a process for every multiplication.
+
+## 5.4 Robustness and Fault Tolerance in Computational Intelligence
+
+*Source: [S5], Section 5.4, p. 149.*
+
+Sher argues that a single bug should not bring down the entire computational
+intelligence system. He proposes supervision trees and an overseeing component,
+the **exoself**, that can restore failed elements. He also connects recovery to
+the possibility of updating code during operation. [S5, p. 149]
+
+### Remaster distinction - detection, restart, recovery, and repair
+
+| Mechanism                            | What it does                                   | What it does not do automatically               |
+| ------------------------------------ | ---------------------------------------------- | ----------------------------------------------- |
+| Monitor                              | Reports that a process terminated              | Restart it or recover its state                 |
+| Supervisor                           | Restarts children according to policy          | Repair the bug that caused the crash            |
+| Initialization or checkpoint loading | Reconstructs the chosen state                  | Restore information that was never retained     |
+| Code replacement                     | Makes a new implementation available           | Prove correctness or migrate every state format |
+| Retry policy                         | Decides whether work should be attempted again | Make external side effects exactly-once         |
+
+These distinctions make Sher's architectural proposal executable. A supervisor
+restarts a process from its configured start arguments; it does not copy the dead
+process's last heap or mailbox. [D2-D4]
+
+```mermaid
+flowchart TB
+    S[Supervisor: one_for_one] --> L[Neuron worker left]
+    S --> R[Neuron worker right]
+    O[Observer] -. monitor .-> L
+    L -. termination notice .-> O
+    S -->|restart same child specification| N[Replacement left worker]
+```
+
+*Figure R5.2 - Supervision and observation are separate relationships. The
+replacement has a new PID. The right worker need not restart.*
+
+### Experiment 3 - Restart is not memory restoration
+
+**Remaster implementation.** `GenServer` supplies the request/reply loop. Our
+callbacks define the neuron's calculation, runtime configuration, and state.
+The supervisor controls its lifecycle. [D2, D3]
+
+```elixir
+defmodule Chapter05.Neuron do
+  use GenServer
+
+  @type state :: %{
+    weights: [number()], bias: number(),
+    calls: non_neg_integer(), revision: non_neg_integer()
+  }
+
+  @spec child_spec(map()) :: Supervisor.child_spec()
+  def child_spec(config) do
+    %{id: __MODULE__, start: {__MODULE__, :start_link, [config]},
+      restart: :permanent, shutdown: 1_000, type: :worker}
+  end
+
+  @spec start_link(map()) :: GenServer.on_start()
+  def start_link(config), do: GenServer.start_link(__MODULE__, config)
+
+  @spec predict(pid(), [number()]) :: {:ok, float()} | {:error, :invalid_input}
+  def predict(pid, inputs), do: GenServer.call(pid, {:predict, inputs}, 2_000)
+
+  @spec snapshot(pid()) :: state()
+  def snapshot(pid), do: GenServer.call(pid, :snapshot, 2_000)
+
+  @spec configure(pid(), [number()], number()) :: :ok | {:error, :invalid_parameters}
+  def configure(pid, weights, bias) do
+    GenServer.call(pid, {:configure, weights, bias}, 2_000)
+  end
+
+  @impl true
+  @spec init(map()) :: {:ok, state()} | {:stop, :invalid_parameters}
+  def init(config) do
+    weights = Map.fetch!(config, :weights)
+    bias = Map.fetch!(config, :bias)
+
+    if Chapter05.Kernels.valid_vector?(weights) and is_number(bias) do
+      state = %{weights: weights, bias: bias, calls: 0, revision: 0}
+
+      case config do
+        %{observer: observer, tag: tag, id: id} ->
+          send(observer, {:chapter05_started, tag, id, self()})
+        _ -> :ok
+      end
+
+      {:ok, state}
+    else
+      {:stop, :invalid_parameters}
+    end
+  end
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), state()) :: {:reply, term(), state()}
+  def handle_call({:predict, inputs}, _from, state) do
+    if Chapter05.Kernels.valid_vector?(inputs) and length(inputs) == length(state.weights) do
+      value = Chapter05.Kernels.scalar(inputs, state.weights, state.bias)
+      {:reply, {:ok, value}, %{state | calls: state.calls + 1}}
+    else
+      {:reply, {:error, :invalid_input}, state}
+    end
+  end
+
+  def handle_call(:snapshot, _from, state), do: {:reply, state, state}
+
+  def handle_call({:configure, weights, bias}, _from, state) do
+    if Chapter05.Kernels.valid_vector?(weights) and
+         length(weights) == length(state.weights) and is_number(bias) do
+      updated = %{state | weights: weights, bias: bias, revision: state.revision + 1}
+      {:reply, :ok, updated}
+    else
+      {:reply, {:error, :invalid_parameters}, state}
+    end
+  end
+
+  def handle_call(_request, _from, state), do: {:reply, {:error, :unknown_request}, state}
+end
+```
+
+The next cell changes a live worker's weights, then deliberately terminates that
+worker. Startup notifications provide synchronization; there is no assumption
+that a fixed sleep is long enough for a restart.
+
+```elixir
+tag_recovery = make_ref()
+config_left = %{weights: [1.0], bias: 0.0, observer: self(), tag: tag_recovery, id: :left}
+config_right = %{weights: [-1.0], bias: 0.0, observer: self(), tag: tag_recovery, id: :right}
+
+children = [
+  Supervisor.child_spec({Chapter05.Neuron, config_left}, id: :left),
+  Supervisor.child_spec({Chapter05.Neuron, config_right}, id: :right)
+]
+
+{:ok, pid_supervisor} = Supervisor.start_link(children,
+  strategy: :one_for_one, max_restarts: 3, max_seconds: 5)
+
+{tbl_recovery, checks_recovery} =
+  try do
+    pid_left = Chapter05.Check.started!(tag_recovery, :left)
+    pid_right = Chapter05.Check.started!(tag_recovery, :right)
+    initial = Chapter05.Neuron.snapshot(pid_left)
+
+    {:ok, _value} = Chapter05.Neuron.predict(pid_left, [0.5])
+    :ok = Chapter05.Neuron.configure(pid_left, [2.0], 0.1)
+    configured = Chapter05.Neuron.snapshot(pid_left)
+
+    {:error, :invalid_input} = Chapter05.Neuron.predict(pid_left, [0.0, 1.0])
+    after_invalid = Chapter05.Neuron.snapshot(pid_left)
+
+    monitor_left = Process.monitor(pid_left)
+    Process.exit(pid_left, :kill)
+    reason = Chapter05.Check.down!(monitor_left, pid_left)
+    pid_replacement = Chapter05.Check.started!(tag_recovery, :left)
+    restarted = Chapter05.Neuron.snapshot(pid_replacement)
+
+    current_right =
+      Supervisor.which_children(pid_supervisor)
+      |> Enum.find_value(fn
+        {:right, pid, :worker, _modules} -> pid
+        _ -> nil
+      end)
+
+    rows = [
+      %{stage: "initial", pid: inspect(pid_left), weights: inspect(initial.weights),
+        bias: initial.bias, calls: initial.calls, revision: initial.revision},
+      %{stage: "configured in place", pid: inspect(pid_left), weights: inspect(configured.weights),
+        bias: configured.bias, calls: configured.calls, revision: configured.revision},
+      %{stage: "after restart", pid: inspect(pid_replacement), weights: inspect(restarted.weights),
+        bias: restarted.bias, calls: restarted.calls, revision: restarted.revision}
+    ]
+
+    checks = [
+      {configured.weights == [2.0] and configured.revision == 1,
+       "Live configuration updates parameters"},
+      {configured.calls == 1, "Worker records one successful request"},
+      {after_invalid == configured, "Invalid input returns an error without changing state"},
+      {reason == :killed, "Monitor observes the intentional worker termination"},
+      {pid_replacement != pid_left, "Supervisor starts a replacement with a new PID"},
+      {restarted == initial, "Restart restores initialization, not the latest runtime state"},
+      {current_right == pid_right and Process.alive?(pid_right),
+       "one_for_one leaves the sibling worker running"},
+      {Process.alive?(pid_supervisor), "Supervisor survives the worker failure"}
+    ]
+    {rows, checks}
+  after
+    Supervisor.stop(pid_supervisor, :normal, 2_000)
+  end
+
+checks_recovery = checks_recovery ++ [
+  {not Process.alive?(pid_supervisor), "Recovery demonstration supervisor is cleaned up"}
+]
+
+Chapter05.Tables.new(tbl_recovery, [:stage, :pid, :weights, :bias, :calls, :revision],
+  "ch_05_tbl_03_recovery.csv")
+```
+
+The restarted worker should have weight **1.0**, bias **0.0**, **0** calls, and
+revision **0**. Its runtime weight **2.0** was not part of the child start
+specification and was not checkpointed. This is the intended lesson, not a failed
+recovery test.
+
+**For our neuroevolution platform:** preserve the genotype and evaluation policy
+outside an expendable phenotype. Decide separately whether to reconstruct the
+phenotype, resume a checkpoint, or restart the entire episode. After a restart,
+connections holding an old PID need a routing or reconstruction policy. Supervisor
+child IDs identify specifications; they do not automatically repair every PID
+stored elsewhere. [D3, D4]
+
+### Experiment 4 - Replace code without restarting the worker
+
+Updating weights with `configure/3` changed **data**. It did not replace code.
+Here we replace the implementation of a dedicated activation module while a
+worker stays alive. Its calls use `apply(module, function, arguments)`, a remote
+module call that resolves the current implementation. [D5, D11]
+
+This is a deliberately small demonstration: the worker state format does not
+change, requests are completed before replacement, and there is only one host.
+It is not a complete release-upgrade procedure or an autonomous self-repair system.
+
+```elixir
+defmodule Chapter05.LiveHost do
+  use GenServer
+  @type state :: %{kernel: module(), calls: non_neg_integer()}
+
+  @spec child_spec(module()) :: Supervisor.child_spec()
+  def child_spec(kernel) do
+    %{id: __MODULE__, start: {__MODULE__, :start_link, [kernel]},
+      restart: :permanent, shutdown: 1_000, type: :worker}
+  end
+
+  @spec start_link(module()) :: GenServer.on_start()
+  def start_link(kernel), do: GenServer.start_link(__MODULE__, kernel)
+
+  @spec run(pid(), number()) :: map()
+  def run(pid, x), do: GenServer.call(pid, {:run, x}, 2_000)
+
+  @impl true
+  @spec init(module()) :: {:ok, state()}
+  def init(kernel), do: {:ok, %{kernel: kernel, calls: 0}}
+
+  @impl true
+  @spec handle_call({:run, number()}, GenServer.from(), state()) :: {:reply, map(), state()}
+  def handle_call({:run, x}, _from, state) do
+    result = %{pid: self(), calls: state.calls + 1,
+      version: apply(state.kernel, :version, []),
+      output: apply(state.kernel, :activate, [x])}
+    {:reply, result, %{state | calls: state.calls + 1}}
+  end
+end
+```
+
+```elixir
+# These are fixed notebook sources. Never compile untrusted input in this way.
+source_linear = ~S"""
+defmodule Chapter05.HotActivation do
+  @spec version() :: :linear
+  def version(), do: :linear
+
+  @spec activate(number()) :: number()
+  def activate(x), do: x
+end
+"""
+
+source_tanh = ~S"""
+defmodule Chapter05.HotActivation do
+  @spec version() :: :tanh
+  def version(), do: :tanh
+
+  @spec activate(number()) :: float()
+  def activate(x), do: :math.tanh(x)
+end
+"""
+
+Code.compile_string(source_linear)
+{:ok, pid_live_host} = Chapter05.LiveHost.start_link(Chapter05.HotActivation)
+
+{tbl_upgrade, checks_upgrade} =
+  try do
+    before_upgrade = Chapter05.LiveHost.run(pid_live_host, 1.0)
+    Code.compile_string(source_tanh)
+    after_upgrade = Chapter05.LiveHost.run(pid_live_host, 1.0)
+
+    rows =
+      Enum.map([before_upgrade, after_upgrade], fn result ->
+        %{version: result.version, process: inspect(result.pid),
+          calls: result.calls, input: 1.0, output: result.output}
+      end)
+
+    checks = [
+      {before_upgrade.pid == after_upgrade.pid, "Code replacement retains the worker PID"},
+      {before_upgrade.calls == 1 and after_upgrade.calls == 2,
+       "Worker state survives the activation-code replacement"},
+      {before_upgrade.version == :linear and before_upgrade.output == 1.0,
+       "First call uses the original implementation"},
+      {after_upgrade.version == :tanh and abs(after_upgrade.output - :math.tanh(1.0)) < 1.0e-12,
+       "Next remote call uses the replacement implementation"}
+    ]
+    {rows, checks}
+  after
+    GenServer.stop(pid_live_host, :normal, 2_000)
+  end
+
+checks_upgrade = checks_upgrade ++ [
+  {not Process.alive?(pid_live_host), "Code-replacement host is cleaned up"}
+]
+
+Chapter05.Tables.new(tbl_upgrade, [:version, :process, :calls, :input, :output],
+  "ch_05_tbl_04_code_replacement.csv")
+```
+
+The output changes from **1.0** to about **0.761594**, while the process identity
+stays the same and the call count increases.
+
+BEAM supports current and old versions of a module. Code replacement therefore
+requires care about processes still executing old code, especially before further
+replacements. Our activation calls have returned before each replacement; the
+example is not a general guarantee that repeatedly reloading arbitrary modules
+is safe. [D5]
+
+When a GenServer's **state representation** also changes, an upgrade plan may
+need `code_change/3` and coordinated OTP upgrade handling. Simply calling
+`Code.compile_string/1` does not automatically migrate all running server states.
+Our example avoids that issue by keeping the host state unchanged. [D2, D5, D11]
+
+## 5.5 I've Done This Once Before; And We Are On Our Way
+
+*Source: [S5], Section 5.5, pp. 149-150.*
+
+Sher closes the foundations by promising a step-by-step neuroevolutionary
+platform. He points forward to artificial-life agents, recognition of patterns in
+financial charts, and flexible learning networks applicable to circuits and other
+problems. These are the book's announced destinations; this chapter does not
+supply experimental results for them. [S5, pp. 149-150]
+
+In our remaster, the next step is a concrete feedforward network. Before building
+it, connect this chapter's architecture to the GES framework we established.
+
+| GES operation | Information it owns                                | Possible execution unit                                      |
+| ------------- | -------------------------------------------------- | ------------------------------------------------------------ |
+| Generation    | Parent designs, mutation settings, random state    | Coordinator plus numerical or structural operators           |
+| Evaluation    | Episode state, observations, outputs, measurements | Isolated job, supervised agent, or numerical batch           |
+| Selection     | Measured candidates and an explicit policy         | Coordinator choosing parents, survivors, and archive entries |
+
+A failed evaluation is an **operational outcome**, not automatically a low fitness
+score. Specify whether to retry, reject an invalid candidate, or mark the run as
+incomplete. Otherwise selection can become biased by infrastructure behavior.
+This is a remaster design rule, not a rule specified in Sher's Chapter 5.
+
+### Experiment 5 - A failed evaluation does not erase the other results
+
+Evaluate four hand-designed one-neuron candidates against the target
+$y=\tanh(x)$. A fifth job deliberately exits. Successful jobs report negative
+mean squared error, so higher fitness is better:
+
+$$
+F(w,b)=-\frac{1}{N}\sum_{i=1}^{N}
+\left[\tanh(wx_i+b)-\tanh(x_i)\right]^2.
+$$
+
+The target formula is known because this is a controlled plumbing test, not an
+unknown-function discovery experiment. There is no mutation or evolutionary
+search here. Selection simply chooses the highest-scoring successful candidate.
+
+`Task.Supervisor.async_stream_nolink/4` separates task failures from the caller.
+`ordered: true` lets us pair each result with its candidate in the original order;
+it does **not** require tasks to finish in that order. Concurrency is bounded at
+two jobs. [D12]
+
+```elixir
+defmodule Chapter05.Evaluation do
+  @moduledoc false
+  @type candidate :: %{id: String.t(), weight: number(), bias: number(), fail?: boolean()}
+  @type sample :: {number(), number()}
+
+  @spec score(candidate(), [sample()]) :: float()
+  def score(%{fail?: true}, _samples), do: exit(:intentional_evaluation_failure)
+
+  def score(candidate, samples) do
+    if samples == [], do: raise(ArgumentError, "evaluation needs at least one sample")
+
+    squared_error =
+      Enum.reduce(samples, 0.0, fn {x, target}, total ->
+        prediction = Chapter05.Kernels.scalar([x], [candidate.weight], candidate.bias)
+        total + (prediction - target) * (prediction - target)
+      end)
+
+    -squared_error / length(samples)
+  end
+
+  @spec run([candidate()], [sample()]) :: [map()]
+  def run(candidates, samples) do
+    {:ok, supervisor} = Task.Supervisor.start_link()
+
+    try do
+      results =
+        Task.Supervisor.async_stream_nolink(supervisor, candidates,
+          fn candidate -> score(candidate, samples) end,
+          max_concurrency: 2, ordered: true, timeout: 5_000, on_timeout: :kill_task)
+        |> Enum.to_list()
+
+      Enum.zip(candidates, results)
+      |> Enum.map(fn
+        {candidate, {:ok, fitness}} ->
+          %{id: candidate.id, weight: candidate.weight, bias: candidate.bias,
+            status: "ok", fitness: fitness, reason: ""}
+
+        {candidate, {:exit, reason}} ->
+          %{id: candidate.id, weight: candidate.weight, bias: candidate.bias,
+            status: "failed", fitness: nil, reason: inspect(reason)}
+      end)
+    after
+      Supervisor.stop(supervisor, :normal, 2_000)
+    end
+  end
+end
+
+candidates = [
+  %{id: "flat", weight: 0.0, bias: 0.0, fail?: false},
+  %{id: "shallow", weight: 0.5, bias: 0.0, fail?: false},
+  %{id: "matching", weight: 1.0, bias: 0.0, fail?: false},
+  %{id: "steep", weight: 2.0, bias: 0.0, fail?: false},
+  %{id: "fault", weight: 1.0, bias: 0.0, fail?: true}
+]
+
+samples = Enum.map([-1.0, -0.5, 0.0, 0.5, 1.0], fn x -> {x, :math.tanh(x)} end)
+tbl_evaluation = Chapter05.Evaluation.run(candidates, samples)
+
+successful = Enum.filter(tbl_evaluation, &(&1.status == "ok"))
+failed = Enum.filter(tbl_evaluation, &(&1.status == "failed"))
+selected = successful |> Enum.sort_by(fn row -> {-row.fitness, row.id} end) |> hd()
+
+checks_evaluation = [
+  {length(tbl_evaluation) == 5, "Every candidate retains an identifiable result"},
+  {length(successful) == 4 and length(failed) == 1, "One failing job does not erase four successes"},
+  {hd(failed).id == "fault" and is_nil(hd(failed).fitness), "Failure is recorded separately from fitness"},
+  {Enum.all?(successful, &(&1.fitness <= 0.0)), "Fitness uses negative mean squared error"},
+  {selected.id == "matching" and abs(selected.fitness) < 1.0e-12,
+   "Selection chooses the matching successful candidate"}
+]
+
+Chapter05.Tables.new(tbl_evaluation, [:id, :weight, :bias, :status, :fitness, :reason],
+  "ch_05_tbl_05_evaluation_jobs.csv")
+```
+
+The failed job is recorded, not silently assigned a perfect score of zero. This
+example's explicit policy excludes failed jobs from selection; it does not retry
+them. A production experiment needs its own documented failure policy.
+
+```mermaid
+flowchart LR
+    G[Generation supplies candidate designs] --> E[Bounded evaluation jobs]
+    E --> R[Results retain candidate IDs]
+    R --> S[Selection policy]
+    R --> F[Failure records]
+    S --> P[Parents and survivors]
+    S --> A[Archive policy]
+    P --> G
+```
+
+*Figure R5.3 - Our GES coordination sketch. The experiment implements evaluation
+and a simple selection decision, not the generation loop or an archive.*
+
+### What remains to be built
+
+| This chapter demonstrates        | Later work must make explicit                              |
+| -------------------------------- | ---------------------------------------------------------- |
+| A small process graph            | Genotype-driven construction and wiring of larger networks |
+| Complete-vector messages         | Fan-in synchronization, time steps, and recurrent delays   |
+| A supervised restart             | Episode recovery and connection reconstruction             |
+| A stateless function replacement | Coordinated application upgrades and state migrations      |
+| Local concurrent jobs            | Distribution, reproducibility, budgets, and persistence    |
+
+### Executable checks
+
+Run after the five experiments. Numerical agreement, lifecycle events, and
+policy decisions are checked separately. This is a teaching test suite, not a
+stress test or a proof of general fault tolerance.
+
+```elixir
+csv_probe = Chapter05.Tables.csv([%{label: "a,\"b\"", value: nil}], [:label, :value])
+markdown_probe = Chapter05.Tables.markdown([%{value: "left|right"}], [:value])
+
+checks_format = [
+  {is_binary(csv_probe), "CSV export returns a binary"},
+  {String.contains?(csv_probe, "\"a,\"\"b\"\"\""), "CSV quotes commas and embedded quotes"},
+  {String.ends_with?(csv_probe, "\r\n"), "CSV has a terminating record separator"},
+  {String.contains?(markdown_probe, "left\\|right"), "Computed Markdown tables escape pipes"}
+]
+
+tbl_checks =
+  (checks_mailbox ++ checks_pipeline ++ checks_recovery ++ checks_upgrade ++
+     checks_evaluation ++ checks_format)
+  |> Enum.map(&Chapter05.Check.row!/1)
+
+Chapter05.Tables.new(tbl_checks, [:check, :result], "ch_05_tbl_06_checks.csv")
+```
+
+### Exercises
+
+| Change                                                | Inspect                                                            |
+| ----------------------------------------------------- | ------------------------------------------------------------------ |
+| Change a mailbox neuron's bias                        | Does the message protocol change, or only the numerical response?  |
+| Add an extra input to `Neuron.predict/2`              | Is the failure returned as data? Does the worker remain available? |
+| Remove the runtime `configure/3` call                 | Which differences between initial and restarted state disappear?   |
+| Replace `:one_for_one` with `:one_for_all`            | Why does the sibling-PID assertion now fail?                       |
+| Use the same activation formula in both code versions | Does the output still provide evidence that code changed?          |
+| Change the task-selection failure policy              | Which candidates are eligible, and what does a missing score mean? |
+
+For the supervision-strategy exercise, changed outcomes are expected: it is not
+an instruction to weaken the original assertions until any behavior passes.
+
+### Takeaway
+
+**A neural design, a process graph, and a tensor program are related
+representations, not interchangeable guarantees.** Use processes to express
+independent activities and recovery boundaries. Use numerical kernels to express
+regular arithmetic. Keep the semantics of the neural model and the evaluation
+protocol explicit across both.
+
+**Next: Chapter 6 - Developing a Feedforward Neural Network.** We will turn
+these architectural choices into a network construction and execution model.
+
+## 5.6 References and adaptation notes
+
+### Primary source
+
+**[S5]** Gene I. Sher. *Handbook of Neuroevolution Through Erlang*. Springer,
+
+1. Chapter 5, "The Unintentional Neural Network Programming Language,"
+   pp. 143-150. DOI: `10.1007/978-1-4614-4463-3_5`.
+
+The uploaded eight-page chapter is the basis for the section sequence and
+source-derived discussion. Its Fig. 5.1 was inspected directly. All figures here
+are newly written Mermaid diagrams; no external image attachments are required.
+
+| Source location          | Material retained                                                                | Remaster treatment                                                                         |
+| ------------------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| p. 143                   | Language architecture and conceptual fit                                         | Retained as Sher's argument, not a comparative performance result                          |
+| Section 5.1, pp. 144-146 | Concurrency, signals, recovery, live maintenance, hardware, telecom requirements | Concise requirement tables with separately labeled engineering qualifications              |
+| Section 5.2, pp. 146-147 | Erlang's telecom origins and reliability-oriented facilities                     | Erlang account retained; Elixir/BEAM/OTP bridge added                                      |
+| Section 5.3, pp. 147-149 | Processes as neurons; connections as messages; Fig. 5.1                          | New mailbox and pipeline examples; numerical parity with Nx                                |
+| Section 5.4, p. 149      | Supervision, the exoself, restoration, and upgrades                              | Separate detection, restart state, and real code-replacement demonstrations                |
+| Section 5.5, pp. 149-150 | The platform to be developed and its applications                                | Source roadmap retained; a small GES-related job runner added                              |
+| Section 5.6, p. 150      | Six references                                                                   | Reading pointers below; original works are not claimed to have been independently reviewed |
+
+### References listed by Sher
+
+Bibliographic reading pointers from [S5], condensed without reproducing ISBNs.
+
+| Original number | Work                                                                                                                             | Role in Sher's discussion                         |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| 1               | Everett (2005), "Cultural Constraints on Grammar and Cognition in Piraha: Another Look at the Design Features of Human Language" | Language and cognition motivation                 |
+| 2               | Dacker (2000), *Concurrent Functional Programming for Telecommunications: A Case Study of Technology Introduction*               | Telecommunications requirements                   |
+| 3               | Armstrong (2003), *Making Reliable Distributed Systems in the Presence of Software Errors*                                       | Concurrency-oriented architecture and reliability |
+| 4               | Armstrong (2007), *Programming Erlang: Software for a Concurrent World*                                                          | Erlang background                                 |
+| 5               | Thompson and Cesarini (2009), *Erlang Programming: A Concurrent Approach to Software Development*                                | Erlang background                                 |
+| 6               | Logan, Merritt, and Carlsson (2010), *Erlang and OTP in Action*                                                                  | OTP background                                    |
+
+### Official documentation used for the remaster additions
+
+These sources support the implementation notes, not Sher's historical claims.
+Documentation was consulted on 2026-11-02. The package pins are carried over from
+our earlier notebooks, rather than asserted to be the newest releases.
+
+| Key | Official source                                                                                                           | Used for                                                              |
+| --- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| D1  | [Elixir: Processes](https://hexdocs.pm/elixir/processes.html)                                                             | Spawning, messages, receive loops, and links                          |
+| D2  | [GenServer](https://hexdocs.pm/elixir/GenServer.html)                                                                     | Client interfaces, callbacks, state, and code-change responsibilities |
+| D3  | [Supervisor](https://hexdocs.pm/elixir/Supervisor.html)                                                                   | Child specifications, initialization, restart limits, and strategies  |
+| D4  | [Erlang process reference](https://www.erlang.org/doc/system/ref_man_processes.html)                                      | Process identities, monitors, links, and lifecycle semantics          |
+| D5  | [Erlang: Compilation and Code Loading](https://www.erlang.org/doc/system/code_loading.html)                               | Current/old code and remote-call replacement behavior                 |
+| D6  | [Kino.Layout](https://hexdocs.pm/kino/Kino.Layout.html) and [Kino.DataTable](https://kino.hexdocs.pm/Kino.DataTable.html) | Tabbed outputs and ordered data-table columns                         |
+| D7  | [Kino.Download](https://hexdocs.pm/kino/Kino.Download.html)                                                               | Binary-producing download callbacks                                   |
+| D8  | [Elixir typespecs](https://hexdocs.pm/elixir/typespecs.html)                                                              | Function contracts and custom types                                   |
+| D9  | [Elixir language overview](https://elixir-lang.org/)                                                                      | Erlang VM and OTP relationship                                        |
+| D10 | [Nx.Defn](https://hexdocs.pm/nx/Nx.Defn.html)                                                                             | Numerical functions and compiler/backend separation                   |
+| D11 | [Code](https://hexdocs.pm/elixir/Code.html)                                                                               | Compilation and loading of fixed source strings                       |
+| D12 | [Task.Supervisor](https://hexdocs.pm/elixir/Task.Supervisor.html)                                                         | Non-linked streams, ordered results, bounded concurrency, and cleanup |
+
+### Scope boundaries
+
+The notebook demonstrates local processes, not a multi-node deployment. It
+replaces one stateless function module, not a whole application release. It
+reconstructs a worker from initial parameters, not a durable checkpoint. It
+checks numerical equivalence, not acceleration. It preserves Sher's motivation
+without treating concurrency, supervision, or code loading as proof that general
+intelligence or automatic self-repair follows.
+
+**End of Chapter 5.**

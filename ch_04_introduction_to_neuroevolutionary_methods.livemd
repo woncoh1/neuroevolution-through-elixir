@@ -1,0 +1,1565 @@
+# Chapter 4. Introduction to Neuroevolutionary Methods
+
+```elixir
+Mix.install([
+  {:nx, "1.0.0"},
+  {:kino, "0.19.1"},
+  {:kino_vega_lite, "0.1.13"}
+])
+
+defmodule Chapter04.Tables do
+  @moduledoc false
+
+  @type column :: atom() | String.t()
+  @type cell :: atom() | number() | String.t()
+  @type row :: %{optional(column()) => cell()}
+
+  @spec tabs([row()], [column()], String.t()) :: Kino.Layout.t()
+  @spec tabs([row()], [column()], String.t(), String.t() | nil) :: Kino.Layout.t()
+  def tabs(rows, columns, filename, markdown_source \\ nil) do
+    markdown_source = markdown_source || markdown(rows, columns)
+    csv_source = csv(rows, columns)
+
+    Kino.Layout.tabs([
+      {"Interactive", Kino.DataTable.new(rows, keys: columns)},
+      {"Markdown", Kino.Markdown.new(markdown_source)},
+      {"CSV",
+       Kino.Layout.grid([
+         Kino.Download.new(fn -> csv_source end, filename: filename, label: "Download CSV"),
+         Kino.Text.new(csv_source)
+       ])}
+    ])
+  end
+
+  @spec markdown([row()], [column()]) :: String.t()
+  defp markdown(rows, columns) do
+    header = markdown_row(columns)
+    separator = markdown_row(Enum.map(columns, fn _ -> "---" end))
+
+    body =
+      Enum.map(rows, fn row ->
+        markdown_row(Enum.map(columns, &Map.fetch!(row, &1)))
+      end)
+
+    Enum.join([header, separator | body], "\n") <> "\n"
+  end
+
+  @spec markdown_row([cell()]) :: String.t()
+  defp markdown_row(values) do
+    "| " <> Enum.map_join(values, " | ", &markdown_cell/1) <> " |"
+  end
+
+  @spec markdown_cell(cell()) :: String.t()
+  defp markdown_cell(value) do
+    value
+    |> to_string()
+    |> String.replace("\\", "\\\\")
+    |> String.replace("|", "\\|")
+    |> String.replace("\r\n", "<br>")
+    |> String.replace(["\r", "\n"], "<br>")
+  end
+
+  @spec csv([row()], [column()]) :: String.t()
+  defp csv(rows, columns) do
+    records = [columns | Enum.map(rows, fn row -> Enum.map(columns, &Map.fetch!(row, &1)) end)]
+
+    Enum.map_join(records, "\r\n", fn record ->
+      Enum.map_join(record, ",", &csv_field/1)
+    end) <> "\r\n"
+  end
+
+  @spec csv_field(cell()) :: String.t()
+  defp csv_field(value) do
+    "\"" <> String.replace(to_string(value), "\"", "\"\"") <> "\""
+  end
+end
+```
+
+## Reader's guide
+
+**Neuroevolution through Elixir**  
+Part I - Foundations
+
+**The central idea:** evolve an inherited neural design, construct its working
+phenotype, observe what it does, and decide which designs persist. Parameters,
+topology, interfaces, and developmental rules are different things we can vary.
+
+This chapter remasters Gene I. Sher's *Handbook of Neuroevolution Through Erlang*
+(2013), Chapter 4, printed pp. 105-141, from the supplied 37-page PDF. Original
+section numbers, terminology, and the three application scenarios are retained.
+Source notes refer to that chapter as **[S]**.
+
+All Elixir/Nx implementations, executable experiments, numerical settings, new
+figures, and the Generation-Evaluation-Selection (**GES**) organization are
+**remaster additions**. They illustrate the chapter rather than reconstructing
+its unreported experiments. Explicit source boundaries distinguish Sher's
+proposals from results that this notebook actually tests.
+
+### Chapter map
+
+| Section                                        | Question                                                  | Implementation or representation                   |
+| ---------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------- |
+| 4.1 Encoding approaches and mutation operators | What is inherited, and what can change?                   | Design contracts                                   |
+| 4.1.1 Mutation operators                       | How do weights, connections, and neurons change?          | Immutable graph mutations                          |
+| 4.1.2 Genotype encoding                        | How do we store the same network differently?             | Node records and connection records                |
+| 4.1.3 Phenotype                                | How does an encoding become a working network?            | Graph execution and coordinate-generated weights   |
+| 4.2 Neuroevolution through genetic algorithms  | How do we organize the search?                            | GES loop                                           |
+| 4.2.1 XOR                                      | Can evolution change topology and weights together?       | Source audit and bounded batched TWEANN experiment |
+| 4.2.2 Pole balancing                           | How do sensors, actuators, and evaluation specify a task? | Double-pole interface and termination tests        |
+| 4.2.3 Evolving intelligence                    | What changes in a shared, reproductive world?             | Source thought experiment and resource accounting  |
+| 4.3 Memetic algorithms                         | Why tune a structural innovation before judging it?       | Fixed-topology local search with a counted budget  |
+| 4.4 Graph-based genetic programming            | What is shared across these representations?              | Computational graph synthesis and checks           |
+| 4.5 References                                 | Which statements and choices come from which source?      | Source map and software references                 |
+
+### Run this notebook
+
+Evaluate the setup cell, then every subsequent Elixir cell in order. No earlier
+notebook, dataset, GPU, or accompanying image is required. Package pins match
+Chapters 2 and 3. The examples default to **Nx.BinaryBackend** and
+**Nx.Defn.Evaluator**. Initial dependency installation needs network access or a
+prepared local cache. [D1-D4]
+
+Ordinary explanatory tables stay **Markdown**. Every displayed computed data
+table has **Interactive**, **Markdown**, and **CSV** tabs. The CSV callback returns
+a binary. All named functions have `@spec`; anonymous callbacks are covered by
+their enclosing operation. Names use `mod_`, `tbl_`, and `fig_` where appropriate.
+
+The full XOR search is deliberately bounded: one hidden layer, at most four
+hidden neurons, and tanh activations. It changes active topology and weights,
+but it is **not** a general graph-growing platform, NEAT, or DXNN. The graph
+operators and indirect encoding are separate demonstrations. The full
+process-based platform comes later in the book.
+
+**Validation status:** see the final validation note. Assertions test structural
+and numerical invariants; they do not assume that a stochastic run must solve
+XOR within its budget. These small examples are not speed benchmarks.
+
+```elixir
+alias VegaLite, as: Vl
+
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+
+defmodule Chapter04.Support do
+  @moduledoc false
+  @type numeric :: Nx.Tensor.t() | number()
+
+  @spec max_error(numeric(), numeric()) :: number()
+  def max_error(actual, expected) do
+    actual |> Nx.subtract(expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+  end
+
+  @spec close!(numeric(), numeric(), number()) :: :ok
+  def close!(actual, expected, tolerance) do
+    error = max_error(actual, expected)
+    unless is_number(error) and error <= tolerance do
+      raise "Numerical check failed: error=#{inspect(error)}, tolerance=#{tolerance}"
+    end
+    :ok
+  end
+
+  @spec check!(boolean(), String.t()) :: %{check: String.t(), result: String.t()}
+  def check!(true, label), do: %{check: label, result: "PASS"}
+  def check!(false, label), do: raise("Check failed: #{label}")
+
+  @spec nonincreasing?([number()]) :: boolean()
+  def nonincreasing?(values) do
+    values |> Enum.chunk_every(2, 1, :discard) |> Enum.all?(fn [a, b] -> b <= a end)
+  end
+
+  @spec finite?(Nx.Tensor.t()) :: boolean()
+  def finite?(tensor) do
+    tensor |> Nx.to_flat_list() |> Enum.all?(&is_number/1)
+  end
+
+  @spec rejected?((-> term())) :: boolean()
+  def rejected?(fun) do
+    try do
+      fun.()
+      false
+    rescue
+      ArgumentError -> true
+    end
+  end
+end
+```
+
+## 4.1 Neural Network Encoding Approaches and Mutation Operators
+
+*Source: [S], pp. 105-106.*
+
+Chapter 2 supplied neural computations and plasticity rules. Chapter 3 supplied
+an evolutionary search. Here we join them: the inherited candidate is a **neural
+network design**, and its phenotype is the network that processes signals.
+
+A useful local learning rule does not, by itself, choose the surrounding network's
+size, connections, inputs, or task. Sher motivates neuroevolution as a way to
+choose those features together with synaptic weights and other parameters.
+
+| Search target    | Example change                                | What must be reevaluated?                |
+| ---------------- | --------------------------------------------- | ---------------------------------------- |
+| Parameters       | Perturb a synaptic weight or bias             | The network's outputs or behavior        |
+| Topology         | Add, splice, or remove a neuron or connection | The altered computational structure      |
+| Neural mechanism | Change an activation or plasticity setting    | The resulting computation and adaptation |
+| Interface        | Add or swap a sensor or actuator              | The agent's interaction with its scape   |
+| Development      | Change a substrate density or coordinate rule | The phenotype constructed by the mapper  |
+
+A **TWEANN** is a topology-and-weight-evolving artificial neural network system.
+Weight-only optimization is neuroevolution too, but it does not demonstrate
+topology evolution.
+
+**Source boundary:** Sher argues that supervised backpropagation cannot solve
+his broader design problem. This chapter supplies no general comparison proving
+that it fails on all complex tasks. We retain his motivation without treating
+neuroevolution as the only possible design method.
+
+## 4.1.1 Neural Network Mutation Operators
+
+*Source: [S], pp. 106-108; Figs. 4.1-4.3.*
+
+A mutation operator changes a **genotype**. Its consequences are measured after
+the modified genotype is mapped to a phenotype.
+
+| Operator family  | Source examples                                                  | Required implementation decision                             |
+| ---------------- | ---------------------------------------------------------------- | ------------------------------------------------------------ |
+| Parameter change | Tune weights; add a bias                                         | Which value changes, by how much?                            |
+| Complexification | Add a neuron; add a connection; splice a connection              | How is the new component connected and initialized?          |
+| Pruning          | Remove a connection or neuron; reconnect around a removed neuron | Are incident links deleted or rewired?                       |
+| Interface change | Add sensors or actuators                                         | Is the new interface available and dimensionally compatible? |
+
+Sher calls Fig. 4.2's operators "deleterious." Here we call them **pruning**:
+removal describes a structural change, not its measured benefit or harm. A new
+node is not automatically useful, and a deleted node is not automatically harmful.
+
+### Experiment 1 - Mutate a small, inspectable graph
+
+**Remaster representation:** ordered node records plus a map of directed edges.
+An edge `{from, to} => weight` stores one scalar weight. Sensors have scalar
+outputs; the final neuron is the output. The list is a **topological order**:
+every edge must point forward. This intentionally excludes recurrent edges.
+Recurrent evaluation needs an explicit delay and state convention, not just a
+connection that happens to point backward.
+
+The following operators are deterministic edits. Evolution will choose edits
+stochastically in Experiment 5. Invalid edits raise an error rather than silently
+creating a broken network.
+
+```elixir
+defmodule Chapter04.Graph do
+  @moduledoc false
+
+  @type id :: non_neg_integer()
+  @type activation :: :identity | :tanh | :sin | :cos
+  @type node_record :: %{id: id(), kind: :sensor | :neuron,
+                         activation: activation(), bias: number()}
+  @type genome :: %{nodes: [node_record()], edges: %{optional({id(), id()}) => number()},
+                    sensors: [id()], outputs: [id()]}
+
+  @spec validate!(genome()) :: genome()
+  def validate!(g) do
+    ids = Enum.map(g.nodes, & &1.id)
+    nodes = Map.new(g.nodes, &{&1.id, &1})
+    order = ids |> Enum.with_index() |> Map.new()
+
+    valid_nodes = g.nodes != [] and length(ids) == MapSet.size(MapSet.new(ids)) and
+      Enum.all?(g.nodes, fn n ->
+        is_integer(n.id) and n.id >= 0 and n.kind in [:sensor, :neuron] and
+          n.activation in [:identity, :tanh, :sin, :cos] and is_number(n.bias)
+      end)
+
+    sensor_ids = g.nodes |> Enum.filter(&(&1.kind == :sensor)) |> Enum.map(& &1.id)
+    valid_interfaces = g.sensors != [] and g.outputs != [] and
+      length(g.sensors) == MapSet.size(MapSet.new(g.sensors)) and
+      length(g.outputs) == MapSet.size(MapSet.new(g.outputs)) and
+      sensor_ids == g.sensors
+
+    valid_outputs = Enum.all?(g.outputs, fn id ->
+      Map.has_key?(nodes, id) and nodes[id].kind == :neuron
+    end)
+
+    valid_edges = Enum.all?(g.edges, fn {{from, to}, weight} ->
+      Map.has_key?(nodes, from) and Map.has_key?(nodes, to) and
+        nodes[to].kind == :neuron and order[from] < order[to] and is_number(weight)
+    end)
+
+    unless valid_nodes and valid_interfaces and valid_outputs and valid_edges do
+      raise ArgumentError, "require unique nodes, valid interfaces, and forward numeric edges"
+    end
+    g
+  end
+
+  @spec incoming(genome(), id()) :: [{id(), number()}]
+  def incoming(g, id) do
+    g.edges
+    |> Enum.filter(fn {{_from, to}, _w} -> to == id end)
+    |> Enum.map(fn {{from, _to}, weight} -> {from, weight} end)
+    |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  @spec records(genome()) :: [map()]
+  def records(g) do
+    validate!(g)
+    Enum.map(g.nodes, fn n ->
+      outgoing = g.edges |> Map.keys() |> Enum.filter(&(elem(&1, 0) == n.id))
+        |> Enum.map(&elem(&1, 1)) |> Enum.sort()
+      Map.merge(n, %{input_idps: incoming(g, n.id), output_ids: outgoing})
+    end)
+  end
+
+  @spec add_connection(genome(), id(), id(), number()) :: genome()
+  def add_connection(g, from, to, weight) do
+    if Map.has_key?(g.edges, {from, to}), do: raise(ArgumentError, "edge already exists")
+    validate!(%{g | edges: Map.put(g.edges, {from, to}, weight)})
+  end
+
+  @spec perturb_weight(genome(), id(), id(), number()) :: genome()
+  def perturb_weight(g, from, to, delta) do
+    weight = Map.fetch!(g.edges, {from, to})
+    validate!(%{g | edges: Map.put(g.edges, {from, to}, weight + delta)})
+  end
+
+  @spec delete_connection(genome(), id(), id()) :: genome()
+  def delete_connection(g, from, to) do
+    Map.fetch!(g.edges, {from, to})
+    validate!(%{g | edges: Map.delete(g.edges, {from, to})})
+  end
+
+  @spec splice(genome(), id(), id(), id()) :: genome()
+  def splice(g, from, to, new_id) do
+    if Enum.any?(g.nodes, &(&1.id == new_id)), do: raise(ArgumentError, "node id already exists")
+    weight = Map.fetch!(g.edges, {from, to})
+    position = Enum.find_index(g.nodes, &(&1.id == to))
+    node = %{id: new_id, kind: :neuron, activation: :identity, bias: 0.0}
+    edges = g.edges |> Map.delete({from, to})
+      |> Map.put({from, new_id}, 1.0) |> Map.put({new_id, to}, weight)
+    validate!(%{g | nodes: List.insert_at(g.nodes, position, node), edges: edges})
+  end
+
+  @spec remove_hidden(genome(), id()) :: genome()
+  def remove_hidden(g, id) do
+    unless Enum.any?(g.nodes, &(&1.id == id)) and id not in g.sensors and id not in g.outputs do
+      raise ArgumentError, "only an existing hidden node can be removed"
+    end
+    edges = Map.reject(g.edges, fn {{from, to}, _w} -> from == id or to == id end)
+    validate!(%{g | nodes: Enum.reject(g.nodes, &(&1.id == id)), edges: edges})
+  end
+
+  @spec set_activation(genome(), id(), activation()) :: genome()
+  def set_activation(g, id, activation) do
+    unless Enum.any?(g.nodes, &(&1.id == id and &1.kind == :neuron)) do
+      raise ArgumentError, "activation belongs to an existing neuron"
+    end
+    nodes = Enum.map(g.nodes, fn n -> if n.id == id, do: %{n | activation: activation}, else: n end)
+    validate!(%{g | nodes: nodes})
+  end
+
+  @spec activate(number(), activation()) :: number()
+  def activate(z, :identity), do: z
+  def activate(z, :tanh), do: :math.tanh(z)
+  def activate(z, :sin), do: :math.sin(z)
+  def activate(z, :cos), do: :math.cos(z)
+
+  @spec predict(genome(), [number()]) :: [number()]
+  def predict(g, inputs) do
+    validate!(g)
+    unless length(inputs) == length(g.sensors), do: raise(ArgumentError, "wrong input width")
+    initial = Map.new(Enum.zip(g.sensors, inputs))
+    values = Enum.reduce(g.nodes, initial, fn n, values ->
+      if n.kind == :sensor do
+        values
+      else
+        z = Enum.reduce(incoming(g, n.id), n.bias, fn {id, weight}, sum ->
+          sum + weight * Map.fetch!(values, id)
+        end)
+        Map.put(values, n.id, activate(z, n.activation))
+      end
+    end)
+    Enum.map(g.outputs, &Map.fetch!(values, &1))
+  end
+end
+
+mod_graph = Chapter04.Graph.validate!(%{
+  nodes: [
+    %{id: 0, kind: :sensor, activation: :identity, bias: 0.0},
+    %{id: 1, kind: :sensor, activation: :identity, bias: 0.0},
+    %{id: 2, kind: :neuron, activation: :tanh, bias: 0.1}
+  ],
+  edges: %{{0, 2} => 0.6, {1, 2} => -0.4}, sensors: [0, 1], outputs: [2]
+})
+
+mod_spliced = Chapter04.Graph.splice(mod_graph, 0, 2, 3)
+mod_nonlinear = Chapter04.Graph.set_activation(mod_spliced, 3, :tanh)
+mod_linked = Chapter04.Graph.add_connection(mod_spliced, 1, 3, 0.25)
+mod_pruned = Chapter04.Graph.remove_hidden(mod_spliced, 3)
+mod_perturbed = Chapter04.Graph.perturb_weight(mod_graph, 0, 2, 0.2)
+
+inputs_graph = [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+reference_graph = Enum.map(inputs_graph, &Chapter04.Graph.predict(mod_graph, &1)) |> List.flatten()
+
+tbl_mutations =
+  [{"Original", mod_graph}, {"Identity splice", mod_spliced},
+   {"Nonlinear splice", mod_nonlinear}, {"Added connection", mod_linked},
+   {"Removed hidden node", mod_pruned}, {"Perturbed weight", mod_perturbed}]
+  |> Enum.map(fn {name, genome} ->
+    outputs = Enum.map(inputs_graph, &Chapter04.Graph.predict(genome, &1)) |> List.flatten()
+    error = Enum.zip(outputs, reference_graph) |> Enum.map(fn {a, b} -> abs(a - b) end) |> Enum.max()
+    %{variant: name, nodes: length(genome.nodes), edges: map_size(genome.edges),
+      outputs: inspect(Enum.map(outputs, &Float.round(&1, 5))), max_output_change: error}
+  end)
+
+Chapter04.Tables.tabs(tbl_mutations, [:variant, :nodes, :edges, :outputs, :max_output_change],
+  "ch_04_tbl_01_graph_mutations.csv")
+```
+
+**Why an identity splice preserves behavior:** replace $u\xrightarrow{w}v$ by
+$u\xrightarrow{1}h\xrightarrow{w}v$, with $h(u)=u$ and zero bias. The contribution
+to $v$ remains $wu$. Changing $h$ to tanh instead gives $w\tanh(u)$; preservation
+no longer follows. This identity initialization is our design choice, not a
+property Sher assigns to every splice operator.
+
+Removing the inserted node deletes its incident edges; it does **not** restore
+the old connection. Mutation operators need precise contracts, not just names.
+The validator allows an output that receives only a bias: such a graph may be
+poor at the task without being structurally invalid.
+
+```mermaid
+flowchart LR
+    A[Original edge: weighted signal] --> B[Splice an identity node]
+    B --> C[Same outputs; more structure]
+    C --> D[Mutate activation or new connections]
+    D --> E[Changed outputs; evaluate again]
+```
+
+*Figure R4.1 - Structural change and behavioral change are not the same thing.*
+
+## 4.1.2 Neural Network Genotype Encoding
+
+*Source: [S], pp. 108-113; Figs. 4.4-4.7.*
+
+Sher contrasts two direct encodings. Both can specify nodes, connections, and
+weights; the difference is how that information is organized.
+
+| Encoding in the source                   | Organization                                           | Mutation bookkeeping                                              |
+| ---------------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------- |
+| String/list of node and connection genes | Node records plus connection records                   | Add, remove, or update the relevant records                       |
+| DXNN-style node tuples                   | Each node stores incoming IDs/weights and outgoing IDs | Update the source's fan-out and the destination's fan-in together |
+
+Here "string" means an encoded sequence, not necessarily a text string. Sher
+associates the first illustration with NEAT and prefers the second for readability
+and database storage. His illustration does not specify all mechanisms required
+to implement NEAT; these demonstrations are not a NEAT implementation.
+
+Our canonical genome resembles the first layout but uses Elixir maps. The
+`records/1` view resembles the second. We **derive** incoming and outgoing lists
+from one edge map so redundant adjacency views cannot silently diverge.
+
+### Experiment 2 - View one genome as per-node records
+
+```elixir
+node_records = Chapter04.Graph.records(mod_linked)
+
+tbl_records = Enum.map(node_records, fn n ->
+  %{id: n.id, kind: n.kind, activation: n.activation, bias: n.bias,
+    input_idps: inspect(n.input_idps), output_ids: inspect(n.output_ids)}
+end)
+
+Chapter04.Tables.tabs(tbl_records,
+  [:id, :kind, :activation, :bias, :input_idps, :output_ids],
+  "ch_04_tbl_02_node_records.csv")
+```
+
+A readable representation helps us inspect and modify a design. It does not make
+memory, numerical cost, or communication cost disappear. Sher's preference for
+human-readable records is an architectural argument; this notebook does not
+measure one encoding as universally superior.
+
+## 4.1.3 The Neural Network Phenotype
+
+*Source: [S], pp. 113-118; Figs. 4.8-4.9.*
+
+The genotype is inherited data. The **phenotype** is the constructed system that
+receives inputs and produces outputs. A mapper connects the two.
+
+$$
+p = M(g; e_{\mathrm{development}}, r),
+\qquad
+\tau = \operatorname{Run}(p,e_{\mathrm{evaluation}}).
+$$
+
+This is remaster notation: $g$ is the genotype, $p$ the phenotype, $e$ an
+explicit environment, $r$ any developmental randomness, and $\tau$ a trajectory
+or set of outputs. Direct deterministic mappings need not use $e$ or $r$.
+
+| Mapping  | What the genotype specifies                           | What the mapper contributes                      |
+| -------- | ----------------------------------------------------- | ------------------------------------------------ |
+| Direct   | Explicit components, links, and parameters            | Their executable representation                  |
+| Indirect | Rules or a smaller system that generates a larger one | Development, geometry, and other declared inputs |
+
+Sher's Fig. 4.8 is an environment-dependent developmental scenario: the same
+design develops different sensors in differently colored surroundings. His
+Fig. 4.9 uses a smaller neural network to generate substrate weights from pairs
+of coordinates. These are two examples of indirect mapping, not one mandatory
+implementation.
+
+### Experiment 3 - Map the graph to an Nx phenotype
+
+The mapper below produces an execution plan. Elixir follows graph dependencies;
+Nx processes all examples in a batch. This demonstrates a useful separation,
+not a compiled whole-graph accelerator or a process-per-neuron system.
+
+```elixir
+defmodule Chapter04.Phenotype do
+  @moduledoc false
+  @type plan :: %{sensors: [Chapter04.Graph.id()], outputs: [Chapter04.Graph.id()],
+                  operations: [map()]}
+
+  @spec build(Chapter04.Graph.genome()) :: plan()
+  def build(g) do
+    %{sensors: g.sensors, outputs: g.outputs,
+      operations: Chapter04.Graph.records(g) |> Enum.filter(&(&1.kind == :neuron))}
+  end
+
+  @spec activate(Nx.Tensor.t(), Chapter04.Graph.activation()) :: Nx.Tensor.t()
+  defp activate(z, :identity), do: z
+  defp activate(z, :tanh), do: Nx.tanh(z)
+  defp activate(z, :sin), do: Nx.sin(z)
+  defp activate(z, :cos), do: Nx.cos(z)
+
+  @spec run(plan(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  def run(plan, x) do
+    unless Nx.rank(x) == 2 and Nx.axis_size(x, 1) == length(plan.sensors) do
+      raise ArgumentError, "inputs must have shape {batch, number_of_sensors}"
+    end
+    batch = Nx.axis_size(x, 0)
+    initial = plan.sensors |> Enum.with_index() |> Map.new(fn {id, column} ->
+      {id, x |> Nx.slice_along_axis(column, 1, axis: 1) |> Nx.squeeze(axes: [1])}
+    end)
+    signals = Enum.reduce(plan.operations, initial, fn n, signals ->
+      z = Enum.reduce(n.input_idps, Nx.broadcast(Nx.tensor(n.bias, type: :f32), {batch}),
+        fn {id, weight}, sum -> Nx.add(sum, Nx.multiply(Map.fetch!(signals, id), weight)) end)
+      Map.put(signals, n.id, activate(z, n.activation))
+    end)
+    plan.outputs |> Enum.map(&Map.fetch!(signals, &1)) |> Nx.stack(axis: 1)
+  end
+end
+
+mod_phenotype = Chapter04.Phenotype.build(mod_linked)
+x_graph = Nx.tensor(inputs_graph, type: :f32)
+y_graph = Chapter04.Phenotype.run(mod_phenotype, x_graph)
+y_graph_reference = Enum.map(inputs_graph, &Chapter04.Graph.predict(mod_linked, &1))
+Chapter04.Support.close!(y_graph, Nx.tensor(y_graph_reference, type: :f32), 1.0e-6)
+
+tbl_mapping = Enum.zip([inputs_graph, List.flatten(y_graph_reference), Nx.to_flat_list(y_graph)])
+  |> Enum.map(fn {[x1, x2], scalar, tensor} ->
+    %{x1: x1, x2: x2, scalar_output: scalar, nx_output: tensor, error: abs(scalar - tensor)}
+  end)
+
+Chapter04.Tables.tabs(tbl_mapping, [:x1, :x2, :scalar_output, :nx_output, :error],
+  "ch_04_tbl_03_genotype_phenotype_parity.csv")
+```
+
+### Experiment 4 - Generate a substrate from coordinates
+
+Sher's substrate has densities **[3, 5, 2]** at layer positions $y=-1,0,1$.
+The first layer represents sensory outports, not three processing neurons.
+Coordinates along each layer are equally spaced. The generator receives
+$[x_s,y_s,x_t,y_t]$ and supplies a weight for the source-target pair.
+
+**Remaster simplification:** a single tanh neuron serves as the generator:
+
+$$
+w_{st}=\tanh(a x_s+b y_s+c x_t+d y_t+e).
+$$
+
+All adjacent-layer connections are expressed, substrate biases are zero, and
+substrate neurons use tanh. Five inherited numerical parameters generate 25
+weights for [3,5,2]. The architecture and coordinate conventions remain part of
+the specification; they are not "free" information. This is not full HyperNEAT.
+
+```elixir
+defmodule Chapter04.Substrate do
+  @moduledoc false
+  import Nx.Defn
+
+  @spec coordinates(pos_integer(), number()) :: Nx.Tensor.t()
+  def coordinates(count, y) when is_integer(count) and count > 0 and is_number(y) do
+    xs = if count == 1, do: [0.0], else: Enum.map(0..(count - 1), &(-1.0 + 2.0 * &1 / (count - 1)))
+    Nx.tensor(Enum.map(xs, &[&1, y]), type: :f32)
+  end
+
+  # source: {sources, 2}; target: {targets, 2}; result: {sources, targets}
+  @spec weights(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn weights(generator, source, target) do
+    sx = Nx.slice_along_axis(source, 0, 1, axis: 1)
+    sy = Nx.slice_along_axis(source, 1, 1, axis: 1)
+    tx = Nx.transpose(Nx.slice_along_axis(target, 0, 1, axis: 1))
+    ty = Nx.transpose(Nx.slice_along_axis(target, 1, 1, axis: 1))
+    Nx.tanh(generator[0] * sx + generator[1] * sy + generator[2] * tx +
+      generator[3] * ty + generator[4])
+  end
+
+  @spec forward(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn forward(x, w1, w2), do: Nx.tanh(Nx.dot(Nx.tanh(Nx.dot(x, w1)), w2))
+end
+
+generator = Nx.tensor([0.8, -0.3, -0.6, 0.4, 0.1], type: :f32)
+coordinates_input = Chapter04.Substrate.coordinates(3, -1.0)
+coordinates_hidden = Chapter04.Substrate.coordinates(5, 0.0)
+coordinates_output = Chapter04.Substrate.coordinates(2, 1.0)
+w_substrate_1 = Chapter04.Substrate.weights(generator, coordinates_input, coordinates_hidden)
+w_substrate_2 = Chapter04.Substrate.weights(generator, coordinates_hidden, coordinates_output)
+x_substrate = Nx.tensor([[1.0, 0.0, -1.0]], type: :f32)
+y_substrate = Chapter04.Substrate.forward(x_substrate, w_substrate_1, w_substrate_2)
+
+coordinates_hidden_dense = Chapter04.Substrate.coordinates(9, 0.0)
+w_dense_1 = Chapter04.Substrate.weights(generator, coordinates_input, coordinates_hidden_dense)
+w_dense_2 = Chapter04.Substrate.weights(generator, coordinates_hidden_dense, coordinates_output)
+
+tbl_substrates = Enum.map([
+  {"[3,5,2]", w_substrate_1, w_substrate_2}, {"[3,9,2]", w_dense_1, w_dense_2}
+], fn {density, w1, w2} ->
+  %{density: density, generator_parameters: Nx.size(generator),
+    generated_weights: Nx.size(w1) + Nx.size(w2), w1_shape: inspect(Nx.shape(w1)),
+    w2_shape: inspect(Nx.shape(w2))}
+end)
+
+Chapter04.Tables.tabs(tbl_substrates,
+  [:density, :generator_parameters, :generated_weights, :w1_shape, :w2_shape],
+  "ch_04_tbl_04_substrate_density.csv")
+```
+
+```elixir
+tbl_substrate_weights = w_substrate_1 |> Nx.to_flat_list() |> Enum.with_index()
+  |> Enum.map(fn {weight, index} ->
+    %{source: div(index, 5), target: rem(index, 5), weight: weight}
+  end)
+
+fig_substrate = Vl.new(width: 440, height: 230, title: "R4.2 - Coordinate-generated weights")
+  |> Vl.data_from_values(tbl_substrate_weights)
+  |> Vl.mark(:rect)
+  |> Vl.encode_field(:x, "target", type: :ordinal, title: "Hidden unit")
+  |> Vl.encode_field(:y, "source", type: :ordinal, title: "Sensory outport")
+  |> Vl.encode_field(:color, "weight", type: :quantitative)
+
+fig_substrate
+```
+
+Increasing density changes the generated network without adding generator
+parameters. It does not guarantee better task performance or preserve the old
+network's outputs. The five-parameter generator also cannot specify 25 arbitrary,
+independent weights: its compactness imposes structure.
+
+Sher additionally proposes density changes, dimensionality changes, and
+coordinate preprocessors such as distances or alternative coordinate systems.
+Those are mutation options, not operations exercised by our small generator.
+
+```mermaid
+flowchart LR
+    G[Inherited generator parameters] --> M[Coordinate-based mapper]
+    C[Layer densities and coordinates] --> M
+    M --> W[Generated substrate weights]
+    S[Sensor values] --> P[Substrate phenotype]
+    W --> P
+    P --> A[Actuator commands]
+```
+
+*Figure R4.3 - The weight generator and the task-performing network have different roles.*
+
+Sher also discusses hardware, software, wetware, and a tuple-to-process mapper.
+Our examples use software and distinguish mathematical equivalence from tested
+numerical agreement. Equal intentions do not by themselves establish equal
+precision, update timing, or behavior across implementations.
+
+## 4.2 Neuroevolution Through Genetic Algorithms
+
+*Source: [S], p. 118; shared setup across pp. 119-127.*
+
+The single-phase pattern is straightforward: evaluate candidates, preserve fit
+parents, generate mutated descendants, and evaluate again. Sher's examples use
+mutation-based offspring; crossover is not required by these examples.
+
+Our **GES** organization makes three responsibilities explicit:
+
+| Stage      | Responsibility                                    | Output                                  |
+| ---------- | ------------------------------------------------- | --------------------------------------- |
+| Generation | Copy and vary inherited designs                   | Candidate genotypes                     |
+| Evaluation | Map designs and measure their behavior            | Measurements associated with candidates |
+| Selection  | Choose survivors, parents, and archive admissions | Decisions that affect subsequent search |
+
+The same genotype can be evaluated on different problems by changing its
+sensor-actuator-scape interface, provided dimensions and semantics remain valid.
+Neither a data record nor a tensor shape alone specifies what its signals mean.
+
+## 4.2.1 Example 1: Evolving a XOR Logical Operator
+
+*Source: [S], pp. 118-122; Figs. 4.10-4.11.*
+
+The sensor reads two bipolar values from the XOR truth table. The network emits
+one value. The scape compares that value with the target.
+
+| $x_1$ | $x_2$ | Target $y$ |
+| ----: | ----: | ---------: |
+| -1    | -1    | -1         |
+| -1    | 1     | 1          |
+| 1     | -1    | 1          |
+| 1     | 1     | -1         |
+
+Sher evaluates the whole table using
+
+$$
+E(g)=\sqrt{\sum_{i=1}^{4}(\widehat y_i-y_i)^2},
+\qquad F_{\mathrm{Sher}}(g)=\frac{1}{E(g)}.
+$$
+
+His illustrative stopping threshold is $F\ge1000$, corresponding to
+$E\le0.001$. The reciprocal is undefined at zero. Our search ranks directly by
+**smaller $E$** and reports the bounded transform $F=1/(1+E)$. The ordering is the
+same for positive errors; the numerical fitness scale is not. We test the error
+threshold itself rather than transferring 1000 to the new scale.
+
+### Source audit - A cosine neuron can implement XOR
+
+The endpoint of Fig. 4.11 uses a **cosine** neuron with rounded weights
+$[-4.64,-4.79]$. It is not the three-tanh-neuron circuit from Chapter 2.
+The cell below evaluates those displayed weights rather than assuming that the
+figure's rounded endpoint reaches the earlier stopping threshold.
+
+For comparison, this **analytic remaster construction**, not an evolved result,
+is exact in real arithmetic:
+
+$$
+\widehat y=\cos\left(\frac{\pi}{2}(x_1+x_2)\right).
+$$
+
+Equal inputs give $\cos(\pm\pi)=-1$; different inputs give $\cos(0)=1$.
+There is no conflict with the failure of a single affine-threshold or tanh neuron:
+cosine is nonmonotonic. The available activation functions change the search space.
+
+```elixir
+x_xor = Nx.tensor([[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]], type: :f32)
+y_xor = Nx.tensor([-1.0, 1.0, 1.0, -1.0], type: :f32)
+y_cos_printed = Nx.cos(Nx.dot(x_xor, Nx.tensor([-4.64, -4.79], type: :f32)))
+y_cos_exact = Nx.cos(Nx.dot(x_xor, Nx.tensor([:math.pi() / 2, :math.pi() / 2], type: :f32)))
+error_cos_printed = y_cos_printed |> Nx.subtract(y_xor) |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+
+tbl_cosine = Enum.zip([Nx.to_flat_list(y_xor), Nx.to_flat_list(y_cos_printed), Nx.to_flat_list(y_cos_exact)])
+  |> Enum.with_index()
+  |> Enum.map(fn {{target, printed, analytic}, row} ->
+    %{row: row, target: target, printed_cosine: printed, analytic_cosine: analytic}
+  end)
+
+Chapter04.Tables.tabs(tbl_cosine, [:row, :target, :printed_cosine, :analytic_cosine],
+  "ch_04_tbl_05_cosine_xor_audit.csv")
+```
+
+The displayed weights produce $E\approx0.0159$ and reciprocal fitness about 63,
+not 1000. This audits the **rounded figure**, not an unavailable unrounded run.
+The analytic network is a reference, not a solution inserted into the population.
+
+### Experiment 5 - Evolve topology and weights in a bounded family
+
+We now use tanh throughout. Every candidate has two inputs, one hidden layer with
+up to $H=4$ slots, and one output. A binary mask decides which hidden neurons and
+their incident connections belong to the expressed phenotype:
+
+$$
+h_{pij}=\tanh(a_{pj}x_{i1}+b_{pj}x_{i2}+c_{pj}),
+\qquad
+\widehat y_{pi}=\tanh\left(\sum_j m_{pj}v_{pj}h_{pij}+d_p\right).
+$$
+
+Here $p$ indexes candidates, $i$ examples, and $j$ hidden slots. We retain dormant
+parameters for inactive slots; they do not affect the output until activated.
+This permits structural additions and removals while preserving tensor shapes.
+It is a **bounded topology search**, not unrestricted graph growth.
+
+| Tensor      | Shape                                   | Meaning                                         |
+| ----------- | --------------------------------------- | ----------------------------------------------- |
+| `theta`     | `{population, 4 * hidden_capacity + 1}` | Blocks `a`, `b`, `c`, `v`, then output bias `d` |
+| `mask`      | `{population, hidden_capacity}`         | Binary expression state of hidden neurons       |
+| `x`         | `{examples, 2}`                         | XOR inputs                                      |
+| Predictions | `{population, examples}`                | One output per candidate and input              |
+| Errors      | `{population}`                          | Whole-table error per candidate                 |
+
+**Remaster search policy:** initialize 48 candidates with one active hidden unit;
+keep the best half; sample parents uniformly from that half; perturb every
+parameter with Gaussian noise; and, with probability 0.25 per offspring, toggle
+one hidden slot. A toggle that would remove the last active unit is rejected.
+Weights stay in $[-8,8]$. The run stops at $E\le0.001$ or after 160 generations.
+There is no crossover, local optimizer, complexity penalty, or diversity claim.
+
+```elixir
+defmodule Chapter04.Network do
+  @moduledoc false
+  import Nx.Defn
+
+  @spec forward(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn forward(theta, mask, x) do
+    capacity = Nx.axis_size(mask, 1)
+    examples = Nx.axis_size(x, 0)
+    a = theta |> Nx.slice_along_axis(0, capacity, axis: 1) |> Nx.new_axis(1)
+    b = theta |> Nx.slice_along_axis(capacity, capacity, axis: 1) |> Nx.new_axis(1)
+    c = theta |> Nx.slice_along_axis(2 * capacity, capacity, axis: 1) |> Nx.new_axis(1)
+    v = theta |> Nx.slice_along_axis(3 * capacity, capacity, axis: 1) |> Nx.new_axis(1)
+    d = Nx.slice_along_axis(theta, 4 * capacity, 1, axis: 1)
+    x1 = x |> Nx.slice_along_axis(0, 1, axis: 1) |> Nx.reshape({1, examples, 1})
+    x2 = x |> Nx.slice_along_axis(1, 1, axis: 1) |> Nx.reshape({1, examples, 1})
+    hidden = Nx.tanh(a * x1 + b * x2 + c)
+    Nx.tanh(Nx.sum(hidden * v * Nx.new_axis(mask, 1), axes: [2]) + d)
+  end
+
+  @spec errors(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn errors(theta, mask, x, target) do
+    Nx.sqrt(Nx.sum(Nx.pow(forward(theta, mask, x) - target, 2), axes: [1]))
+  end
+
+  # All predicates passed to select/3 have the full mask shape.
+  @spec toggle(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn toggle(mask, slots, requested) do
+    slot_ids = Nx.iota(Nx.shape(mask), axis: 1)
+    chosen = slot_ids == Nx.broadcast(Nx.new_axis(slots, 1), Nx.shape(mask))
+    requested = Nx.broadcast(Nx.new_axis(requested, 1), Nx.shape(mask))
+    changed = Nx.select(Nx.logical_and(chosen, requested), 1 - mask, mask)
+    empty = Nx.sum(changed, axes: [1], keep_axes: true) == 0
+    Nx.select(Nx.broadcast(empty, Nx.shape(mask)), mask, changed)
+  end
+end
+
+defmodule Chapter04.Evolution do
+  @moduledoc false
+  @type population :: %{theta: Nx.Tensor.t(), mask: Nx.Tensor.t()}
+  @type champion :: %{theta: Nx.Tensor.t(), mask: Nx.Tensor.t(), error: number()}
+  @type result :: %{population: population(), archive: champion(), key: Nx.Tensor.t(),
+                    history: [map()], stop: :target | :budget}
+
+  @spec champion(population(), Nx.Tensor.t()) :: champion()
+  def champion(pop, errors) do
+    # Keep the leading population axis for subsequent evaluation.
+    index = errors |> Nx.argsort(stable: true) |> Nx.slice_along_axis(0, 1)
+    %{theta: Nx.take(pop.theta, index), mask: Nx.take(pop.mask, index),
+      error: errors |> Nx.take(index) |> Nx.squeeze() |> Nx.to_number()}
+  end
+
+  @spec summary(population(), Nx.Tensor.t(), non_neg_integer(), pos_integer()) :: map()
+  def summary(pop, errors, generation, evaluations) do
+    best = champion(pop, errors)
+    widths = Nx.sum(pop.mask, axes: [1])
+    %{generation: generation, evaluations: evaluations, best_error: best.error,
+      mean_error: Nx.to_number(Nx.mean(errors)), fitness: 1.0 / (1.0 + best.error),
+      champion_hidden: best.mask |> Nx.sum() |> Nx.to_number(),
+      mean_hidden: Nx.to_number(Nx.mean(widths)),
+      distinct_widths: widths |> Nx.to_flat_list() |> Enum.uniq() |> length()}
+  end
+
+  @spec next(population(), Nx.Tensor.t(), Nx.Tensor.t(), number(), number()) ::
+    {population(), Nx.Tensor.t()}
+  def next(pop, errors, key, sigma, topology_rate) do
+    {size, capacity} = Nx.shape(pop.mask)
+    kept = div(size, 2)
+    elite_ids = errors |> Nx.argsort(stable: true) |> Nx.slice_along_axis(0, kept)
+    elite = %{theta: Nx.take(pop.theta, elite_ids), mask: Nx.take(pop.mask, elite_ids)}
+    count = size - kept
+    {parent_ids, key} = Nx.Random.randint(key, 0, kept, shape: {count})
+    parent_theta = Nx.take(elite.theta, parent_ids)
+    parent_mask = Nx.take(elite.mask, parent_ids)
+    {noise, key} = Nx.Random.normal(key, shape: Nx.shape(parent_theta), type: :f32)
+    {slots, key} = Nx.Random.randint(key, 0, capacity, shape: {count})
+    {draws, key} = Nx.Random.uniform(key, shape: {count}, type: :f32)
+    child_theta = parent_theta |> Nx.add(Nx.multiply(noise, sigma)) |> Nx.clip(-8.0, 8.0)
+    child_mask = Chapter04.Network.toggle(parent_mask, slots, Nx.less(draws, topology_rate))
+    next = %{theta: Nx.concatenate([elite.theta, child_theta]),
+      mask: Nx.concatenate([elite.mask, child_mask])}
+    {next, key}
+  end
+
+  @spec run(integer(), Nx.Tensor.t(), Nx.Tensor.t(), keyword()) :: result()
+  def run(seed, x, target, opts) do
+    size = Keyword.fetch!(opts, :size)
+    capacity = Keyword.fetch!(opts, :capacity)
+    generations = Keyword.fetch!(opts, :generations)
+    sigma = Keyword.fetch!(opts, :sigma)
+    topology_rate = Keyword.fetch!(opts, :topology_rate)
+    threshold = Keyword.fetch!(opts, :threshold)
+    unless is_integer(size) and size >= 4 and rem(size, 2) == 0 and
+      is_integer(capacity) and capacity >= 2 and is_integer(generations) and generations > 0 and
+      is_number(sigma) and sigma > 0 and is_number(topology_rate) and topology_rate >= 0 and
+      topology_rate <= 1 and is_number(threshold) and threshold >= 0 and
+      Nx.shape(x) == {4, 2} and Nx.shape(target) == {4} do
+      raise ArgumentError, "invalid XOR population, shapes, variation rates, or budget"
+    end
+    {theta, key} = Nx.Random.normal(Nx.Random.key(seed), shape: {size, 4 * capacity + 1}, type: :f32)
+    theta = Nx.clip(theta, -8.0, 8.0)
+    mask = Nx.iota({size, capacity}, axis: 1) |> Nx.equal(0) |> Nx.as_type(:f32)
+    pop = %{theta: theta, mask: mask}
+    errors = Chapter04.Network.errors(theta, mask, x, target)
+    archive = champion(pop, errors)
+    initial = {pop, errors, key, archive, [summary(pop, errors, 0, size)]}
+
+    {pop, _errors, key, archive, history} =
+      Enum.reduce_while(1..generations, initial, fn generation, {current, errors, key, archive, history} ->
+        if archive.error <= threshold do
+          {:halt, {current, errors, key, archive, history}}
+        else
+          {next, key} = next(current, errors, key, sigma, topology_rate)
+          errors = Chapter04.Network.errors(next.theta, next.mask, x, target)
+          candidate = champion(next, errors)
+          archive = if candidate.error < archive.error, do: candidate, else: archive
+          row = summary(next, errors, generation, size * (generation + 1))
+          {:cont, {next, errors, key, archive, [row | history]}}
+        end
+      end)
+
+    %{population: pop, archive: archive, key: key, history: Enum.reverse(history),
+      stop: if(archive.error <= threshold, do: :target, else: :budget)}
+  end
+end
+
+result_evolution = Chapter04.Evolution.run(20261030, x_xor, y_xor,
+  size: 48, capacity: 4, generations: 160, sigma: 0.35, topology_rate: 0.25, threshold: 0.001)
+tbl_evolution = result_evolution.history
+
+Chapter04.Tables.tabs(tbl_evolution,
+  [:generation, :evaluations, :best_error, :mean_error, :fitness, :champion_hidden,
+   :mean_hidden, :distinct_widths], "ch_04_tbl_06_evolution_trace.csv")
+```
+
+```elixir
+fig_evolution = Vl.new(width: 650, height: 270, title: "R4.4 - Best XOR error across evaluations")
+  |> Vl.data_from_values(tbl_evolution)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "evaluations", type: :quantitative)
+  |> Vl.encode_field(:y, "best_error", type: :quantitative)
+
+fig_evolution
+```
+
+```elixir
+mod_champion = result_evolution.archive
+champion_outputs = Chapter04.Network.forward(mod_champion.theta, mod_champion.mask, x_xor)
+
+tbl_champion = Enum.zip([Nx.to_flat_list(y_xor), Nx.to_flat_list(champion_outputs)])
+  |> Enum.with_index()
+  |> Enum.map(fn {{target, output}, row} ->
+    predicted = if output >= 0, do: 1, else: -1
+    %{row: row, target: target, output: output, classification: predicted, correct: predicted == target}
+  end)
+
+Chapter04.Tables.tabs(tbl_champion, [:row, :target, :output, :classification, :correct],
+  "ch_04_tbl_07_champion_xor.csv")
+```
+
+```elixir
+%{stop_reason: result_evolution.stop, error: mod_champion.error,
+  meets_source_error_threshold: mod_champion.error <= 0.001,
+  correct_cases: Enum.count(tbl_champion, & &1.correct),
+  active_hidden_neurons: Nx.to_number(Nx.sum(mod_champion.mask)),
+  evaluated_candidates: List.last(tbl_evolution).evaluations,
+  active_mask: Nx.to_flat_list(mod_champion.mask)}
+```
+
+**Read the actual outcome.** Correct signs on all four cases and $E\le0.001$ are
+different achievements. A run can classify all cases while missing the source's
+stricter numerical threshold. The notebook reports both and never declares a
+budget-limited run solved by assumption.
+
+Best error cannot increase in this deterministic elitist setup; mean error can.
+The one-entry champion archive accepts strict improvements and keeps the earlier
+entry on a tie. It is not a novelty archive. All four truth-table rows are used
+for selection, so this is not a held-out generalization test.
+
+The evaluation counter includes the initial population and every reevaluation
+of preserved parents: $N(G+1)$ after $G$ completed generations. A full-table
+candidate evaluation processes four examples. We deliberately do not call that
+four separate candidate evaluations.
+
+Nx performs the regular numerical work; Elixir coordinates generations and
+archive updates. Shapes remain fixed even when expressed topology changes.
+Inactive slots still consume tensor memory and arithmetic. A sparse or arbitrary
+graph representation has different tradeoffs. [D1, D2]
+
+## 4.2.2 Example 2: Evolving a Pole Balancing Neurocontroller
+
+*Source: [S], pp. 123-127; Figs. 4.12-4.13.*
+
+Sher's problem has **two poles**, not the common single-pole variant. The
+controller receives the cart position and both pole angles, then commands a
+horizontal force. The general genotype need not change; its interface does.
+
+| Property               | Source specification                                                  |
+| ---------------------- | --------------------------------------------------------------------- |
+| Track                  | 2 meters long                                                         |
+| Sensor                 | `[CartPos, Pole1Ang, Pole2Ang]`                                       |
+| Actuator               | One signed force command in `[-1,1]`                                  |
+| Update interval        | 0.02 simulated seconds                                                |
+| Failure                | Cart leaves the track or either pole exceeds 35 degrees from vertical |
+| Fitness                | Simulated time balanced                                               |
+| Goal                   | 30 simulated minutes                                                  |
+| Evaluation arrangement | A private scape per evaluated network                                 |
+
+At 0.02 seconds per step, 30 minutes is **90,000 steps**. These are simulated
+steps, not a requirement to wait 30 wall-clock minutes per evaluation.
+
+**Source boundary:** this chapter describes the task and evolutionary procedure
+but does not supply masses, pole lengths, force calibration, or integration
+equations. We do not invent those and call the result Sher's simulator.
+Chapter 14 develops the pole-balancing benchmark. Here we implement and test the
+**interface and scoring contract**, not a physical rollout or successful controller.
+
+### Experiment 6 - Test observation, action, and termination contracts
+
+**Explicit remaster conventions:** the track is centered at zero, so its ends
+are $-1$ and $1$ meters. Angles are in radians. A normalized observation divides
+position by 1 meter and angles by 35 degrees. A completed step earns 0.02 seconds
+only when its resulting state remains within bounds. An unsafe step ends scoring.
+
+```elixir
+defmodule Chapter04.PoleInterface do
+  @moduledoc false
+  @type state :: %{x: number(), theta1: number(), theta2: number()}
+
+  @spec angle_limit() :: float()
+  def angle_limit, do: 35.0 * :math.pi() / 180.0
+
+  @spec observe(state()) :: Nx.Tensor.t()
+  def observe(state) do
+    Nx.tensor([state.x, state.theta1 / angle_limit(), state.theta2 / angle_limit()], type: :f32)
+  end
+
+  @spec force(number(), number()) :: number()
+  def force(command, max_force) when is_number(command) and is_number(max_force) and max_force > 0 do
+    max(-1.0, min(1.0, command)) * max_force
+  end
+
+  @spec safe?(state()) :: boolean()
+  def safe?(s), do: abs(s.x) <= 1.0 and abs(s.theta1) <= angle_limit() and abs(s.theta2) <= angle_limit()
+
+  @spec score([state()]) :: float()
+  def score(post_step_states) do
+    safe_steps = post_step_states |> Enum.take(90_000) |> Enum.take_while(&safe?/1) |> length()
+    safe_steps * 0.02
+  end
+end
+
+# A scripted trace for contract testing. It is NOT a physics simulation.
+pole_trace = [
+  %{x: 0.00, theta1: 0.01, theta2: -0.02},
+  %{x: 0.10, theta1: 0.03, theta2: -0.04},
+  %{x: 0.20, theta1: 0.05, theta2: -0.06},
+  %{x: 0.30, theta1: 0.07, theta2: -0.08},
+  %{x: 1.01, theta1: 0.09, theta2: -0.10},
+  %{x: 0.00, theta1: 0.00, theta2: 0.00}
+]
+
+tbl_pole = pole_trace |> Enum.with_index(1) |> Enum.map(fn {state, step} ->
+  %{step: step, x: state.x, theta1: state.theta1, theta2: state.theta2,
+    individually_safe: Chapter04.PoleInterface.safe?(state),
+    episode_score: Chapter04.PoleInterface.score(Enum.take(pole_trace, step))}
+end)
+
+Chapter04.Tables.tabs(tbl_pole,
+  [:step, :x, :theta1, :theta2, :individually_safe, :episode_score],
+  "ch_04_tbl_08_double_pole_contract.csv")
+```
+
+The score stops at **0.08 seconds**. A later safe row does not restart the failed
+episode. `force(0.4, 10.0)` returns 4.0: the 10.0 force scale is an illustrative
+caller-supplied calibration, **not a value specified by Sher**.
+
+The sensor omits velocities. A controller with state can use observation history;
+adding velocity sensors instead changes the specified interface. Preserve that
+distinction when comparing controllers. Reset neural state and the simulated
+world for independent trials, and do not assume that simulation performance
+establishes successful transfer to hardware.
+
+## 4.2.3 Example 3: End Game; Evolving Intelligence
+
+*Source: [S], pp. 127-135; Fig. 4.14.*
+
+This section is Sher's **research thought experiment**. He assumes enormous
+populations and effectively unlimited computation for a highly detailed shared
+world. He proposes supplying neurons and modular body interfaces rather than
+requiring evolution to rediscover every physical building block.
+
+Sensors and actuators can carry both signal semantics and simulated body
+properties. Adding a sensor or actuator can therefore change the neural
+interface and the organism's morphology together. Module granularity trades
+convenient, viable building blocks against a larger space of possible designs.
+
+| Design choice in Sher's scenario | What it controls                                                               |
+| -------------------------------- | ------------------------------------------------------------------------------ |
+| Public scape                     | Agents interact within the same world rather than isolated trials              |
+| Modular sensors and actuators    | Which observations, actions, and body parts are available                      |
+| Metabolism                       | How body size, neural size, and activity consume resources                     |
+| Reproduction actuator            | When an agent requests an offspring, subject to energy and time costs          |
+| Bootstrapping                    | How the researcher replenishes populations before self-sustaining reproduction |
+| Lifespan and aging               | How long agents persist and how their capabilities change                      |
+| Mutable environment              | How agents alter conditions encountered by later agents                        |
+
+Sher contrasts externally controlled reproduction with agent-initiated
+reproduction. In his chosen scenario, an external bootstrap phase ends when
+agents sustain their own reproduction. Offspring are mutated inherited designs,
+not arbitrary copies of every transient state.
+
+**GES interpretation, added for the remaster:** the absence of an external scalar
+fitness function does not remove selection. Resource access, survival,
+reproduction eligibility, and offspring placement still determine which designs
+persist. These decisions may be distributed through environmental rules rather
+than centralized in a sorting function.
+
+```mermaid
+flowchart LR
+    G[Generate inherited variants] --> P[Develop embodied agents]
+    P --> W[Shared world and other agents]
+    W --> R[Resources and survival]
+    R --> B[Eligible reproduction]
+    B --> G
+    W --> C[Changed environment]
+    C --> W
+```
+
+*Figure R4.5 - GES can be distributed through a shared ecology. The diagram does
+not assert that complexity or intelligence must increase.*
+
+### Experiment 7 - A reproduction request is not unrestricted reproduction
+
+This small **remaster accounting example** isolates one environmental rule. A
+birth transfers energy to a child, pays an overhead, leaves a parental reserve,
+and respects a population cap. It is not an ALife simulator or an intelligence
+experiment. Only immutable numerical records are created.
+
+```elixir
+defmodule Chapter04.Reproduction do
+  @moduledoc false
+  @type result :: %{accepted: boolean(), parent_energy: number(), child_energy: number(),
+                    dissipated_energy: number()}
+
+  @spec request(number(), boolean(), non_neg_integer(), pos_integer()) :: result()
+  def request(energy, requested, population, capacity)
+      when is_number(energy) and energy >= 0 and is_boolean(requested) and
+           is_integer(population) and population >= 0 and is_integer(capacity) and capacity > 0 do
+    child_energy = 3.0
+    overhead = 1.0
+    reserve = 2.0
+    accepted = requested and population < capacity and energy >= child_energy + overhead + reserve
+    if accepted do
+      %{accepted: true, parent_energy: energy - child_energy - overhead,
+        child_energy: child_energy, dissipated_energy: overhead}
+    else
+      %{accepted: false, parent_energy: energy, child_energy: 0.0, dissipated_energy: 0.0}
+    end
+  end
+end
+
+tbl_births = Enum.map([
+  {"Eligible request", 8.0, true, 9}, {"Too little energy", 5.0, true, 9},
+  {"No request", 8.0, false, 9}, {"Population cap", 8.0, true, 10}
+], fn {scenario, energy, requested, population} ->
+  outcome = Chapter04.Reproduction.request(energy, requested, population, 10)
+  Map.merge(outcome, %{scenario: scenario, initial_energy: energy,
+    accounting_error: abs(energy - outcome.parent_energy - outcome.child_energy - outcome.dissipated_energy)})
+end)
+
+Chapter04.Tables.tabs(tbl_births,
+  [:scenario, :initial_energy, :accepted, :parent_energy, :child_energy,
+   :dissipated_energy, :accounting_error], "ch_04_tbl_09_reproduction_accounting.csv")
+```
+
+All thresholds above are remaster choices, not numbers taken from the chapter.
+They make a point visible: the environment still defines what reproduction costs
+and permits. No reproduction actuator bypasses those rules.
+
+Sher also proposes genotype-reading and self-modifying interfaces, richer
+morphologies, teaching, niches, and environmental intervention when progress
+stalls. The chapter does not establish that these mechanisms inevitably produce
+intelligence, that atomic simulation is necessary, or that increasing complexity
+is a reliable proxy for intelligence. Those remain proposals to formulate and
+test, not results of this notebook.
+
+## 4.3 Neuroevolution Through Memetic Algorithms
+
+*Source: [S], pp. 135-137; Figs. 4.15-4.16.*
+
+A structural innovation may initially perform poorly because its new weights
+are not yet useful. Sher's memetic approach gives the altered topology a local
+weight-tuning budget before making the final selection decision.
+
+$$
+\mathcal T' = \operatorname{MutateTopology}(\mathcal T),
+\qquad
+\theta' = \operatorname{LocalSearch}(\theta_0;\mathcal T',B),
+\qquad
+E' = \operatorname{Evaluate}(\mathcal T',\theta').
+$$
+
+Here $B$ is a finite tuning budget. Local search does not reveal a topology's
+absolute or "true" fitness; it reveals the performance obtained by a specified
+optimizer, initialization, and budget.
+
+| Single-phase example                             | Memetic example                                              |
+| ------------------------------------------------ | ------------------------------------------------------------ |
+| Change structure and/or weights, then evaluate   | Change structure, tune weights locally, then compare         |
+| Each candidate receives one specified evaluation | Each structural candidate receives a specified tuning budget |
+| Retain or discard using its measured result      | Retain or discard using the result after tuning              |
+
+### Experiment 8 - Give a new neuron a tuning budget
+
+We start from a **hand-designed reference**, not the search champion. Two active
+hidden units implement the same tanh XOR construction used in Chapter 2. We then
+activate a third unit with chosen nonzero connections, disturbing the output.
+Only that new unit's four parameters may change during tuning.
+
+Compare two explicit protocols from the **same perturbed candidate**: stochastic
+hill climbing proposes around the current best, while an independent proposal
+baseline always proposes around the initial candidate. Both retain the best
+observed candidate, use 120 proposals, and spend 121 full-table evaluations.
+Neither protocol changes topology or knows the analytical repair.
+
+```elixir
+defmodule Chapter04.LocalSearch do
+  @moduledoc false
+  @type result :: %{theta: Nx.Tensor.t(), error: number(), key: Nx.Tensor.t(),
+                    history: [map()], evaluations: pos_integer()}
+
+  @spec error(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: number()
+  def error(theta, mask, x, target) do
+    Chapter04.Network.errors(theta, mask, x, target) |> Nx.squeeze() |> Nx.to_number()
+  end
+
+  @spec run(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(),
+            Nx.Tensor.t(), Nx.Tensor.t(), keyword()) :: result()
+  def run(theta, mask, x, target, mutable, key, opts) do
+    steps = Keyword.fetch!(opts, :steps)
+    scale = Keyword.fetch!(opts, :scale)
+    mode = Keyword.fetch!(opts, :mode)
+    unless is_integer(steps) and steps > 0 and is_number(scale) and scale > 0 and
+      mode in [:local, :independent] and Nx.shape(mutable) == Nx.shape(theta) and
+      Nx.axis_size(theta, 0) == 1 and Nx.axis_size(mask, 0) == 1 do
+      raise ArgumentError, "require one candidate, matching mutation mask, positive budget and scale"
+    end
+    initial_error = error(theta, mask, x, target)
+    first = %{proposal: 0, evaluations: 1, trial_error: initial_error,
+      best_error: initial_error, accepted: false}
+
+    {best, best_error, key, history} = Enum.reduce(1..steps,
+      {theta, initial_error, key, [first]}, fn step, {best, best_error, key, history} ->
+        base = if mode == :local, do: best, else: theta
+        {noise, key} = Nx.Random.normal(key, shape: Nx.shape(theta), type: :f32)
+        trial = base |> Nx.add(Nx.multiply(Nx.multiply(noise, scale), mutable)) |> Nx.clip(-8.0, 8.0)
+        trial_error = error(trial, mask, x, target)
+        accepted = trial_error < best_error
+        {best, best_error} = if accepted, do: {trial, trial_error}, else: {best, best_error}
+        row = %{proposal: step, evaluations: step + 1, trial_error: trial_error,
+          best_error: best_error, accepted: accepted}
+        {best, best_error, key, [row | history]}
+      end)
+
+    %{theta: best, error: best_error, key: key, history: Enum.reverse(history), evaluations: steps + 1}
+  end
+end
+
+# Parameter blocks: a[4], b[4], c[4], v[4], output bias.
+theta_reference = Nx.tensor([[
+  3.0, -3.0, 0.0, 0.0,
+  3.0, -3.0, 0.0, 0.0,
+  3.0, 3.0, 0.0, 0.0,
+  3.0, 3.0, 0.0, 0.0, -3.0
+]], type: :f32)
+mask_reference = Nx.tensor([[1.0, 1.0, 0.0, 0.0]], type: :f32)
+
+theta_innovation = Nx.tensor([[
+  3.0, -3.0, 0.7, 0.0,
+  3.0, -3.0, -0.6, 0.0,
+  3.0, 3.0, 0.4, 0.0,
+  3.0, 3.0, 1.5, 0.0, -3.0
+]], type: :f32)
+mask_innovation = Nx.tensor([[1.0, 1.0, 1.0, 0.0]], type: :f32)
+mutable_new_unit = Nx.tensor([Enum.map(0..16, fn i -> if i in [2, 6, 10, 14], do: 1.0, else: 0.0 end)], type: :f32)
+
+# Deliberate paired streams: both methods receive the same sequence of random offsets.
+result_local = Chapter04.LocalSearch.run(theta_innovation, mask_innovation, x_xor, y_xor,
+  mutable_new_unit, Nx.Random.key(4008), steps: 120, scale: 0.3, mode: :local)
+result_independent = Chapter04.LocalSearch.run(theta_innovation, mask_innovation, x_xor, y_xor,
+  mutable_new_unit, Nx.Random.key(4008), steps: 120, scale: 0.3, mode: :independent)
+
+tbl_tuning = [
+  %{candidate: "Hand-designed reference", error: Chapter04.LocalSearch.error(theta_reference, mask_reference, x_xor, y_xor),
+    active_hidden: 2, evaluations: 1},
+  %{candidate: "Untuned innovation", error: Chapter04.LocalSearch.error(theta_innovation, mask_innovation, x_xor, y_xor),
+    active_hidden: 3, evaluations: 1},
+  %{candidate: "Local tuning", error: result_local.error, active_hidden: 3, evaluations: result_local.evaluations},
+  %{candidate: "Independent proposals", error: result_independent.error, active_hidden: 3, evaluations: result_independent.evaluations}
+]
+
+Chapter04.Tables.tabs(tbl_tuning, [:candidate, :error, :active_hidden, :evaluations],
+  "ch_04_tbl_10_memetic_tuning.csv")
+```
+
+```elixir
+tbl_tuning_trace = Enum.flat_map([
+  {"Local tuning", result_local.history}, {"Independent proposals", result_independent.history}
+], fn {method, history} -> Enum.map(history, &Map.put(&1, :method, method)) end)
+
+Chapter04.Tables.tabs(tbl_tuning_trace,
+  [:method, :proposal, :evaluations, :trial_error, :best_error, :accepted],
+  "ch_04_tbl_11_tuning_trace.csv")
+```
+
+```elixir
+fig_tuning = Vl.new(width: 650, height: 270, title: "R4.6 - Weight tuning with equal evaluation budgets")
+  |> Vl.data_from_values(tbl_tuning_trace)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "evaluations", type: :quantitative)
+  |> Vl.encode_field(:y, "best_error", type: :quantitative)
+  |> Vl.encode_field(:color, "method", type: :nominal)
+
+fig_tuning
+```
+
+Both protocols must finish no worse than their own initial candidate because
+both keep the incumbent. Neither is guaranteed to beat the other. A single toy
+comparison does not establish that memetic search is generally faster or better.
+The reference and untuned rows are separate diagnostic evaluations; the two
+search budgets each include their own initial evaluation.
+
+The tuned tensor is the candidate returned for possible inheritance. Keeping
+only the untuned genotype while using the tuned performance for selection would
+be a different inheritance policy. Neither policy should be accidental.
+
+### Why a public scape complicates local tuning
+
+Sher points out a difficulty: in an ongoing ALife world, a parent and offspring
+may coexist, final lifetime scores arrive only after death, and the world changes
+between trials. A rollback-and-retry interpretation of local search no longer
+maps neatly to agent-initiated reproduction.
+
+His proposed alternative is an external controller, a pool of previously scored
+genotypes (the **dead_pool**), and designated **spawning pools**. It respawns a
+design with new weights for repeated trials, then records the tuned design's
+score. Those are reproduction and evaluation policies, not synonyms for a
+population of simultaneously living agents.
+
+**Remaster implementation caution:** repeated births do not automatically make
+trials comparable. World state, neighbors, placement, lifetime, randomness, and
+state-reset policy belong in the evaluation protocol. A changing public world
+requires more care than our deterministic four-row XOR scape.
+
+## 4.4 Neural Networks as Graph Based Genetic Programming Systems
+
+*Source: [S], pp. 138-140; Figs. 4.17-4.18.*
+
+Sher's synthesis treats a neuron as a small program: weight inputs, aggregate,
+apply an activation, and emit a signal. A neural network is then a graph of these
+programs. Replacing node operations makes the connection to graph-based genetic
+programming visible.
+
+| Shared element      | Neural-network interpretation                   | Program-graph interpretation                      |
+| ------------------- | ----------------------------------------------- | ------------------------------------------------- |
+| Nodes               | Neurons or neural circuits                      | Operators or subprograms                          |
+| Edges               | Signal-carrying connections                     | Data dependencies                                 |
+| Node parameters     | Weights, bias, activation settings              | Constants or operation parameters                 |
+| Structural mutation | Change neurons and connections                  | Change operations and dependencies                |
+| Execution           | Propagate signals with declared state semantics | Evaluate the graph under declared execution rules |
+
+Our `Graph.predict/2` is already an interpreter for a restricted program graph.
+Its primitive operations are identity, tanh, sine, and cosine applied after
+weighted aggregation. Its genotype can be changed without rewriting the
+interpreter. That is the concrete unifying idea this notebook implements.
+
+**Source boundary:** Sher uses "multi-rooted trees" to describe graphs and argues
+for equivalence between sufficiently advanced neuroevolution and GP systems.
+We retain the architectural analogy without treating it as a complete graph
+definition or a proof of identical expressiveness for every finite system.
+Our implementation explicitly requires an acyclic order. Recurrence, loops,
+shared state, and nontermination require additional semantics and bounds.
+
+The useful question is not only "Which algorithm family is this?" It is:
+**What can the encoding express, what can variation reach, and what exactly does
+evaluation reward?**
+
+### Executable checks
+
+Run this after all earlier cells. These checks cover the demonstrations, not all
+possible genomes, tensor backends, numerical types, or simulation conditions.
+Stochastic success is reported above rather than asserted here.
+
+```elixir
+# Deliberate invalid back-edge: the validator must reject it.
+back_edge_rejected = Chapter04.Support.rejected?(fn ->
+  Chapter04.Graph.add_connection(mod_spliced, 2, 3, 0.1)
+end)
+
+# A singleton cannot be switched off; adding a second slot is allowed.
+mask_toggle_test = Chapter04.Network.toggle(
+  Nx.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], type: :f32),
+  Nx.tensor([0, 1]), Nx.tensor([1, 1]))
+
+spliced_outputs = Enum.map(inputs_graph, &Chapter04.Graph.predict(mod_spliced, &1)) |> List.flatten()
+parent_outputs = Enum.map(inputs_graph, &Chapter04.Graph.predict(mod_graph, &1)) |> List.flatten()
+final_masks = Nx.to_flat_list(result_evolution.population.mask)
+final_widths = result_evolution.population.mask |> Nx.sum(axes: [1]) |> Nx.to_flat_list()
+innovation_error = Chapter04.LocalSearch.error(theta_innovation, mask_innovation, x_xor, y_xor)
+reference_outputs = Chapter04.Network.forward(theta_reference, mask_reference, x_xor)
+reference_labels = Nx.select(Nx.greater_equal(reference_outputs, 0), 1, -1)
+immutable_difference = result_local.theta |> Nx.subtract(theta_innovation)
+  |> Nx.multiply(Nx.subtract(1.0, mutable_new_unit))
+
+checks = [
+  {mod_graph.edges == %{{0, 2} => 0.6, {1, 2} => -0.4}, "Graph mutation does not alter its parent"},
+  {length(mod_spliced.nodes) == 4 and map_size(mod_spliced.edges) == 3, "Splice adds one node and one net edge"},
+  {Enum.zip(spliced_outputs, parent_outputs) |> Enum.all?(fn {a, b} -> abs(a - b) < 1.0e-12 end),
+    "Identity splice preserves the example outputs"},
+  {Enum.all?(mod_pruned.edges, fn {{from, to}, _w} -> from != 3 and to != 3 end),
+    "Removing a hidden node removes every incident edge"},
+  {back_edge_rejected, "Feedforward representation rejects a backward edge"},
+  {Enum.sum(Enum.map(node_records, &length(&1.input_idps))) == map_size(mod_linked.edges) and
+    Enum.sum(Enum.map(node_records, &length(&1.output_ids))) == map_size(mod_linked.edges),
+    "Incoming and outgoing record views account for every edge"},
+  {Chapter04.Support.max_error(y_graph, Nx.tensor(y_graph_reference)) < 1.0e-6,
+    "Scalar graph and Nx phenotype agree"},
+  {Nx.shape(y_graph) == {4, 1}, "Graph phenotype preserves batch and output axes"},
+  {Nx.shape(w_substrate_1) == {3, 5} and Nx.shape(w_substrate_2) == {5, 2},
+    "Source substrate densities map to the intended weight shapes"},
+  {Nx.size(w_dense_1) + Nx.size(w_dense_2) == 45 and Nx.size(generator) == 5,
+    "Denser substrate reuses the same five generator parameters"},
+  {Nx.shape(y_substrate) == {1, 2} and Chapter04.Support.finite?(y_substrate),
+    "Substrate phenotype returns two finite outputs"},
+  {Chapter04.Support.max_error(y_cos_exact, y_xor) < 1.0e-6, "Analytic cosine neuron implements bipolar XOR"},
+  {error_cos_printed > 0.001, "Rounded source cosine weights do not meet the stated error threshold"},
+  {Chapter04.Support.max_error(mask_toggle_test, Nx.tensor([[1, 0, 0], [1, 1, 0]])) == 0,
+    "Mask mutation adds a unit but never removes the last one"},
+  {Nx.shape(result_evolution.population.theta) == {48, 17} and
+    Nx.shape(result_evolution.population.mask) == {48, 4}, "Evolution preserves population tensor shapes"},
+  {Enum.all?(final_masks, &(&1 == 0 or &1 == 1)) and Enum.all?(final_widths, &(&1 >= 1 and &1 <= 4)),
+    "Every candidate expresses a valid bounded topology"},
+  {Chapter04.Support.nonincreasing?(Enum.map(tbl_evolution, & &1.best_error)),
+    "Elitist best error never increases"},
+  {List.last(tbl_evolution).evaluations == 48 * length(tbl_evolution),
+    "Evaluation accounting includes initial and retained candidates"},
+  {abs(mod_champion.error - List.last(tbl_evolution).best_error) < 1.0e-6,
+    "Champion archive matches the best retained error"},
+  {Chapter04.Support.finite?(champion_outputs), "Archived champion produces finite predictions"},
+  {abs(Chapter04.PoleInterface.score(pole_trace) - 0.08) < 1.0e-12,
+    "Double-pole scoring stops at the first unsafe completed step"},
+  {Nx.shape(Chapter04.PoleInterface.observe(hd(pole_trace))) == {3},
+    "Double-pole sensor has exactly three components"},
+  {Chapter04.PoleInterface.force(2.0, 10.0) == 10.0 and Chapter04.PoleInterface.force(-2.0, 10.0) == -10.0,
+    "Actuator clips signed commands before scaling force"},
+  {not Chapter04.PoleInterface.safe?(%{x: 0.0, theta1: 0.0, theta2: Chapter04.PoleInterface.angle_limit() + 0.01}),
+    "Either pole can terminate an episode"},
+  {Enum.count(tbl_births, & &1.accepted) == 1 and Enum.all?(tbl_births, &(&1.accounting_error < 1.0e-12)),
+    "Births respect eligibility and energy accounting"},
+  {Chapter04.Support.max_error(reference_labels, Nx.new_axis(y_xor, 0)) == 0,
+    "Hand-designed tanh reference classifies XOR correctly"},
+  {result_local.error <= innovation_error and result_independent.error <= innovation_error,
+    "Both local-search protocols keep their initial incumbent"},
+  {result_local.evaluations == 121 and result_independent.evaluations == 121,
+    "Local and independent protocols have equal evaluation budgets"},
+  {Chapter04.Support.max_error(immutable_difference, 0.0) == 0,
+    "Local tuning changes only the new neuron's parameters"},
+  {Chapter04.Support.nonincreasing?(Enum.map(result_local.history, & &1.best_error)) and
+    Chapter04.Support.nonincreasing?(Enum.map(result_independent.history, & &1.best_error)),
+    "Both tuning traces preserve best-so-far error"}
+]
+
+tbl_checks = Enum.map(checks, fn {passed, label} -> Chapter04.Support.check!(passed, label) end)
+Chapter04.Tables.tabs(tbl_checks, [:check, :result], "ch_04_tbl_12_executable_checks.csv")
+```
+
+### Exercises
+
+| Change                                                                 | Question to answer                                                  |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Change the inserted identity node to tanh                              | Which algebraic equality stops holding?                             |
+| Increase substrate density without changing the generator              | What grows: inherited parameters, phenotype weights, or both?       |
+| Freeze all topology masks in Experiment 5                              | Is the resulting search still a TWEANN experiment?                  |
+| Compare cosine and tanh single-neuron XOR candidates                   | Why does the activation family matter as much as neuron count?      |
+| Increase population size but keep generations fixed                    | Did you keep the evaluation budget fixed?                           |
+| Permit tuning of all weights rather than only the new neuron's weights | Did you change the local-search problem?                            |
+| Replace private evaluation with a shared scape                         | Which scores cease to be directly comparable without more controls? |
+
+### What to carry forward
+
+**Encoding defines the inherited design. Mapping defines the working system.
+Interfaces define its task. Evaluation records consequences. Selection decides
+what persists.** Structural innovation and local adaptation can complement one
+another, but each needs explicit semantics and a measurable budget.
+
+Chapter 5 examines the programming-language architecture. We will carry forward
+Sher's interest in concurrency and readable neural systems without requiring
+every multiply-add to become a BEAM message.
+
+## 4.5 References and adaptation notes
+
+### Primary source
+
+**[S]** Gene I. Sher. *Handbook of Neuroevolution Through Erlang*. Springer, 2013.
+Chapter 4, "Introduction to Neuroevolutionary Methods," pp. 105-141.
+DOI: `10.1007/978-1-4614-4463-3_4`.
+
+The supplied PDF is the source for the conceptual organization, terminology,
+mutation families, encoding examples, three application scenarios, and memetic
+comparison. Printed page 105 is PDF page 1. Figures here are new diagrams or
+computed plots, not copied book illustrations.
+
+| Source location            | Material retained                                             | Explicit remaster treatment                                                |
+| -------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| pp. 105-106                | Need to choose network structure and parameters               | Separate motivation from claims of universal superiority                   |
+| Section 4.1.1, pp. 106-108 | Growth, pruning, connection, and interface mutations          | Immutable DAG edits; identity splice with a precise preservation condition |
+| Section 4.1.2, pp. 108-113 | Sequence genes and DXNN-style node tuples                     | One canonical edge map; derived per-node views                             |
+| Section 4.1.3, pp. 113-118 | Direct and indirect mapping; [3,5,2] substrate                | Batch graph interpreter and one-neuron coordinate generator                |
+| Section 4.2.1, pp. 118-122 | XOR scape, reciprocal error, mutation-based evolution         | Rounded cosine audit; finite error-based selection; bounded masked TWEANN  |
+| Section 4.2.2, pp. 123-127 | Double-pole task and interfaces                               | Contract tests, not an invented physical simulator                         |
+| Section 4.2.3, pp. 127-135 | Modular morphology, shared ecology, bootstrapped reproduction | Research proposal retained; isolated resource-accounting demonstration     |
+| Section 4.3, pp. 135-137   | Topology search plus local weight tuning; spawning pools      | Counted local/independent trials and explicit inheritance choice           |
+| Section 4.4, pp. 138-140   | Neuroevolution as specialized graph-based GP                  | Shared interpreter perspective with declared execution limits              |
+| Section 4.5, pp. 140-141   | Source bibliography                                           | Selected reading pointers, without claiming independent review             |
+
+### Selected reading pointers from the source
+
+| Source reference | Work                                                                                                           | Connection                                                    |
+| ---------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| [1]              | Stanley and Miikkulainen (2002), "Efficient Reinforcement Learning through Evolving Neural Network Topologies" | Topology evolution; named in the source's encoding discussion |
+| [2]              | Sher, "Evolving Chart Pattern Sensitive Neural Network Based Forex Trading Agents," arXiv:1111.5892            | DXNN-style representation                                     |
+| [3]              | Cormen, Leiserson, Rivest, and Stein (2001), *Introduction to Algorithms*                                      | Graph representations                                         |
+| [4]              | Stanley and Miikkulainen (2003), "A Taxonomy for Artificial Embryogeny"                                        | Indirect encoding and development                             |
+| [6]              | Turing (1952), "The Chemical Basis of Morphogenesis"                                                           | Developmental mechanisms                                      |
+
+**Bibliographic note:** Sher cites HyperNEAT as [17] on p. 116, but the supplied
+chapter's bibliography ends at [16]. No missing bibliographic entry is invented
+here. The generator experiment illustrates the chapter's described mapping, not
+an implementation verified against a separate HyperNEAT paper.
+
+### Software references for remaster implementations
+
+These references support the software interfaces, not additional claims about
+Sher's evolutionary examples.
+
+| Key | Official documentation                                                                                                                | Used for                                              |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| D1  | [Nx](https://nx.hexdocs.pm/Nx.html)                                                                                                   | Tensor shapes, broadcasting, indexing, and reductions |
+| D2  | [Nx.Defn](https://nx.hexdocs.pm/Nx.Defn.html) and [Nx.Random](https://nx.hexdocs.pm/Nx.Random.html)                                   | Numerical kernels and explicit random keys            |
+| D3  | [Kino.Layout](https://kino.hexdocs.pm/Kino.Layout.html) and [Kino.DataTable](https://kino.hexdocs.pm/Kino.DataTable.html)             | Tabbed computed tables                                |
+| D4  | [Kino.Download](https://kino.hexdocs.pm/Kino.Download.html) and [Kino.VegaLite](https://hexdocs.pm/kino_vega_lite/Kino.VegaLite.html) | Binary CSV downloads and plots                        |
+
+Documentation links may describe a different version over time. The setup pins
+Nx 1.0.0, Kino 0.19.1, and Kino.VegaLite 0.1.13 to match the preceding notebooks.
+Every non-scalar `Nx.select/3` predicate in the numerical kernels is explicitly
+full-shaped or already matches the selected tensor; singleton mask broadcasting
+is not left implicit.
+
+### Validation note
+
+Independent Python/NumPy reference implementations passed **39 algorithmic
+checks**, and **7 notebook-structure checks** also passed. These cover graph
+mutations, scalar/batched parity, substrate shapes, the cosine audit, masked
+variation, elite preservation, evaluation budgets, pole-interface boundaries,
+reproduction accounting, and local-search invariants.
+
+The reference random generator is **not Nx.Random**, so its stochastic traces
+are not claimed to reproduce the notebook's seed exactly. The authoring
+environment has no Elixir/Erlang runtime: **the actual Elixir/Nx cells and
+Livebook visual rendering have not been executed here**. The notebook includes
+**30 executable assertions** to run in your own runtime. Those assertions do
+not require a lucky stochastic search outcome.
+
+**End of Chapter 4.**

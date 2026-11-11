@@ -1,0 +1,1650 @@
+# Chapter 2. Introduction to Neural Networks
+
+```elixir
+Mix.install([
+  {:nx, "1.0.0"},
+  {:kino, "0.19.1"},
+  {:kino_vega_lite, "0.1.13"}
+])
+
+# Shared presentation only; the chapter's table contents are unchanged.
+defmodule Chapter02.Tables do
+  @moduledoc false
+
+  @type column :: atom() | String.t()
+  @type cell :: atom() | number() | String.t()
+  @type row :: %{optional(column()) => cell()}
+
+  @spec tabs([row()], [column()], String.t()) :: Kino.Layout.t()
+  @spec tabs([row()], [column()], String.t(), String.t() | nil) :: Kino.Layout.t()
+  def tabs(rows, columns, filename, markdown_source \\ nil) do
+    markdown_source = markdown_source || markdown(rows, columns)
+    csv_source = csv(rows, columns)
+
+    Kino.Layout.tabs([
+      {"Interactive", Kino.DataTable.new(rows, keys: columns)},
+      {"Markdown", Kino.Markdown.new(markdown_source)},
+      {"CSV",
+       Kino.Layout.grid([
+         Kino.Download.new(fn -> csv_source end, filename: filename, label: "Download CSV"),
+         Kino.Text.new(csv_source)
+       ])}
+    ])
+  end
+
+  @spec from_markdown(String.t(), String.t()) :: Kino.Layout.t()
+  def from_markdown(markdown_source, filename) do
+    [header, _separator | lines] =
+      markdown_source |> String.trim() |> String.split("\n", trim: true)
+
+    columns = split_row(header)
+
+    rows =
+      Enum.map(lines, fn line ->
+        values = split_row(line)
+
+        unless length(values) == length(columns) do
+          raise ArgumentError, "table row does not match its header"
+        end
+
+        Map.new(Enum.zip(columns, values))
+      end)
+
+    tabs(rows, columns, filename, markdown_source)
+  end
+
+  @spec split_row(String.t()) :: [String.t()]
+  defp split_row(line) do
+    line
+    |> String.trim()
+    |> String.trim_leading("|")
+    |> String.trim_trailing("|")
+    |> String.split("|")
+    |> Enum.map(&String.trim/1)
+  end
+
+  @spec markdown([row()], [column()]) :: String.t()
+  defp markdown(rows, columns) do
+    header = markdown_row(columns)
+    separator = markdown_row(Enum.map(columns, fn _ -> "---" end))
+
+    body =
+      Enum.map(rows, fn row ->
+        markdown_row(Enum.map(columns, &Map.fetch!(row, &1)))
+      end)
+
+    Enum.join([header, separator | body], "\n") <> "\n"
+  end
+
+  @spec markdown_row([cell()]) :: String.t()
+  defp markdown_row(values) do
+    "| " <> Enum.map_join(values, " | ", &markdown_cell/1) <> " |"
+  end
+
+  @spec markdown_cell(cell()) :: String.t()
+  defp markdown_cell(value) do
+    value
+    |> to_string()
+    |> String.replace("\\", "\\\\")
+    |> String.replace("|", "\\|")
+    |> String.replace("\r\n", "<br>")
+    |> String.replace(["\r", "\n"], "<br>")
+  end
+
+  @spec csv([row()], [column()]) :: String.t()
+  defp csv(rows, columns) do
+    records = [columns | Enum.map(rows, fn row -> Enum.map(columns, &Map.fetch!(row, &1)) end)]
+
+    Enum.map_join(records, "\r\n", fn record ->
+      Enum.map_join(record, ",", &csv_field/1)
+    end) <> "\r\n"
+  end
+
+  @spec csv_field(cell()) :: String.t()
+  defp csv_field(value) do
+    "\"" <> String.replace(to_string(value), "\"", "\"\"") <> "\""
+  end
+end
+```
+
+## Reader's guide
+
+**Neuroevolution through Elixir**  
+Part I - Foundations
+
+**The central idea:** a neural network transforms signals. Recurrent state lets its
+past affect its present. Plasticity changes how it will process future signals.
+Evolution can search over all three: computation, memory, and adaptation.
+
+This chapter remasters Gene I. Sher's *Handbook of Neuroevolution Through Erlang*
+(2013), Chapter 2, printed pages 43-79. The original section numbers and conceptual
+sequence are retained. Source notes refer to that chapter as **[S]**.
+
+The explanations condense Sher's text. All Elixir/Nx implementations, executable
+experiments, new diagrams, exercises, and the Generation-Evaluation-Selection
+(GES) connection are **remaster additions**, not code or claims attributed to
+Sher. Numerical discrepancies and terminology qualifications are identified where
+they matter. This is a study adaptation, not an official revised edition.
+
+### Chapter map
+
+| Section                                              | Question                                                | Main representation                        |
+| ---------------------------------------------------- | ------------------------------------------------------- | ------------------------------------------ |
+| 2.1 Biological Neural Network                        | What does the biological analogy contribute?            | Prose, table, timing example               |
+| 2.2 Artificial Neural Network                        | What do we retain in an artificial neuron?              | Equation and diagram                       |
+| 2.2.1 The Neurode in Detail                          | How do weights, bias, and activation produce an output? | Elixir, Nx, activation plot, XOR audit     |
+| 2.3 Neural Networks and Neural Network Based Systems | How do neurons form circuits and agents?                | Tensor shapes and topology                 |
+| 2.3.1 Recurrent Neural Networks and Memory Loops     | How can a fixed network remember?                       | Recurrent rollout and plot                 |
+| 2.3.2 A Neural Network Based System                  | How does a network interact with a world?               | Sensor-controller-actuator example         |
+| 2.4 Learning Vs. Training                            | What changes, when, and under whose control?            | Comparison table                           |
+| 2.5 Supervised "Learning" Algorithms                 | How can labeled examples set weights?                   | Backpropagation with Nx                    |
+| 2.6 Unsupervised Learning Algorithms                 | How can activity drive adaptation?                      | Hebbian, Oja, modulation, competition, SOM |
+| 2.7 Summary                                          | What should we carry into neuroevolution?               | Checks, exercises, synthesis               |
+| 2.8 References                                       | Which parts come from which sources?                    | Source map and editorial notes             |
+
+### Run this notebook
+
+Evaluate the setup cell, then evaluate the sections in order. Nothing from
+Chapter 1 is required. The examples use small, deterministic, synthetic inputs.
+No external dataset or accompanying image file is needed.
+
+The default is **Nx's CPU BinaryBackend**. No GPU, Torchx, EXLA, or Axon is
+required. The first package installation requires network access, or a previously
+prepared package cache. After installation, these examples do not fetch data.
+Use **Elixir 1.17 or later in the 1.x series**, as required by the pinned Nx
+release. Kino 0.19.1 explicitly supports Nx 1.0. Restart the runtime before
+changing the dependency set. [D1, D2, D7, D8]
+
+These small examples teach tensor computation; they are **not evidence of a
+speedup**. A native backend and sufficiently large, regular workloads are needed
+before acceleration becomes a performance question worth measuring. We keep the
+numerical kernels in `defn` so that their execution strategy can be changed later.
+[D1, D2]
+
+**Validation status:** the numerical reference results were independently checked
+in Python/NumPy. Elixir and Livebook are not available in the authoring environment,
+so the Elixir cells and their visual rendering have not been executed here. The
+notebook includes assertions and a final check table for validation in your runtime.
+
+### Conventions
+
+We use `mod_` for models, `tbl_` for table rows, and `fig_` for finished charts.
+Tensor variables use mathematical names such as `x`, `w`, and `y`.
+
+A **batch** contains several examples. For dense networks, examples occupy rows:
+$X$ has shape $\{\text{batch},\text{inputs}\}$ and $W$ has shape
+$\{\text{inputs},\text{outputs}\}$. A neuron's scalar output can be packaged as a
+one-element vector at an interface, matching Sher's convention.
+
+```elixir
+alias VegaLite, as: Vl
+
+# Explicit defaults keep the introductory examples independent of native libraries.
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+
+defmodule Chapter02.Support do
+  @moduledoc false
+
+  @type numeric :: Nx.Tensor.t() | number()
+
+  @spec max_error(numeric(), numeric()) :: number() | :nan | :infinity | :neg_infinity
+  def max_error(actual, expected) do
+    actual
+    |> Nx.subtract(expected)
+    |> Nx.abs()
+    |> Nx.reduce_max()
+    |> Nx.to_number()
+  end
+
+  @spec close!(numeric(), numeric()) :: :ok
+  @spec close!(numeric(), numeric(), number()) :: :ok
+  def close!(actual, expected, tolerance \\ 1.0e-5) do
+    error = max_error(actual, expected)
+
+    unless is_number(error) and error <= tolerance do
+      raise "Numerical check failed: error=#{inspect(error)}, tolerance=#{tolerance}"
+    end
+
+    :ok
+  end
+
+  @spec bipolar(numeric()) :: Nx.Tensor.t()
+  def bipolar(values) do
+    Nx.select(Nx.greater_equal(values, 0), 1, -1)
+  end
+
+  @spec check!(boolean(), String.t()) :: %{check: String.t(), result: String.t()}
+  def check!(true, label), do: %{check: label, result: "PASS"}
+  def check!(false, label), do: raise("Check failed: #{label}")
+
+  # A download callback must return a binary, not a list of row maps.
+  # Quote every field, including headers, to produce valid CSV.
+  @spec csv([map()], [atom() | String.t()]) :: String.t()
+  def csv(rows, columns) when is_list(rows) and is_list(columns) do
+    records = [columns | Enum.map(rows, fn row -> Enum.map(columns, &Map.fetch!(row, &1)) end)]
+
+    Enum.map_join(records, "\r\n", fn record ->
+      Enum.map_join(record, ",", fn value ->
+        "\"" <> String.replace(to_string(value), "\"", "\"\"") <> "\""
+      end)
+    end) <> "\r\n"
+  end
+end
+```
+
+## 2.1 Biological Neural Network
+
+*Source: [S], Section 2.1, pp. 45-51; evolutionary motivation on pp. 43-45.*
+
+Sher starts from a network of connected biological signal-processing cells. His
+motivation is to use neurons as computational building blocks and evolution as a
+way to discover useful arrangements of those blocks. The origin-of-life narrative
+motivates that approach; it is not an executable specification or a guarantee of
+machine intelligence.
+
+A biological neuron receives signals, integrates their effects, and can produce
+an action potential. Its response depends on both **where** inputs arrive and
+**when** they arrive. Its connections and responsiveness can also change.
+
+| Biological component    | Role in Sher's account                                      | Computational idea we retain       |
+| ----------------------- | ----------------------------------------------------------- | ---------------------------------- |
+| Dendrites and soma      | Receive and integrate incoming influences                   | Inputs and signal aggregation      |
+| Synapses                | Determine how one cell influences another                   | Connection strengths               |
+| Spike initiation region | Generates an action potential when excitation is sufficient | An output-producing rule           |
+| Axon and terminals      | Carry the output to other cells                             | Connections and output delivery    |
+| Plasticity              | Changes connections or their effects through experience     | Parameter or structural adaptation |
+
+At a chemical synapse, Sher describes an electrical-chemical-electrical sequence:
+an arriving electrical signal triggers chemical transmission, which changes the
+receiving cell's electrical state. This table is an abstraction of his account,
+not a one-to-one biological model.
+
+### Space and time both matter
+
+Sher emphasizes frequency-encoded spike signals and the timing of their
+integration. Consider a deliberately simplified coincidence detector: it emits
+one spike when at least three inputs arrive in the same time bin.
+
+| Input pattern             | Arrivals at time 1 | Arrivals at time 2 | Arrivals at time 3 | Output spikes |
+| ------------------------- | -----------------: | -----------------: | -----------------: | ------------: |
+| Three simultaneous inputs | 3                  | 0                  | 0                  | 1             |
+| Three separated inputs    | 1                  | 1                  | 1                  | 0             |
+
+**Remaster illustration:** both rows contain three incoming events, but their
+arrangement in time changes the result. This toy rule is not a physiological
+simulation. It isolates the timing point made in Sher's discussion of Fig. 2.3
+(pp. 49-50).
+
+### Plasticity is a different kind of change
+
+A neuron can produce a different output simply because its input changed.
+Plasticity instead changes the mechanism that will produce future outputs.
+Sher discusses changes in synaptic influence, the formation or removal of
+connections, and modulation of neural responses.
+
+**Keep:** signal integration, connectivity, time dependence, and adaptation.  
+**Do not assume:** that a weighted sum reproduces all biological mechanisms.
+
+## 2.2 Artificial Neural Network
+
+*Source: [S], Section 2.2, pp. 51-54; Figs. 2.4-2.5.*
+
+An artificial neuron, or **neurode**, is a simplified signal-processing unit.
+The version we will use first multiplies inputs by weights, adds a bias, and
+applies an activation function:
+
+$$
+z = \sum_{i=1}^{d} w_i x_i + b,
+\qquad y = \phi(z).
+$$
+
+| Symbol | Meaning             | Effect                                           |
+| ------ | ------------------- | ------------------------------------------------ |
+| $x_i$  | Input signal        | Information presented to the neuron              |
+| $w_i$  | Weight              | Scales that input's contribution                 |
+| $b$    | Bias                | Shifts the aggregate independently of the inputs |
+| $z$    | Preactivation       | Weighted sum plus bias                           |
+| $\phi$ | Activation function | Converts the aggregate into an output            |
+| $y$    | Output              | Signal delivered to downstream elements          |
+
+For a positive input, a positive weight raises the aggregate and a negative
+weight lowers it. With signed inputs, inspect the product $w_i x_i$ rather than
+the weight's sign alone.
+
+```mermaid
+flowchart LR
+    X[Input vector x] --> W[Multiply by weights]
+    W --> Z[Sum weighted inputs]
+    B[Bias b] --> Z
+    Z --> A[Activation function]
+    A --> Y[Output y]
+    Y --> D[Downstream neurons or actuators]
+```
+
+*Figure R2.1 - A neurode's data flow. New diagram of the computation discussed
+in Sher's Figs. 2.5-2.6.*
+
+Sher contrasts biological spike-based signaling with the ordinary ANN's
+numerical, **amplitude-encoded** signals. He also explicitly includes artificial
+spiking networks. Thus, "artificial" does not mean "necessarily non-spiking."
+
+**Scope note:** this chapter builds useful computational abstractions. Sher's
+broader claims about universal approximation and universal computation do not
+establish that a particular finite circuit can solve every problem. We will check
+specific circuits against specific tasks instead.
+
+## 2.2.1 The Neurode in Detail
+
+*Source: [S], Section 2.2.1, pp. 54-57; Figs. 2.6-2.7 and the bipolar XOR table.*
+
+### Several incoming vectors, one aggregate
+
+Sher allows an input link to carry a vector. A neuron associates a weight vector
+with each incoming link, adds their dot products, and then adds its bias:
+
+$$
+z = b + \sum_{k=1}^{K}\langle w^{(k)},x^{(k)}\rangle.
+$$
+
+Concatenating those vectors gives the ordinary single-vector equation. Grouping
+inputs by sender is useful for a graph implementation; a flat tensor is useful
+for numerical computation. They can represent the same calculation.
+
+A bias can be represented as a constant input of $1$ with weight $b$. Setting
+$b=0$ removes its effect. For $\tanh$, the output changes sign at $z=0$, so the
+bias moves that boundary.
+
+### Experiment 1 - The same neuron in Elixir and Nx
+
+The ordinary Elixir implementation exposes every arithmetic step. The Nx
+implementation expresses the same calculation as a tensor kernel.
+
+```elixir
+defmodule Chapter02.Neuron do
+  import Nx.Defn
+
+  @spec scalar(nonempty_list(number()), nonempty_list(number()), number()) :: float()
+  def scalar(x, w, bias) when is_list(x) and is_list(w) and is_number(bias) do
+    unless length(x) == length(w) and x != [] do
+      raise ArgumentError, "x and w must be nonempty lists of equal length"
+    end
+
+    weighted_sum =
+      Enum.zip(x, w)
+      |> Enum.reduce(bias, fn {input, weight}, total -> total + input * weight end)
+
+    :math.tanh(weighted_sum)
+  end
+
+  @spec tensor(Nx.Tensor.t(), Nx.Tensor.t(), Chapter02.Support.numeric()) :: Nx.Tensor.t()
+  defn tensor(x, w, bias) do
+    Nx.tanh(Nx.dot(x, w) + bias)
+  end
+end
+
+x_neuron = Nx.tensor([0.5, -1.0], type: :f32)
+w_neuron = Nx.tensor([2.0, -0.5], type: :f32)
+b_neuron = Nx.tensor(-0.25, type: :f32)
+
+y_scalar = Chapter02.Neuron.scalar([0.5, -1.0], [2.0, -0.5], -0.25)
+y_tensor = Chapter02.Neuron.tensor(x_neuron, w_neuron, b_neuron)
+
+Chapter02.Support.close!(y_tensor, y_scalar)
+
+%{preactivation: 1.25, elixir: y_scalar, nx: Nx.to_number(y_tensor)}
+```
+
+Expected output: $\tanh(1.25)\approx 0.848284$. The two implementations should
+agree within floating-point tolerance, not necessarily bit for bit.
+
+`defn` defines numerical Elixir. Inside it, arithmetic operators work on tensors.
+Outside it, use functions such as `Nx.add/2` and `Nx.multiply/2` rather than
+assuming ordinary Elixir arithmetic accepts tensors. [D1, D2]
+
+### Experiment 2 - Activation functions
+
+Sher highlights sigmoid and hyperbolic tangent:
+
+$$
+\sigma(z)=\frac{1}{1+e^{-z}},
+\qquad \tanh(z)=\frac{e^z-e^{-z}}{e^z+e^{-z}}.
+$$
+
+Sigmoid takes values between $0$ and $1$; tanh takes values between $-1$ and $1$.
+Tanh is convenient for Sher's bipolar encoding: false is $-1$, true is $1$.
+A smooth output is still a number, not automatically a Boolean label.
+
+```elixir
+z_activation = Nx.linspace(-4.0, 4.0, n: 161)
+y_tanh = Nx.tanh(z_activation)
+y_sigmoid = Nx.divide(1.0, Nx.add(1.0, Nx.exp(Nx.negate(z_activation))))
+
+tbl_activation =
+  Enum.flat_map([{"tanh", y_tanh}, {"sigmoid", y_sigmoid}], fn {name, values} ->
+    Enum.zip(Nx.to_flat_list(z_activation), Nx.to_flat_list(values))
+    |> Enum.map(fn {z, y} -> %{z: z, output: y, activation: name} end)
+  end)
+
+fig_activation =
+  Vl.new(width: 640, height: 260, title: "R2.2 - Activation functions")
+  |> Vl.data_from_values(tbl_activation)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "z", type: :quantitative)
+  |> Vl.encode_field(:y, "output", type: :quantitative)
+  |> Vl.encode_field(:color, "activation", type: :nominal)
+
+fig_activation
+```
+
+### Experiment 3 - A three-neurode XOR circuit
+
+The task is to return true exactly when the two inputs differ.
+
+| $x_1$ | $x_2$ | Bipolar XOR target |
+| ----: | ----: | -----------------: |
+| -1    | -1    | -1                 |
+| -1    | 1     | 1                  |
+| 1     | -1    | 1                  |
+| 1     | 1     | -1                 |
+
+Two hidden neurons feed one output neuron. For a batch of inputs:
+
+$$
+H=\tanh(XW_1+b_1),
+\qquad \widehat Y=\tanh(HW_2+b_2).
+$$
+
+Here $W_1$ has one **column per hidden neuron**. This is a storage convention,
+not a different network from a diagram with one weight vector per neuron.
+
+```elixir
+defmodule Chapter02.Feedforward do
+  import Nx.Defn
+
+  @type params :: {Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()}
+
+  @spec forward(params(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn forward({w1, b1, w2, b2}, x) do
+    hidden = Nx.tanh(Nx.dot(x, w1) + b1)
+    Nx.tanh(Nx.dot(hidden, w2) + b2)
+  end
+
+  @spec loss(params(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn loss(params, x, target) do
+    Nx.mean(Nx.pow(forward(params, x) - target, 2))
+  end
+end
+
+inputs_xor = [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+targets_xor = [-1.0, 1.0, 1.0, -1.0]
+x_xor = Nx.tensor(inputs_xor, type: :f32)
+y_xor = Nx.tensor(Enum.map(targets_xor, &[&1]), type: :f32)
+```
+
+**Source audit - do not silently copy the numerical example.** On printed p. 56,
+Sher lists A as `[2.1081, 2.2440, 2.2533]`, B as
+`[3.4963, -2.7463, 3.5200]`, and C as `[-2.5983, 2.7354, 2.7255]`, with each
+third value being the bias. Those values do not reproduce XOR under the stated
+tanh computation. Fig. 2.7 also uses inconsistent signal labels/order and slightly
+different rounded coefficients. Simply swapping the two hidden outputs does
+not fix the circuit.
+
+The next cell evaluates the **printed prose coefficients**, then a **new,
+hand-constructed replacement**. We do not claim to recover Sher's intended weights.
+The replacement's hidden units approximate OR and NAND; the output combines
+them to approximate XOR.
+
+```elixir
+mod_printed = {
+  Nx.tensor([[2.1081, 3.4963], [2.2440, -2.7463]], type: :f32),
+  Nx.tensor([2.2533, 3.5200], type: :f32),
+  Nx.tensor([[-2.5983], [2.7354]], type: :f32),
+  Nx.tensor([2.7255], type: :f32)
+}
+
+# Also test the other possible order of the two hidden outputs at C.
+mod_printed_swapped =
+  put_elem(mod_printed, 2, Nx.tensor([[2.7354], [-2.5983]], type: :f32))
+
+# Remaster replacement, not a transcription of Sher's coefficients.
+mod_xor = {
+  Nx.tensor([[3.0, -3.0], [3.0, -3.0]], type: :f32),
+  Nx.tensor([3.0, 3.0], type: :f32),
+  Nx.tensor([[3.0], [3.0]], type: :f32),
+  Nx.tensor([-3.0], type: :f32)
+}
+
+y_printed = Chapter02.Feedforward.forward(mod_printed, x_xor)
+y_printed_swapped = Chapter02.Feedforward.forward(mod_printed_swapped, x_xor)
+y_replacement = Chapter02.Feedforward.forward(mod_xor, x_xor)
+
+tbl_xor =
+  Enum.zip([
+    inputs_xor,
+    targets_xor,
+    Nx.to_flat_list(y_printed),
+    Nx.to_flat_list(y_printed_swapped),
+    Nx.to_flat_list(y_replacement)
+  ])
+  |> Enum.map(fn {[x1, x2], target, printed, swapped, replacement} ->
+    %{
+      x1: x1,
+      x2: x2,
+      target: target,
+      printed_A_then_B: Float.round(printed, 6),
+      printed_B_then_A: Float.round(swapped, 6),
+      replacement: Float.round(replacement, 6)
+    }
+  end)
+
+Chapter02.Support.close!(Chapter02.Support.bipolar(y_replacement), y_xor, 0.0)
+Chapter02.Tables.tabs(
+  tbl_xor,
+  [:x1, :x2, :target, :printed_A_then_B, :printed_B_then_A, :replacement],
+  "ch_02_tbl_01_xor_audit.csv"
+)
+```
+
+Reference outputs, in truth-table order:
+
+| Circuit                        | Outputs, approximately           | Correct classifications |
+| ------------------------------ | -------------------------------- | ----------------------: |
+| Printed coefficients, A then B | 1.0000, -0.9877, 0.9944, 0.9935  | 1 / 4                   |
+| Printed coefficients, B then A | -0.9868, 1.0000, 0.9924, 0.9935  | 3 / 4                   |
+| Remaster replacement           | -0.9949, 0.9948, 0.9948, -0.9949 | 4 / 4                   |
+
+Classification here uses the sign of the output. Exact outputs of $\pm1$ are not
+required. Nor does getting all four XOR cases right demonstrate generalization
+on an unrelated task.
+
+```elixir
+Kino.Download.new(
+  fn ->
+    Chapter02.Support.csv(tbl_xor, [
+      :x1, :x2, :target, :printed_A_then_B, :printed_B_then_A, :replacement
+    ])
+  end,
+  filename: "ch_02_tbl_01_xor_audit.csv",
+  label: "Download XOR audit as CSV"
+)
+```
+
+**Why use more than one neuron?** A single affine threshold cannot separate the
+two positive XOR corners from the two negative corners. Hidden nonlinear units
+create intermediate features that the output neuron can combine. Choosing the
+right weights and connectivity is the problem that training and evolution address.
+
+## 2.3 Neural Networks and Neural Network Based Systems
+
+*Source: [S], Section 2.3, pp. 57-59; Figs. 2.8-2.9.*
+
+A network is a graph of neurons and connections. Its **topology** specifies which
+elements communicate. Its **parameters** specify how those elements transform
+signals. Changing one is not the same as changing the other.
+
+| Property           | Meaning                               | XOR example                      |
+| ------------------ | ------------------------------------- | -------------------------------- |
+| Input size         | Number of input components            | 2                                |
+| Hidden width       | Number of neurons in a hidden layer   | 2                                |
+| Output size        | Number of output neurons              | 1                                |
+| Neuron-layer depth | Number of computational neuron layers | 2                                |
+| Parameter count    | Connection weights plus biases        | 9                                |
+| Topology           | Pattern of connectivity               | Inputs to hidden layer to output |
+
+Sher counts layers of processing neurons; sensors are separate. In this notebook,
+we likewise do not count the raw input vector as a computational neuron layer.
+
+| Tensor       | Shape     | Interpretation                   |
+| ------------ | --------- | -------------------------------- |
+| $X$          | $\{B,2\}$ | $B$ input examples               |
+| $W_1$        | $\{2,2\}$ | Two inputs to two hidden neurons |
+| $b_1$        | $\{2\}$   | One bias per hidden neuron       |
+| $H$          | $\{B,2\}$ | Hidden activations               |
+| $W_2$        | $\{2,1\}$ | Hidden neurons to output neuron  |
+| $b_2$        | $\{1\}$   | Output bias                      |
+| $\widehat Y$ | $\{B,1\}$ | One output per example           |
+
+A **feedforward** network has no directed feedback cycle. A **recurrent** network
+contains feedback connections. To execute a recurrent circuit, we must specify
+what an edge's delay means and how the initial state is set.
+
+**Remaster scheduling note:** connections within a computation impose dependencies.
+Separate examples or independent neurons may be processed together, but a later
+layer still needs the earlier results it depends on. With skip connections, path
+lengths differ; execution is constrained by the relevant dependency paths, not
+simply the shortest route from an input to an output.
+
+## 2.3.1 Recurrent Neural Networks and Memory Loops
+
+*Source: [S], Section 2.3.1, pp. 59-60; Fig. 2.10.*
+
+A recurrent neuron can use its previous output as an additional input:
+
+$$
+h_t = \tanh(w_x x_t + w_h h_{t-1} + b).
+$$
+
+Here $h_{t-1}$ is **state**, not another learned weight. The weights can stay
+fixed while the state changes at every step. Sher's longer feedback loops extend
+this idea: a signal can return after passing through several other neurons.
+
+```mermaid
+flowchart LR
+    H0[Initial state h0] --> H1[Compute h1]
+    X1[Input x1] --> H1
+    H1 --> H2[Compute h2]
+    X2[Input x2] --> H2
+    H2 --> H3[Compute h3]
+    X3[Input x3] --> H3
+```
+
+*Figure R2.3 - A recurrence unrolled in time. Each step depends on the previous
+state; independent sequences can still be batched.*
+
+### Experiment 4 - An input disappears, but its effect remains
+
+We present a single pulse, then zeros. Compare a memoryless neuron with a
+recurrent neuron using the same input weight and bias.
+
+```elixir
+defmodule Chapter02.Recurrent do
+  import Nx.Defn
+
+  @spec step(
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric()
+        ) :: Nx.Tensor.t()
+  defn step(x, previous, input_weight, recurrent_weight, bias) do
+    Nx.tanh(input_weight * x + recurrent_weight * previous + bias)
+  end
+end
+
+sequence = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+{tbl_memory, h_final} =
+  sequence
+  |> Enum.with_index(1)
+  |> Enum.map_reduce(Nx.tensor(0.0, type: :f32), fn {input, step}, previous ->
+    current = Chapter02.Recurrent.step(input, previous, 1.0, 0.8, 0.0)
+
+    row = %{
+      step: step,
+      input: input,
+      feedforward: :math.tanh(input),
+      recurrent: Nx.to_number(current)
+    }
+
+    {row, current}
+  end)
+
+Chapter02.Tables.tabs(
+  tbl_memory,
+  [:step, :input, :feedforward, :recurrent],
+  "ch_02_tbl_memory.csv"
+)
+```
+
+At step 2, the input is zero. The feedforward output is zero, but the recurrent
+output is approximately $0.5436$: it still reflects the earlier pulse. For these
+particular parameters, the trace decays. Recurrence supplies a mechanism for
+memory; it does not guarantee reliable or unlimited memory.
+
+```elixir
+tbl_memory_plot =
+  Enum.flat_map(tbl_memory, fn row ->
+    [
+      %{step: row.step, output: row.feedforward, model: "feedforward"},
+      %{step: row.step, output: row.recurrent, model: "recurrent"}
+    ]
+  end)
+
+fig_memory =
+  Vl.new(width: 640, height: 260, title: "R2.4 - Memory with fixed weights")
+  |> Vl.data_from_values(tbl_memory_plot)
+  |> Vl.mark(:line, point: true)
+  |> Vl.encode_field(:x, "step", type: :quantitative)
+  |> Vl.encode_field(:y, "output", type: :quantitative)
+  |> Vl.encode_field(:color, "model", type: :nominal)
+
+fig_memory
+```
+
+We use `Enum.map_reduce/3` to make time dependence explicit. Nx handles each
+numerical step. A compiled loop can reduce overhead later, but does not remove
+the mathematical dependence on the previous state. Reset the state before an
+independent episode unless carrying memory across episodes is intentional.
+
+## 2.3.2 A Neural Network Based System
+
+*Source: [S], Section 2.3.2, pp. 60-61; Fig. 2.11.*
+
+A neural network alone does not specify where its inputs come from or what its
+outputs do. Sher's **NN-based agent** combines sensors, a neural network, and
+actuators.
+
+```mermaid
+flowchart LR
+    E[Environment or scape] --> S[Sensor: encode observation]
+    S --> N[Neural controller]
+    N --> A[Actuator: interpret command]
+    A --> E
+```
+
+*Figure R2.5 - The agent-environment loop. A network output is a command;
+its consequences depend on the actuator and the environment.*
+
+### Experiment 5 - Move toward a target
+
+**Remaster toy environment:** an agent has a one-dimensional position. Its sensor
+reports signed distance to a target. A hand-set neuron produces a command. The
+actuator limits the command, and the environment updates position. Nothing is
+evolved or trained in this example.
+
+```elixir
+world_initial = %{position: 1.0, target: 0.0}
+w_controller = Nx.tensor([-2.0], type: :f32)
+
+sensor = fn world ->
+  Nx.tensor([world.position - world.target], type: :f32)
+end
+
+controller = fn observation ->
+  Chapter02.Neuron.tensor(observation, w_controller, 0.0)
+  |> Nx.to_number()
+end
+
+actuator = fn command -> max(-1.0, min(1.0, command)) end
+
+scape_step = fn world, action ->
+  %{world | position: world.position + 0.1 * action}
+end
+
+{tbl_agent, world_final} =
+  Enum.map_reduce(1..8, world_initial, fn step, world ->
+    command = controller.(sensor.(world))
+    action = actuator.(command)
+    next_world = scape_step.(world, action)
+
+    {%{
+       step: step,
+       position_before: world.position,
+       command: command,
+       position_after: next_world.position,
+       distance_after: abs(next_world.position - next_world.target)
+     }, next_world}
+  end)
+
+Chapter02.Tables.tabs(
+  tbl_agent,
+  [:step, :position_before, :command, :position_after, :distance_after],
+  "ch_02_tbl_agent.csv"
+)
+```
+
+The distance should decrease. That is a property of this hand-designed controller
+and simple update rule, not evidence that the neuron understands the task.
+In GES, an evaluator could turn the resulting trajectory into a fitness score or
+behavior descriptor. **The controller's output is not itself its fitness.**
+
+## 2.4 Learning Vs. Training
+
+*Source: [S], Section 2.4, pp. 61-63.*
+
+Sher deliberately distinguishes two terms that are often used interchangeably.
+
+| Term in Sher's book | Where the change comes from                                                        | Example                                           |
+| ------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------- |
+| Training            | An algorithm outside the agent changes its parameters or topology                  | A trainer updates weights using output errors     |
+| Learning            | The operating agent changes through experience using its own plasticity mechanisms | A synapse updates from activity during an episode |
+
+His proposed combination is to prepare a system first, then let its plasticity
+adapt it while it interacts with an environment. Neuroevolution can search for
+systems whose adaptation rules are useful, not merely for a good fixed set of
+weights.
+
+**Terminology note - remaster clarification:** retain Sher's distinction when
+reading this book, but do not equate these two independent questions:
+
+| Question                             | Possible answers                                       |
+| ------------------------------------ | ------------------------------------------------------ |
+| What information guides an update?   | Target labels, input structure, activity, feedback     |
+| When and where does an update occur? | In a separate trainer, or during the agent's operation |
+
+The supervised example in the next section uses target labels and an external
+trainer. Freezing the weights afterward is our execution policy, not an intrinsic
+property of the differentiation operation. Likewise, changing weights during an
+episode does not by itself prove that task performance improves.
+
+### State is not plasticity
+
+| Changing quantity     | Fixed-weight recurrent example | Plastic network                                   |
+| --------------------- | ------------------------------ | ------------------------------------------------- |
+| Input $x_t$           | Can change                     | Can change                                        |
+| Recurrent state $h_t$ | Can change                     | Can change                                        |
+| Weights $W_t$         | Fixed during the episode       | Updated during the episode                        |
+| Topology              | Fixed in our example           | May be fixed or adaptive, depending on the design |
+
+**A network can remember without changing its weights. A network can change its
+weights without having a recurrent connection.** Those are distinct mechanisms.
+
+## 2.5 Neural Network Supervised "Learning" Algorithms
+
+*Source: [S], Section 2.5, pp. 63-66; Fig. 2.12.*
+
+Supervised training starts with input-target pairs. The network predicts an
+output, a loss measures the discrepancy, and an optimizer changes the weights.
+Sher introduces backpropagation but leaves its extensive treatment to other texts.
+
+For a batch with $B$ examples and $O$ output components, use mean squared error:
+
+$$
+L(\theta)=\frac{1}{BO}\sum_{n=1}^{B}\sum_{j=1}^{O}
+\left(\widehat y_{nj}-y_{nj}\right)^2.
+$$
+
+A gradient-descent update is
+
+$$
+\theta_{k+1}=\theta_k-\eta\nabla_\theta L(\theta_k).
+$$
+
+| Operation           | What it does                                         |
+| ------------------- | ---------------------------------------------------- |
+| Forward computation | Produces predictions from inputs and parameters      |
+| Loss evaluation     | Compares predictions with targets                    |
+| Backpropagation     | Computes derivatives of the loss through the network |
+| Optimizer update    | Uses those derivatives to change parameters          |
+
+Backpropagation computes gradients; gradient descent uses them. We use distinct
+symbols for input $x$, target $y$, and prediction $\widehat y$ to avoid ambiguity
+in the source's step-by-step notation.
+
+For intuition, with one tanh neuron and squared error $(\widehat y-y)^2$:
+
+$$
+\frac{\partial L}{\partial w_i}
+=2(\widehat y-y)(1-\widehat y^2)x_i.
+$$
+
+In a multi-layer network, the chain rule carries these contributions through the
+hidden layers. Nx's automatic differentiation computes that chain rule. [D2]
+
+### Experiment 6 - Train the small XOR network
+
+**Remaster implementation:** use the same two-hidden-neuron architecture, but
+start from modest, fixed, asymmetric parameters rather than the hand-designed
+solution. The initial values are deterministic; no random seed is needed.
+
+```elixir
+defmodule Chapter02.Training do
+  import Nx.Defn
+
+  @spec step(
+          Chapter02.Feedforward.params(),
+          Nx.Tensor.t(),
+          Nx.Tensor.t(),
+          Chapter02.Support.numeric()
+        ) :: Chapter02.Feedforward.params()
+  defn step(params, x, target, rate) do
+    {w1, b1, w2, b2} = params
+
+    {dw1, db1, dw2, db2} =
+      grad(params, fn candidate ->
+        Chapter02.Feedforward.loss(candidate, x, target)
+      end)
+
+    {w1 - rate * dw1, b1 - rate * db1, w2 - rate * dw2, b2 - rate * db2}
+  end
+end
+
+mod_seed = {
+  Nx.tensor([[0.2, -0.3], [0.4, 0.1]], type: :f32),
+  Nx.tensor([0.1, -0.2], type: :f32),
+  Nx.tensor([[0.5], [-0.4]], type: :f32),
+  Nx.tensor([0.0], type: :f32)
+}
+
+loss_initial = Chapter02.Feedforward.loss(mod_seed, x_xor, y_xor) |> Nx.to_number()
+
+{tbl_training_steps, mod_trained} =
+  Enum.map_reduce(1..300, mod_seed, fn step, params ->
+    updated = Chapter02.Training.step(params, x_xor, y_xor, 0.2)
+    loss = Chapter02.Feedforward.loss(updated, x_xor, y_xor) |> Nx.to_number()
+    {%{step: step, loss: loss}, updated}
+  end)
+
+tbl_training = [%{step: 0, loss: loss_initial} | tbl_training_steps]
+y_trained = Chapter02.Feedforward.forward(mod_trained, x_xor)
+loss_final = Chapter02.Feedforward.loss(mod_trained, x_xor, y_xor) |> Nx.to_number()
+
+Chapter02.Support.close!(Chapter02.Support.bipolar(y_trained), y_xor, 0.0)
+
+%{initial_loss: loss_initial, final_loss: loss_final, predictions: Nx.to_flat_list(y_trained)}
+```
+
+Reference behavior: loss falls from approximately **1.0500** to **0.00484** after
+300 updates, with all four classifications correct. Small floating-point
+variation is expected. This is a reproducible example, not a claim that every
+initialization or learning rate succeeds.
+
+```elixir
+fig_training =
+  Vl.new(width: 640, height: 260, title: "R2.6 - Supervised XOR training")
+  |> Vl.data_from_values(tbl_training)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "step", type: :quantitative)
+  |> Vl.encode_field(:y, "loss", type: :quantitative)
+
+fig_training
+```
+
+All four XOR cases appear in training. Therefore, this experiment checks that the
+implementation can fit a truth table; it is not a held-out generalization test.
+On a real problem, evaluate generalization using data or environments not used
+to choose the parameters.
+
+Sher's motivating limitation is the absence of an appropriate input-target
+training set for many controller-design tasks. A task may be easier to **score**
+after a rollout than to specify as the correct action for every observation.
+That motivates evolutionary evaluation; it does not mean gradient-based methods
+and evolution must be mutually exclusive.
+
+## 2.6 Neural Network Unsupervised Learning Algorithms
+
+*Source: [S], Section 2.6, pp. 66-67.*
+
+Sher next considers adaptation without the input-target pairs used above. His
+important architectural distinction is between a rule that uses information local
+to a connection or neuron and a rule that compares a collection of neurons.
+
+| Method in this chapter | Information used by the update                 | Coordination required                             |
+| ---------------------- | ---------------------------------------------- | ------------------------------------------------- |
+| Hebbian / Oja          | Input, output, and possibly the current weight | Local update once activity is available           |
+| Neuromodulation        | Local activity plus a modulatory signal        | A modulator communicates with the affected units  |
+| Competitive learning   | Outputs from competing units                   | Choose a winner, then update it                   |
+| Self-organizing map    | Input-prototype distances and map coordinates  | Choose a best match, then update its neighborhood |
+
+The following experiments make these rules explicit. A rule that changes weights
+is not automatically a rule that improves the task we care about. That question
+belongs to evaluation.
+
+## 2.6.1 Hebbian Learning
+
+*Source: [S], Section 2.6.1, pp. 67-70; Figs. 2.13-2.14.*
+
+### Correlated activity changes a connection
+
+With a presynaptic input $x_i$, postsynaptic output $y$, and learning rate $\eta$,
+the simple Hebbian update is
+
+$$
+\Delta w_i=\eta x_i y,
+\qquad w_i\leftarrow w_i+\Delta w_i.
+$$
+
+Sher's basic prose equation takes the learning-rate factor as implicit; his figure
+includes it. We write it explicitly throughout the notebook.
+
+For signed signals, matching signs produce a positive increment; opposite signs
+produce a negative increment. A negative increment lowers the signed weight, but
+does not necessarily reduce its absolute magnitude.
+
+Repeated reinforcing activity can drive simple Hebbian weights to large
+magnitudes. Sher introduces Oja's rule to counter that growth:
+
+$$
+\Delta w_i=\eta y(x_i-yw_i)
+=\underbrace{\eta yx_i}_{\text{Hebbian term}}
+-\underbrace{\eta y^2w_i}_{\text{normalizing term}}.
+$$
+
+**Source qualification:** simple signed Hebbian updates can decrease a weight
+when $x_i y<0$. The missing ingredient is an automatic stabilizing or decay term,
+not a mathematical impossibility of decrease. Also, the normalizing term does
+not provide an unconditional stability guarantee for arbitrary learning rates
+and inputs.
+
+### Experiment 7 - Unrestricted growth versus normalization
+
+**Remaster implementation:** follow the tanh-neuron illustration in Sher's
+figures. Present $x=1$ repeatedly, start at $w=0.5$, and use $\eta=0.1$.
+Compute the output from the old weight, then update the weight.
+
+```elixir
+defmodule Chapter02.Plasticity do
+  import Nx.Defn
+
+  @spec hebbian(
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric()
+        ) :: Nx.Tensor.t()
+  defn hebbian(w, x, y, rate) do
+    w + rate * x * y
+  end
+
+  @spec oja(
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric()
+        ) :: Nx.Tensor.t()
+  defn oja(w, x, y, rate) do
+    w + rate * y * (x - y * w)
+  end
+end
+
+plastic_input = Nx.tensor([1.0], type: :f32)
+plastic_initial = Nx.tensor([0.5], type: :f32)
+
+{tbl_plastic_steps, {w_hebb_final, w_oja_final}} =
+  Enum.map_reduce(1..100, {plastic_initial, plastic_initial}, fn step, {w_hebb, w_oja} ->
+    y_hebb = Chapter02.Neuron.tensor(plastic_input, w_hebb, 0.0)
+    y_oja = Chapter02.Neuron.tensor(plastic_input, w_oja, 0.0)
+
+    next_hebb = Chapter02.Plasticity.hebbian(w_hebb, plastic_input, y_hebb, 0.1)
+    next_oja = Chapter02.Plasticity.oja(w_oja, plastic_input, y_oja, 0.1)
+
+    rows = [
+      %{step: step, weight: Nx.to_number(Nx.sum(next_hebb)), rule: "Hebbian"},
+      %{step: step, weight: Nx.to_number(Nx.sum(next_oja)), rule: "Oja-style"}
+    ]
+
+    {rows, {next_hebb, next_oja}}
+  end)
+
+tbl_plasticity =
+  [
+    %{step: 0, weight: 0.5, rule: "Hebbian"},
+    %{step: 0, weight: 0.5, rule: "Oja-style"}
+  ] ++ List.flatten(tbl_plastic_steps)
+
+fig_plasticity =
+  Vl.new(width: 640, height: 260, title: "R2.7 - Repeated input and weight dynamics")
+  |> Vl.data_from_values(tbl_plasticity)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "step", type: :quantitative)
+  |> Vl.encode_field(:y, "weight", type: :quantitative)
+  |> Vl.encode_field(:color, "rule", type: :nominal)
+
+fig_plasticity
+```
+
+In this nonlinear example, the Oja-style weight approaches a fixed point near
+$1.20$, while the plain Hebbian weight keeps increasing. The nonzero fixed point
+satisfies $w\tanh(w)=1$. It is **not** the unit-norm result one might expect from
+a different, linear-neuron setup. We are reproducing the type of tanh
+illustration used in Sher's chapter, not demonstrating a principal-component
+analysis theorem.
+
+For multiple inputs and outputs, local Hebbian updates can be written as an outer
+product. Under our input-by-output weight convention:
+
+$$
+\Delta W=\eta x y^\top.
+$$
+
+This is a natural Nx workload. Batching or summing updates across observations,
+however, is not necessarily equivalent to sequential online updates, because
+later online outputs depend on earlier weight changes.
+
+## 2.6.2 Neuromodulation
+
+*Source: [S], Section 2.6.2, pp. 70-73; Figs. 2.15-2.17.*
+
+A modulatory circuit changes **how another circuit adapts**. Sher gives two
+architectures: a separate circuit modulates a main circuit, or a smaller
+modulatory circuit is embedded within each affected neuron.
+
+His update rule can be written with consistent symbols as
+
+$$
+\Delta w_i = \eta m\left(Ax_i y+Bx_i+Cy\right).
+$$
+
+Here $m$ corresponds to Sher's $f$; $\eta$ corresponds to his $N$; $x_i$ and $y$
+correspond to presynaptic and postsynaptic outputs. The equation retains the
+three terms in this chapter's source; no extra constant term has been added.
+
+| Quantity | Role                                           |
+| -------- | ---------------------------------------------- |
+| $\eta$   | Overall learning-rate scale                    |
+| $A$      | Contribution of joint input-output activity    |
+| $B$      | Contribution of the input alone                |
+| $C$      | Contribution of the output alone               |
+| $m$      | Modulates the magnitude and sign of the update |
+
+For this rule, $m=0$ freezes the update. A negative $m$ reverses its direction.
+The parameters may be hand-set, evolved, or produced by another neural circuit,
+as Sher discusses. The modulation signal is not automatically a reward or a
+fitness value.
+
+### Experiment 8 - Gate a plastic update
+
+```elixir
+defmodule Chapter02.Modulation do
+  import Nx.Defn
+
+  @spec step(
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric()
+        ) :: Nx.Tensor.t()
+  defn step(w, x, y, modulation, rate, a, b, c) do
+    w + rate * modulation * (a * x * y + b * x + c * y)
+  end
+end
+
+w_modulation = Nx.tensor([0.2, 0.1], type: :f32)
+x_modulation = Nx.tensor([1.0, -0.5], type: :f32)
+y_modulation = Chapter02.Neuron.tensor(x_modulation, w_modulation, 0.0)
+
+# A tiny circuit B that observes the same input and produces m.
+m_neural =
+  Chapter02.Neuron.tensor(x_modulation, Nx.tensor([2.0, -1.0], type: :f32), 0.0)
+  |> Nx.to_number()
+
+tbl_modulation =
+  Enum.map([{"reverse", -1.0}, {"freeze", 0.0}, {"permit", 1.0}, {"circuit B", m_neural}],
+    fn {mode, m} ->
+      updated = Chapter02.Modulation.step(w_modulation, x_modulation, y_modulation,
+        m, 0.1, 1.0, 0.0, 0.0)
+
+      [w1, w2] = Nx.to_flat_list(updated)
+      %{mode: mode, modulation: m, updated_w1: w1, updated_w2: w2}
+    end)
+
+w_frozen = Chapter02.Modulation.step(w_modulation, x_modulation, y_modulation,
+  0.0, 0.1, 1.0, 0.0, 0.0)
+
+Chapter02.Support.close!(w_frozen, w_modulation, 0.0)
+Chapter02.Tables.tabs(
+  tbl_modulation,
+  [:mode, :modulation, :updated_w1, :updated_w2],
+  "ch_02_tbl_modulation.csv"
+)
+```
+
+Circuit B is hand-set here. Evolution could instead search its weights and
+connections. That does not remove the design problem; it moves part of the
+search from a fixed controller to a mechanism that controls adaptation.
+
+## 2.6.3 Competitive Learning
+
+*Source: [S], Section 2.6.3, pp. 73-74; Fig. 2.18.*
+
+Several neurons receive the same input. A coordinating rule compares their
+responses, chooses a winner, and updates that winner. Repeated competition is
+intended to produce specialization.
+
+**Preserved source choice:** Sher selects the largest output **magnitude**.
+For this experiment we therefore use
+
+$$
+s_j=\tanh(w_j^\top x),
+\qquad c=\operatorname*{arg\,max}_j |s_j|.
+$$
+
+Then only $w_c$ receives an Oja-style update. We do not silently substitute a
+nearest-prototype algorithm; that different criterion appears in the SOM section.
+
+### Experiment 9 - Only the winner changes
+
+Here each **row** of $W$ is one competing neuron's weight vector. This differs
+from the column-per-neuron convention in the dense feedforward example, because
+we are now comparing a collection of candidate vectors. The code states the
+orientation explicitly.
+
+```elixir
+defmodule Chapter02.Competitive do
+  import Nx.Defn
+
+  # w: {units, inputs}; x: {inputs}
+  @spec step(Nx.Tensor.t(), Nx.Tensor.t(), Chapter02.Support.numeric()) ::
+          {Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()}
+  defn step(w, x, rate) do
+    scores = Nx.tanh(Nx.dot(w, x))
+    winner = Nx.argmax(Nx.abs(scores))
+
+    row_ids = Nx.iota({Nx.axis_size(w, 0)})
+    winner_mask =
+      Nx.new_axis(Nx.equal(row_ids, winner), 1)
+      |> Nx.broadcast(Nx.shape(w))
+    y = Nx.new_axis(scores, 1)
+    candidates = w + rate * y * (Nx.new_axis(x, 0) - y * w)
+
+    {Nx.select(winner_mask, candidates, w), winner, scores}
+  end
+end
+
+w_competitive = Nx.tensor([[0.8, 0.1], [0.1, 0.8], [-0.5, -0.5]], type: :f32)
+x_competitive = Nx.tensor([1.0, 0.1], type: :f32)
+
+{w_competitive_updated, competitive_winner, competitive_scores} =
+  Chapter02.Competitive.step(w_competitive, x_competitive, 0.1)
+
+tbl_competitive =
+  Enum.zip([
+    Nx.to_flat_list(competitive_scores),
+    Enum.chunk_every(Nx.to_flat_list(w_competitive), 2),
+    Enum.chunk_every(Nx.to_flat_list(w_competitive_updated), 2)
+  ])
+  |> Enum.with_index()
+  |> Enum.map(fn {{score, [old1, old2], [new1, new2]}, unit} ->
+    %{unit: unit, score: score, winner: unit == Nx.to_number(competitive_winner),
+      old_w1: old1, old_w2: old2, new_w1: new1, new_w2: new2}
+  end)
+
+Chapter02.Tables.tabs(
+  tbl_competitive,
+  [:unit, :score, :winner, :old_w1, :old_w2, :new_w1, :new_w2],
+  "ch_02_tbl_competitive.csv"
+)
+```
+
+The winner is unit **0** under zero-based indexing. The other two weight vectors
+remain unchanged. One update illustrates the mechanism; it does not demonstrate
+that meaningful clusters have already been learned.
+
+## 2.6.4 Kohonen/Self Organizing Map
+
+*Source: [S], Section 2.6.4, pp. 74-76; Figs. 2.19-2.20.*
+
+A **self-organizing map (SOM)** associates each unit with a prototype vector and a
+position on a fixed map. These are two different spaces.
+
+| Object                        | Space         | Used for                       |
+| ----------------------------- | ------------- | ------------------------------ |
+| Input $x$ and prototype $w_v$ | Feature space | Finding the closest prototype  |
+| Unit coordinate $r_v$         | Map space     | Finding the winner's neighbors |
+
+The **best matching unit (BMU)** is
+
+$$
+c=\operatorname*{arg\,min}_v\|x-w_v\|^2.
+$$
+
+Sher's update moves the BMU and its neighbors toward the input:
+
+$$
+w_v(t+1)=w_v(t)+\alpha(t)\,h_{cv}(t)\left[x(t)-w_v(t)\right].
+$$
+
+He permits different neighborhood functions. Our remaster chooses a Gaussian:
+
+$$
+h_{cv}=\exp\left(-\frac{\|r_c-r_v\|^2}{2\sigma^2}\right).
+$$
+
+The winner has $h_{cc}=1$; more distant map units have smaller factors.
+For repeated training, Sher decreases the learning rate over time. The objective
+is an organized mapping of the data, not a guarantee that every topological
+relationship will be preserved perfectly.
+
+### Experiment 10 - The winner and its neighbors adapt
+
+Use nine units on a $3\times3$ grid with coordinates in $[-1,1]$, following
+Sher's coordinate convention. Feature space is also two-dimensional in this toy
+example, but it need not have the same dimensionality as map space.
+
+```elixir
+defmodule Chapter02.SOM do
+  import Nx.Defn
+
+  # prototypes: {units, features}; grid: {units, map_dimensions}
+  @spec step(
+          Nx.Tensor.t(),
+          Nx.Tensor.t(),
+          Nx.Tensor.t(),
+          Chapter02.Support.numeric(),
+          Chapter02.Support.numeric()
+        ) :: {Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()}
+  defn step(prototypes, grid, x, rate, sigma) do
+    distances = Nx.sum(Nx.pow(prototypes - Nx.new_axis(x, 0), 2), axes: [1])
+    winner = Nx.argmin(distances)
+    winner_position = Nx.take(grid, winner, axis: 0)
+
+    map_distances =
+      Nx.sum(Nx.pow(grid - Nx.new_axis(winner_position, 0), 2), axes: [1])
+
+    neighborhood = Nx.exp(-map_distances / (2 * sigma * sigma))
+    updated = prototypes + rate * Nx.new_axis(neighborhood, 1) * (Nx.new_axis(x, 0) - prototypes)
+
+    {updated, winner, neighborhood}
+  end
+end
+
+grid_coordinates = for row <- [-1.0, 0.0, 1.0], col <- [-1.0, 0.0, 1.0], do: [row, col]
+grid_som = Nx.tensor(grid_coordinates, type: :f32)
+w_som = Nx.multiply(grid_som, 0.3)
+x_som = Nx.tensor([0.8, 0.6], type: :f32)
+
+# rate > 0 and sigma > 0 are required for this demonstration.
+{w_som_updated, som_winner, som_neighborhood} =
+  Chapter02.SOM.step(w_som, grid_som, x_som, 0.4, 0.7)
+
+tbl_som =
+  Enum.zip([
+    grid_coordinates,
+    Enum.chunk_every(Nx.to_flat_list(w_som), 2),
+    Enum.chunk_every(Nx.to_flat_list(w_som_updated), 2),
+    Nx.to_flat_list(som_neighborhood)
+  ])
+  |> Enum.with_index()
+  |> Enum.map(fn {{[row, col], [old1, old2], [new1, new2], neighborhood}, unit} ->
+    %{unit: unit, map_row: row, map_col: col,
+      bmu: unit == Nx.to_number(som_winner), neighborhood: neighborhood,
+      old_w1: old1, old_w2: old2, new_w1: new1, new_w2: new2}
+  end)
+
+Chapter02.Tables.tabs(
+  tbl_som,
+  [:unit, :map_row, :map_col, :bmu, :neighborhood, :old_w1, :old_w2, :new_w1, :new_w2],
+  "ch_02_tbl_som.csv"
+)
+```
+
+The BMU is unit **8**, whose prototype starts at $[0.3,0.3]$. Its update is
+
+$$
+[0.3,0.3]+0.4([0.8,0.6]-[0.3,0.3])=[0.5,0.42].
+$$
+
+Other units move according to their **map-space** distance from unit 8, not
+according to their feature-space distance from the input.
+
+```elixir
+tbl_som_plot =
+  Enum.flat_map(tbl_som, fn row ->
+    [
+      %{unit: row.unit, phase: "before", x: row.old_w1, y: row.old_w2},
+      %{unit: row.unit, phase: "after", x: row.new_w1, y: row.new_w2}
+    ]
+  end)
+
+fig_som =
+  Vl.new(width: 520, height: 350, title: "R2.8 - SOM prototypes before and after one update")
+  |> Vl.data_from_values(tbl_som_plot)
+  |> Vl.mark(:point, filled: true, size: 90)
+  |> Vl.encode_field(:x, "x", type: :quantitative, title: "Prototype feature 1")
+  |> Vl.encode_field(:y, "y", type: :quantitative, title: "Prototype feature 2")
+  |> Vl.encode_field(:color, "phase", type: :nominal)
+  |> Vl.encode_field(:tooltip, "unit", type: :nominal)
+
+fig_som
+```
+
+For a full training run, repeat the update over data while decreasing
+$\alpha(t)$, as in Sher's algorithm. One possible remaster schedule is
+$\alpha(t)=\alpha_0/(1+t/\tau)$ for $\tau>0$. That schedule is an implementation
+choice, not a formula specified by the source. The experiment above intentionally
+shows only one update so that the mechanism is inspectable.
+
+## 2.6.5 Putting it All Together
+
+*Source: [S], Section 2.6.5, pp. 76-77; Fig. 2.21.*
+
+Sher's synthesis is a network composed of different kinds of circuits: some
+static, some recurrent, some plastic, and some modulatory. His question is how to
+choose their parameters and connect them into a useful whole. He proposes
+evolution as the organizing method.
+
+His large, heterogeneous cognitive architecture is a **proposed direction**, not
+a demonstrated consequence of combining the four learning algorithms. We retain
+the research question without treating intelligence or self-awareness as guaranteed.
+
+### Remaster connection - Generation, Evaluation, Selection
+
+Our GES framework makes the design problem explicit.
+
+| Stage      | What it does here                                  | Examples                                                        |
+| ---------- | -------------------------------------------------- | --------------------------------------------------------------- |
+| Generation | Produces candidate inherited designs               | Mutate initial weights, topology, or plasticity-rule parameters |
+| Evaluation | Observes what each design does during its lifetime | Measure task performance, behavior, novelty, or robustness      |
+| Selection  | Decides what persists or contributes to the future | Choose survivors, parents, or archive entries                   |
+
+```mermaid
+flowchart LR
+    G[Generation: candidate designs] --> E[Evaluation: episodes and measurements]
+    E --> S[Selection: decisions]
+    S --> P[Survivors and parents]
+    P --> G
+    S --> A[Archive]
+    A -. reference behaviors .-> E
+    A -. reusable designs .-> G
+```
+
+*Figure R2.9 - Our GES design framework. The archive's use is a policy choice;
+it need not serve both roles shown here. This diagram is a remaster addition.*
+
+A candidate can encode both starting parameters and an adaptation rule:
+
+$$
+g \longmapsto (\theta_0,\phi,\mathcal T),
+$$
+
+where $\theta_0$ is the initial parameter set, $\phi$ contains plasticity settings,
+and $\mathcal T$ is topology. During one evaluated episode:
+
+$$
+(h_{t+1},a_t)=F_{\theta_t,\mathcal T}(h_t,x_t),
+\qquad
+\theta_{t+1}=U_\phi(\theta_t,x_t,h_t,a_t,\ldots).
+$$
+
+Evolution can evaluate **how the agent adapts**, rather than just its performance
+before adaptation. The ellipsis represents additional explicitly chosen update
+signals, such as a modulatory signal; it is not an unspecified oracle.
+
+### Four things to keep separate
+
+| Item                          | Lifetime                          | Reset or inheritance decision                                             |
+| ----------------------------- | --------------------------------- | ------------------------------------------------------------------------- |
+| Genotype $g$                  | Across generations                | Passed through the chosen reproduction/mutation scheme                    |
+| Recurrent state $h_t$         | Within a rollout                  | Usually reset at an independent episode boundary                          |
+| Adapted parameters $\theta_t$ | Within a learning lifetime        | Reset to $\theta_0$ unless a different evaluation protocol is intentional |
+| Archive                       | Across evaluations or generations | Retained under an explicit archive policy                                 |
+
+Do not accidentally let one candidate inherit another candidate's recurrent state
+or adapted weights. Whether an individual's **own acquired changes** are inherited
+is also an explicit algorithmic choice, not a default implication of plasticity.
+Evaluation must specify the reset policy, episode duration, and environment
+conditions before scores can be compared meaningfully.
+
+### Elixir/BEAM and Nx
+
+| Responsibility                                                            | Natural implementation in this remaster                           |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Agent lifecycle, dynamic graphs, environment interfaces, persistence      | Elixir data structures and, where useful, BEAM processes          |
+| Weighted sums, dense inference, plasticity updates, distance calculations | Nx tensor functions                                               |
+| Sequential orchestration and dependent episode steps                      | Explicit control flow, with numerical kernels inside              |
+| Many compatible examples, candidates, or environments                     | Batched Nx computations when their shapes and semantics permit it |
+
+**The boundary is not "BEAM does generation, Nx does evaluation."** Numerical
+mutation and ranking may also suit Nx. The useful distinction is **dynamic
+coordination versus regular numerical computation**. Heterogeneous topologies
+need careful representation before they can be efficiently batched.
+
+A process per neuron is a possible educational architecture, not a requirement
+for expressing neural computation. We will preserve Sher's concurrency ideas
+without forcing every multiply-add to become a message exchange.
+
+## 2.7 Summary
+
+*Source: [S], Section 2.7, p. 78. The checks and exercises below are remaster additions.*
+
+| Idea           | What to remember                                                             |
+| -------------- | ---------------------------------------------------------------------------- |
+| Neurode        | An input-weight-bias-activation computation                                  |
+| Network        | A graph whose topology and parameters jointly determine computation          |
+| Recurrence     | State carries effects from earlier steps                                     |
+| Plasticity     | Experience changes future computation by changing parameters or structure    |
+| Modulation     | One signal or circuit controls how another adapts                            |
+| Competition    | A comparison determines which unit receives an update                        |
+| SOM            | A winner is found in feature space; its neighborhood is defined in map space |
+| Neuroevolution | Searches for useful networks and potentially useful adaptation rules         |
+
+**The key insight:** evolution need not discover only a finished solution. It can
+also discover a system that continues adapting during its lifetime. Evaluating
+that system requires evaluating its dynamics, not merely inspecting its weights.
+
+### Executable checks
+
+Run this after all earlier cells. A failed assertion stops the cell and names the
+failed check. These checks validate the demonstrated behaviors; they are not an
+exhaustive test suite for arbitrary network sizes, data, or backends.
+
+```elixir
+competitive_old_rows = Enum.chunk_every(Nx.to_flat_list(w_competitive), 2)
+competitive_new_rows = Enum.chunk_every(Nx.to_flat_list(w_competitive_updated), 2)
+som_winner_vector = Nx.take(w_som_updated, som_winner, axis: 0)
+
+checks = [
+  {Chapter02.Support.max_error(y_tensor, y_scalar) < 1.0e-5,
+   "Plain Elixir and Nx agree for the neurode"},
+  {Nx.shape(y_replacement) == {4, 1},
+   "Batched XOR output has shape {4, 1}"},
+  {Chapter02.Support.max_error(Chapter02.Support.bipolar(y_replacement), y_xor) == 0,
+   "Replacement circuit classifies all XOR inputs"},
+  {Chapter02.Support.max_error(Chapter02.Support.bipolar(y_printed), y_xor) > 0,
+   "Printed XOR coefficients expose the source discrepancy"},
+  {Enum.at(tbl_memory, 1).feedforward == 0.0 and Enum.at(tbl_memory, 1).recurrent > 0.0,
+   "Recurrence retains the effect of the earlier input"},
+  {abs(world_final.position - world_final.target) < abs(world_initial.position - world_initial.target),
+   "Hand-designed agent moves closer to its target"},
+  {loss_final < 0.02 and loss_final < loss_initial,
+   "Supervised training reduces the XOR loss"},
+  {Chapter02.Support.max_error(Chapter02.Support.bipolar(y_trained), y_xor) == 0,
+   "Trained network classifies all XOR inputs"},
+  {Nx.to_number(Nx.sum(w_hebb_final)) > Nx.to_number(Nx.sum(w_oja_final)),
+   "Repeated Hebbian growth exceeds this Oja-style trace"},
+  {Chapter02.Support.max_error(w_frozen, w_modulation) == 0,
+   "Zero modulation freezes the weights"},
+  {Nx.to_number(competitive_winner) == 0 and
+     Enum.at(competitive_old_rows, 0) != Enum.at(competitive_new_rows, 0) and
+     Enum.drop(competitive_old_rows, 1) == Enum.drop(competitive_new_rows, 1),
+   "Competitive learning changes only the winning row"},
+  {Nx.to_number(som_winner) == 8 and
+     Chapter02.Support.max_error(som_winner_vector, Nx.tensor([0.5, 0.42])) < 1.0e-5,
+   "SOM chooses unit 8 and updates its prototype correctly"}
+]
+
+tbl_checks = Enum.map(checks, fn {passed, label} -> Chapter02.Support.check!(passed, label) end)
+Chapter02.Tables.tabs(
+  tbl_checks,
+  [:check, :result],
+  "ch_02_tbl_checks.csv"
+)
+```
+
+### Exercises
+
+| Exercise                | Change                                                | What to inspect                                                               |
+| ----------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Bias and threshold      | Change the single neuron's bias from -0.25 to 0.25    | Did its weights change? Why did its output change?                            |
+| Memory without learning | Change the recurrent weight from 0.8 to 0.0           | Which mechanism disappears, and which parameters remain fixed?                |
+| Plasticity and order    | Present different input sequences to a plastic neuron | Can the same final input produce different outputs after different histories? |
+| Controlled adaptation   | Change the modulation signal's sign                   | Which terms of the update are reversed?                                       |
+| Neighborhood learning   | Reduce SOM sigma from 0.7 to 0.2                      | Does the winner change? Which neighbors still move appreciably?               |
+| Fair GES evaluation     | Compare agents with different plasticity rates        | What must be reset or standardized before comparing scores?                   |
+
+### Self-check
+
+| Question                                               | Answer                                                                         |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| Does recurrence require weight updates?                | No. The state can change while the weights stay fixed.                         |
+| Does plasticity guarantee improvement?                 | No. Its effects must be evaluated against a task or other criterion.           |
+| Is a neural controller the whole agent?                | No. Sensors and actuators define its interface to the environment.             |
+| Is an Oja-style update the same as arbitrary clipping? | No. The normalizing term is part of a particular update equation.              |
+| Is the SOM neighborhood measured in feature space?     | No. The BMU is chosen there, but neighborhood distance is measured on the map. |
+| Does evaluation decide who reproduces?                 | It supplies measurements. Selection makes the reproduction decision.           |
+
+**Next:** Chapter 3 introduces evolutionary computation. We will use GES to
+separate candidate generation, measurement, and decisions about what persists.
+
+## 2.8 References and adaptation notes
+
+### Primary source
+
+**[S]** Gene I. Sher. *Handbook of Neuroevolution Through Erlang*. Springer, 2013.
+Chapter 2, "Introduction to Neural Networks," pp. 43-79.
+DOI: `10.1007/978-1-4614-4463-3_2`.
+
+The supplied 37-page chapter PDF is the source for the explanations and section
+organization. Printed page numbers are used throughout; PDF page 1 is printed
+p. 43. Figures in this notebook are new diagrams or plots, not extracted book
+illustrations.
+
+| Source location               | Material retained                                              | Remaster treatment                                                           |
+| ----------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| pp. 43-45                     | Evolutionary motivation for neural building blocks             | Condensed; broad future claims remain motivation                             |
+| Section 2.1, pp. 45-51        | Anatomy, signal timing, spatiotemporal integration, plasticity | Short comparison table and timing illustration                               |
+| Sections 2.2-2.2.1, pp. 51-57 | Neurodes, bias, activation, vector inputs, XOR                 | Equations, scalar/Nx parity, plotted activations, explicit coefficient audit |
+| Sections 2.3-2.3.2, pp. 57-61 | Layers, recurrence, memory loops, NN-based agents              | Tensor-shape convention and two small rollouts                               |
+| Section 2.4, pp. 61-63        | Sher's distinction between training and learning               | Preserved as book-specific terminology                                       |
+| Section 2.5, pp. 63-66        | Supervised backpropagation                                     | Consistent symbols and an Nx gradient-descent experiment                     |
+| Section 2.6.1, pp. 67-70      | Hebbian growth, Oja normalization, mention of other rules      | Executable local rules with stability qualifications                         |
+| Section 2.6.2, pp. 70-73      | Separate and embedded modulators; three-term plasticity rule   | Same rule with renamed symbols and an explicit gating experiment             |
+| Section 2.6.3, pp. 73-74      | Competition based on output magnitude                          | Magnitude-based winner selection retained                                    |
+| Section 2.6.4, pp. 74-76      | BMU, coordinate grid, neighborhood update                      | One inspectable Gaussian-neighborhood update                                 |
+| Section 2.6.5, pp. 76-77      | Heterogeneous circuits organized through evolution             | GES connection clearly marked as an addition                                 |
+| Sections 2.7-2.8, pp. 78-79   | Summary and bibliography                                       | Condensed synthesis, selected source references, software references         |
+
+### Selected references from Sher's bibliography
+
+These are reading pointers reproduced in condensed bibliographic form from [S],
+not claims that those works were independently reviewed for this remaster.
+The source also mentions Sanger's rule, BCM, other associative-memory systems,
+and SOM variants; it does not derive or implement all of them in this chapter.
+
+| Original reference number | Work                                                                                                                                                                                               | Connection to the chapter                     |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| [4]                       | Hornik, Stinchcombe, and White (1989). "Multilayer Feedforward Networks are Universal Approximators." *Neural Networks* 2, 359-366.                                                                | Approximation claims                          |
+| [11]                      | Rojas (1996). *Neural Networks: A Systematic Introduction*. Springer.                                                                                                                              | Neural-network and backpropagation background |
+| [15]                      | Oja (1982). "A Simplified Neuron as a Principal Component Analyzer." *Journal of Mathematical Biology* 15, 267-273.                                                                                | Oja's rule                                    |
+| [16]                      | Sanger (1989). "Optimal Unsupervised Learning in a Single-Layer Linear Feedforward Neural Network." *Neural Networks* 2, 459-473.                                                                  | Generalized Hebbian learning                  |
+| [17]                      | Bienenstock, Cooper, and Munro (1982). "Theory for the Development of Neuron Selectivity: Orientation Specificity and Binocular Interaction in Visual Cortex." *Journal of Neuroscience* 2, 32-48. | BCM                                           |
+| [19]                      | Kohonen (1982). "Self-Organized Formation of Topologically Correct Feature Maps." *Biological Cybernetics* 43, 59-69.                                                                              | SOMs                                          |
+| [26]                      | Hebb (1949). *The Organization of Behavior*. Wiley.                                                                                                                                                | Hebbian learning                              |
+
+### Software references for the new implementations
+
+| Key | Official documentation                                                                                                                    | Used for                                              |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| D1  | [Nx](https://nx.hexdocs.pm/Nx.html)                                                                                                       | Tensors, broadcasting, shapes, reductions, backends   |
+| D2  | [Nx.Defn](https://nx.hexdocs.pm/Nx.Defn.html)                                                                                             | Numerical definitions and automatic differentiation   |
+| D3  | [Kino](https://kino.hexdocs.pm/api-reference.html)                                                                                        | Tables and notebook output                            |
+| D4  | [Kino.Download](https://hexdocs.pm/kino/Kino.Download.html)                                                                               | Binary-producing download callbacks                   |
+| D5  | [Kino.VegaLite](https://hexdocs.pm/kino_vega_lite/Kino.VegaLite.html)                                                                     | Charts in Livebook                                    |
+| D6  | [Livebook introductory notebook](https://github.com/livebook-dev/livebook/blob/main/lib/livebook/notebook/learn/intro_to_livebook.livemd) | Markdown, math, Mermaid, and notebook execution order |
+| D7  | [Nx 1.0.0 package configuration](https://hex.pm/packages/nx/1.0.0/files/mix.exs)                                                          | Elixir version requirement                            |
+| D8  | [Kino 0.19.1 dependencies](https://hex.pm/packages/kino/0.19.1/dependencies)                                                              | Compatibility with Nx 1.0                             |
+
+Package versions are pinned in the setup cell for repeatability. Software
+references were consulted on 2026-10-28. This is not a performance comparison of
+backends or a claim that these dependencies have been executed in this environment.
+
+### Editorial decisions that affect interpretation
+
+| Issue in the source or adaptation                                                   | Explicit decision                                                                                               |
+| ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Printed XOR coefficients and Fig. 2.7 do not consistently reproduce the truth table | Evaluate the printed coefficients without alteration; supply a separately labeled, constructed circuit          |
+| Broad claims about what neural networks can compute                                 | Do not turn approximation or computability claims into a guarantee for a specific finite circuit                |
+| Training versus learning                                                            | Preserve Sher's usage, while separating update timing from the information used to guide an update              |
+| Basic Hebbian weights described as unable to weaken                                 | Explain signed increments and distinguish them from an automatic stabilizing term                               |
+| Oja-style stability                                                                 | Show a concrete tanh example; do not assert unconditional stability or a linear PCA result                      |
+| Sparse/dynamic graph implementation versus dense tensors                            | Keep the conceptual graph; use tensors only where the chosen representation makes the numerical operation clear |
+| Future heterogeneous cognitive systems                                              | Retain as Sher's research vision, not as a proved outcome                                                       |
+| GES and runtime-state distinctions                                                  | Identify these as the organizing framework of this remaster                                                     |
+
+**End of Chapter 2.**

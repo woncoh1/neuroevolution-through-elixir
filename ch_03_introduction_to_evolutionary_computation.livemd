@@ -1,0 +1,1430 @@
+# Chapter 3. Introduction to Evolutionary Computation
+
+```elixir
+Mix.install([
+  {:nx, "1.0.0"},
+  {:kino, "0.19.1"},
+  {:kino_vega_lite, "0.1.13"}
+])
+
+defmodule Chapter03.Tables do
+  @moduledoc false
+
+  @type column :: atom() | String.t()
+  @type cell :: atom() | number() | String.t()
+  @type row :: %{optional(column()) => cell()}
+
+  @spec tabs([row()], [column()], String.t()) :: Kino.Layout.t()
+  @spec tabs([row()], [column()], String.t(), String.t() | nil) :: Kino.Layout.t()
+  def tabs(rows, columns, filename, markdown_source \\ nil) do
+    markdown_source = markdown_source || markdown(rows, columns)
+    csv_source = csv(rows, columns)
+
+    Kino.Layout.tabs([
+      {"Interactive", Kino.DataTable.new(rows, keys: columns)},
+      {"Markdown", Kino.Markdown.new(markdown_source)},
+      {"CSV",
+       Kino.Layout.grid([
+         Kino.Download.new(fn -> csv_source end, filename: filename, label: "Download CSV"),
+         Kino.Text.new(csv_source)
+       ])}
+    ])
+  end
+
+  @spec markdown([row()], [column()]) :: String.t()
+  defp markdown(rows, columns) do
+    header = markdown_row(columns)
+    separator = markdown_row(Enum.map(columns, fn _ -> "---" end))
+
+    body =
+      Enum.map(rows, fn row ->
+        markdown_row(Enum.map(columns, &Map.fetch!(row, &1)))
+      end)
+
+    Enum.join([header, separator | body], "\n") <> "\n"
+  end
+
+  @spec markdown_row([cell()]) :: String.t()
+  defp markdown_row(values) do
+    "| " <> Enum.map_join(values, " | ", &markdown_cell/1) <> " |"
+  end
+
+  @spec markdown_cell(cell()) :: String.t()
+  defp markdown_cell(value) do
+    value
+    |> to_string()
+    |> String.replace("\\", "\\\\")
+    |> String.replace("|", "\\|")
+    |> String.replace("\r\n", "<br>")
+    |> String.replace(["\r", "\n"], "<br>")
+  end
+
+  @spec csv([row()], [column()]) :: String.t()
+  defp csv(rows, columns) do
+    records = [columns | Enum.map(rows, fn row -> Enum.map(columns, &Map.fetch!(row, &1)) end)]
+
+    Enum.map_join(records, "\r\n", fn record ->
+      Enum.map_join(record, ",", &csv_field/1)
+    end) <> "\r\n"
+  end
+
+  @spec csv_field(cell()) :: String.t()
+  defp csv_field(value) do
+    "\"" <> String.replace(to_string(value), "\"", "\"\"") <> "\""
+  end
+end
+```
+
+## Reader's guide
+
+**Neuroevolution through Elixir**  
+Part I - Foundations
+
+**The central idea:** represent possible solutions, generate variations, measure
+their consequences, and decide what survives or reproduces. The representation
+and operators determine which possibilities the search can reach.
+
+This chapter remasters Gene I. Sher's *Handbook of Neuroevolution Through Erlang*
+(2013), Chapter 3, printed pp. 81-104. The source is Chapter 3 of the complete
+book in your Library. Original section numbers, examples, and conceptual order
+are retained. Source notes refer to the chapter as **[S]**.
+
+All Elixir/Nx code, executable experiments, numerical settings, new diagrams, and
+the Generation-Evaluation-Selection (**GES**) interfaces are **remaster additions**.
+Where an experiment changes a source example, the change is stated explicitly.
+This is a study adaptation, not an official revised edition.
+
+### Chapter map
+
+| Section                                               | Question                                                    | Main representation                             |
+| ----------------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------- |
+| 3.1 Evolution                                         | What does the biological narrative contribute?              | Prose and concept table                         |
+| 3.2 Extracting the Essentials of Biological Evolution | What must an artificial evolutionary system provide?        | GES diagram and equations                       |
+| 3.3 Formulating a Given Problem in Evolutionary Terms | How do we turn a task into a search?                        | Expression trees, data table, plot              |
+| 3.4 The Different Flavors of Evolutionary Algorithms  | Which design choices distinguish the families?              | Comparison table                                |
+| 3.4.1 Genetic Algorithms                              | How do crossover and mutation change encoded candidates?    | A complete batched camouflage search            |
+| 3.4.2 Genetic Programming                             | How do we vary programs instead of bit strings?             | Tree operators and invariants                   |
+| 3.4.3 Evolutionary Strategies                         | Can variation settings themselves be inherited and changed? | Self-adaptive mutation example                  |
+| 3.4.4 Evolutionary Programming                        | What changes when the genome is a state-transition table?   | A finite-state predictor                        |
+| 3.5 A Few Words on Memetic Computing                  | Why tune a design before judging it?                        | Global family choice and local parameter search |
+| 3.6 The Different Sides of the Same Coin              | What is shared across these algorithms?                     | Synthesis, checks, exercises                    |
+| 3.7 References                                        | Which claims and choices come from which source?            | Source map and references                       |
+
+### Run this notebook
+
+Evaluate the setup cell, then the remaining cells in order. No earlier notebook,
+external dataset, or accompanying image file is required. The default execution
+path is **Nx.BinaryBackend with Nx.Defn.Evaluator**; no GPU, EXLA, Torchx, or Axon
+is required. Package installation needs internet access or an already prepared
+local cache. The package pins match the corrected Chapter 2. [D1-D4]
+
+Ordinary explanatory tables remain **Markdown**. Computed data tables have
+**Interactive**, **Markdown**, and **CSV** tabs. CSV tabs contain both a text
+preview and a download button; download callbacks return a binary. [D3, D4]
+
+Every named function has an `@spec`. Anonymous callbacks use their enclosing
+function's contract. We use `tbl_` for table rows, `fig_` for charts, and `mod_`
+for candidate programs or models. [D5]
+
+**Validation status:** the deterministic numerical examples were independently
+checked with Python/NumPy, and the notebook was checked structurally. This
+authoring environment has no Elixir runtime, so the Elixir/Nx cells and Livebook
+rendering have **not** been executed here. The final check cell tests numerical
+invariants in your runtime. A particular stochastic search outcome is not assumed.
+
+The small experiments demonstrate algorithms, not acceleration. Nx is used for
+regular numerical work; Elixir manages structures and orchestration. The complete
+GA uses tensor operations for variation, evaluation, **and** selection. [D1, D2]
+
+```elixir
+alias VegaLite, as: Vl
+
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+
+defmodule Chapter03.Support do
+  @moduledoc false
+
+  @spec max_error(Nx.Tensor.t() | number(), Nx.Tensor.t() | number()) :: number()
+  def max_error(actual, expected) do
+    actual |> Nx.subtract(expected) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+  end
+
+  @spec close!(Nx.Tensor.t() | number(), Nx.Tensor.t() | number(), number()) :: :ok
+  def close!(actual, expected, tolerance) do
+    error = max_error(actual, expected)
+    unless is_number(error) and error <= tolerance do
+      raise "Numerical check failed: error=#{inspect(error)}, tolerance=#{tolerance}"
+    end
+    :ok
+  end
+
+  @spec check!(boolean(), String.t()) :: %{check: String.t(), result: String.t()}
+  def check!(true, label), do: %{check: label, result: "PASS"}
+  def check!(false, label), do: raise("Check failed: #{label}")
+
+  @spec nondecreasing?([number()]) :: boolean()
+  def nondecreasing?(values) do
+    values |> Enum.chunk_every(2, 1, :discard) |> Enum.all?(fn [a, b] -> b >= a end)
+  end
+
+  @spec nonincreasing?([number()]) :: boolean()
+  def nonincreasing?(values) do
+    values |> Enum.chunk_every(2, 1, :discard) |> Enum.all?(fn [a, b] -> b <= a end)
+  end
+end
+```
+
+## 3.1 Evolution
+
+*Source: [S], Section 3.1, pp. 81-85.*
+
+Sher begins with **replication**. A replicator makes copies; imperfect copying
+creates variation. When variants differ in their ability to persist and reproduce,
+the composition of the population changes.
+
+His narrative moves from replicating molecules to competition, predation,
+protective structures, and increasingly elaborate organisms. Organisms also
+change their surroundings. A new environmental modification can change which
+traits are useful to other organisms.
+
+| Element in Sher's account  | Role in the narrative                         | Computational idea                                |
+| -------------------------- | --------------------------------------------- | ------------------------------------------------- |
+| Replication                | Produces descendants                          | Copy an inherited representation                  |
+| Copying errors             | Produce variants                              | Apply mutation operators                          |
+| Limited resources          | Prevent all variants from multiplying equally | Allocate finite population and evaluation budgets |
+| Differential reproduction  | Changes which traits become common            | Select parents and allocate offspring             |
+| Interacting organisms      | Change one another's conditions               | Evaluate against other agents                     |
+| Environmental modification | Changes the conditions of later evolution     | Make environment state explicit                   |
+
+Sher also asks why current organisms do not form a complete sequence of all past
+forms. He discusses extinction, change spreading through an interbreeding
+population, and divergence after populations become separated. The practical
+lesson for our implementation is that an evolutionary history contains both
+**branching** and **loss**; the current population is not a complete archive.
+
+**Source boundary:** Sher frames this history as an inevitable progression toward
+complexity. The chapter does not provide a probability model establishing that
+inevitability. We retain his motivation without making it a theorem or an
+implementation assumption. Our experiments begin with an explicitly initialized
+population and end after a finite budget.
+
+**Keep the level of change clear:** individuals develop or adapt during a lifetime;
+evolution changes a population across descendants. Sher makes this distinction
+explicit in the note on p. 88.
+
+## 3.2 Extracting the Essentials of Biological Evolution
+
+*Source: [S], Section 3.2, pp. 85-88; Fig. 3.1.*
+
+We do not need to simulate the origin of life. We can supply the initial population,
+its representation, and the rules for creating and comparing descendants.
+
+| Component   | What we must specify                                               |
+| ----------- | ------------------------------------------------------------------ |
+| Population  | The candidates currently available to the search                   |
+| Genotype    | The representation that can be copied and varied                   |
+| Mapping     | How an encoded candidate becomes an evaluated object or behavior   |
+| Phenotype   | The object, outputs, or behavior produced by that mapping          |
+| Variation   | How mutation or crossover creates candidates                       |
+| Fitness     | How performance is measured on the problem                         |
+| Selection   | How measurements influence survival and reproduction               |
+| Termination | A target score, evaluation budget, or other explicit stopping rule |
+
+In Sher's terminology, genotype space is the **search space** and phenotype space
+is the **solution space**. Search changes genotypes; evaluation examines what they
+produce. He also allows genotype and phenotype to coincide when the task directly
+evaluates the encoding.
+
+```mermaid
+flowchart LR
+    G[Genotype: mutable representation] -->|mapping| P[Phenotype: outputs or behavior]
+    P -->|problem or scape| E[Evaluation measurements]
+    E --> S[Selection decisions]
+    S -->|retained inherited designs| V[Variation]
+    V --> G
+```
+
+*Figure R3.1 - The encoding-to-evaluation loop. A new diagram of the distinction
+in Sher's Fig. 3.1, with our evaluation-selection separation made explicit.*
+
+### Remaster connection - Generation, Evaluation, Selection
+
+**Generation creates candidates. Evaluation produces information. Selection
+allocates opportunities and persistence.**
+
+The GES names describe responsibilities, not three processes that must execute
+in a rigid order. Choosing parents is itself selection, and happens before those
+parents produce offspring. Sher's generational loop begins with an initialized
+population, evaluates it, selects survivors and parents, and then creates the next
+generation.
+
+A precise state description is:
+
+$$
+C_t = \mathcal G(P_t,A_t;r_t),
+\qquad R_t = \mathcal E(C_t;W_t,A_t),
+\qquad (P_{t+1},A_{t+1}) = \mathcal S(P_t,C_t,R_t,A_t).
+$$
+
+Here $P_t$ is the current population, $A_t$ is an optional archive, $r_t$ is random
+state, $W_t$ specifies evaluation conditions, and $R_t$ contains measurements tied
+to candidate identities. Incumbents can be included in $C_t$ for reevaluation;
+reusing their earlier scores is valid only when the evaluation protocol permits it.
+Parent choice inside a generator is delegated to an explicit selection policy.
+
+| Responsibility | Examples in our framework                          | Important distinction                               |
+| -------------- | -------------------------------------------------- | --------------------------------------------------- |
+| Generation     | Initialization, mutation, crossover                | A new candidate is not necessarily an improvement   |
+| Evaluation     | Fitness, behavior descriptors, novelty, robustness | A measurement is not a survival decision            |
+| Selection      | Parent choice, survival, archive admission         | These decisions need not choose the same candidates |
+
+**Remaster extension:** novelty and archive policies belong to our GES framework.
+Sher's basic loop in this section is fitness-based and does not require an archive.
+His later discussion on p. 94 does consider rewarding differences and protecting
+subpopulations.
+
+### Experiment 1 - One evaluation, different decisions
+
+The following numbers are deliberately invented. The example demonstrates policy
+separation; it does not implement a novelty estimator.
+
+```elixir
+tbl_decisions = [
+  %{candidate: "A", fitness: 95, novelty: 10},
+  %{candidate: "B", fitness: 70, novelty: 95},
+  %{candidate: "C", fitness: 30, novelty: 20}
+]
+
+selected_parent = Enum.max_by(tbl_decisions, & &1.fitness)
+selected_archive = Enum.max_by(tbl_decisions, & &1.novelty)
+
+tbl_decisions =
+  Enum.map(tbl_decisions, fn row ->
+    Map.merge(row, %{
+      parent: row.candidate == selected_parent.candidate,
+      archived: row.candidate == selected_archive.candidate
+    })
+  end)
+
+Chapter03.Tables.tabs(
+  tbl_decisions, [:candidate, :fitness, :novelty, :parent, :archived],
+  "ch_03_tbl_01_selection_decisions.csv"
+)
+```
+
+Candidate A becomes a parent; candidate B enters the archive. We changed neither
+measurement. We changed which information each decision uses.
+
+### Elitism and stopping
+
+Sher's concrete loop retains fit parents and fills the remaining slots with their
+offspring. This is an **elitist** design: selected incumbents survive unchanged.
+Under an unchanged, deterministic evaluation, retaining a best candidate prevents
+the best population score from decreasing. It does not prevent stagnation or
+ensure that the global optimum will be found.
+
+## 3.3 Formulating a Given Problem in Evolutionary Terms
+
+*Source: [S], Section 3.3, pp. 88-93; Figs. 3.2-3.5.*
+
+Sher's central example is **curve fitting**: a target graph is given, but the
+function that produced it is unknown. A candidate is a mathematical expression;
+its phenotype is the graph produced by evaluating that expression.
+
+| Design question           | Curve-fitting answer                                  |
+| ------------------------- | ----------------------------------------------------- |
+| What is inherited?        | A tree encoding an expression                         |
+| What is executed?         | The expression evaluated at input coordinates         |
+| What is observed?         | Predicted output values                               |
+| What is measured?         | Discrepancy from the target graph                     |
+| How are variants created? | Change a node, insert a subtree, or exchange branches |
+| What stops the search?    | Sufficient fit or an explicit budget                  |
+
+Sher proposes fitness inversely related to the total distance between candidate
+and target graphs. His notation is $1/D$. **Remaster choice:** our executable
+comparison uses mean squared error, minimized directly:
+
+$$
+L(g)=\frac{1}{n}\sum_{i=1}^{n}
+\left(\operatorname{eval}(g,x_i)-y_i\right)^2.
+$$
+
+This is a different, explicitly chosen discrepancy measure, not a transcription
+of his distance formula. It also remains defined when a candidate fits exactly.
+
+### An expression tree
+
+In Fig. 3.3, Sher illustrates
+
+$$
+f(x)=(x+0.27)\tanh(x).
+$$
+
+Internal nodes are operators. Leaves are inputs or constants. Evaluation combines
+values from the leaves toward the root.
+
+```mermaid
+flowchart TD
+    M[Multiply] --> A[Add]
+    M --> T[tanh]
+    A --> X1[x]
+    A --> C[0.27]
+    T --> X2[x]
+```
+
+*Figure R3.2 - A new rendering of the expression structure in Sher's Fig. 3.3,
+printed p. 91. Repeated x leaves refer to the same input value.*
+
+### Experiment 2 - Evaluate, mutate, and recombine trees
+
+The genotype is an Elixir tuple tree. A small interpreter evaluates only the
+listed operators; it does not execute arbitrary Elixir source. Nx evaluates each
+node over a whole vector of input coordinates. The irregular tree traversal stays
+in ordinary Elixir.
+
+A path uses `0` for the left child or a unary child, and `1` for a right child.
+The empty path `[]` identifies the root. These path conventions are remaster
+implementation choices.
+
+```elixir
+defmodule Chapter03.Tree do
+  @moduledoc false
+
+  @type tree :: :x | {:const, number()} |
+                {:tanh, tree()} | {:add | :mul, tree(), tree()}
+  @type path :: [0 | 1]
+
+  @spec evaluate(tree(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  def evaluate(:x, x), do: x
+  def evaluate({:const, value}, x), do: Nx.broadcast(Nx.tensor(value, type: :f32), Nx.shape(x))
+  def evaluate({:tanh, child}, x), do: Nx.tanh(evaluate(child, x))
+  def evaluate({:add, left, right}, x), do: Nx.add(evaluate(left, x), evaluate(right, x))
+  def evaluate({:mul, left, right}, x), do: Nx.multiply(evaluate(left, x), evaluate(right, x))
+
+  @spec at(tree(), path()) :: tree()
+  def at(tree, []), do: tree
+  def at({:tanh, child}, [0 | rest]), do: at(child, rest)
+  def at({op, left, _right}, [0 | rest]) when op in [:add, :mul], do: at(left, rest)
+  def at({op, _left, right}, [1 | rest]) when op in [:add, :mul], do: at(right, rest)
+  def at(_tree, _path), do: raise(ArgumentError, "path does not identify a subtree")
+
+  @spec replace(tree(), path(), tree()) :: tree()
+  def replace(_tree, [], replacement), do: replacement
+  def replace({:tanh, child}, [0 | rest], replacement) do
+    {:tanh, replace(child, rest, replacement)}
+  end
+  def replace({op, left, right}, [0 | rest], replacement) when op in [:add, :mul] do
+    {op, replace(left, rest, replacement), right}
+  end
+  def replace({op, left, right}, [1 | rest], replacement) when op in [:add, :mul] do
+    {op, left, replace(right, rest, replacement)}
+  end
+  def replace(_tree, _path, _replacement), do: raise(ArgumentError, "invalid replacement path")
+
+  @spec crossover(tree(), path(), tree(), path()) :: tree()
+  def crossover(recipient, recipient_path, donor, donor_path) do
+    replace(recipient, recipient_path, at(donor, donor_path))
+  end
+
+  @spec size(tree()) :: pos_integer()
+  def size(:x), do: 1
+  def size({:const, _value}), do: 1
+  def size({:tanh, child}), do: 1 + size(child)
+  def size({op, left, right}) when op in [:add, :mul], do: 1 + size(left) + size(right)
+
+  @spec format(tree()) :: String.t()
+  def format(:x), do: "x"
+  def format({:const, value}), do: to_string(value)
+  def format({:tanh, child}), do: "tanh(" <> format(child) <> ")"
+  def format({:add, left, right}), do: "(" <> format(left) <> " + " <> format(right) <> ")"
+  def format({:mul, left, right}), do: "(" <> format(left) <> " * " <> format(right) <> ")"
+end
+
+defmodule Chapter03.Loss do
+  @moduledoc false
+  import Nx.Defn
+
+  @spec mse(Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn mse(prediction, target), do: Nx.mean(Nx.pow(prediction - target, 2))
+end
+
+# The first expression is from Sher's Fig. 3.3. The others are remaster examples.
+mod_tree_a = {:mul, {:add, :x, {:const, 0.27}}, {:tanh, :x}}
+mod_tree_b = {:add, {:mul, :x, :x}, {:const, 0.1}}
+mod_tree_mutated = Chapter03.Tree.replace(mod_tree_a, [0, 1], {:const, -0.5})
+mod_tree_child = Chapter03.Tree.crossover(mod_tree_a, [1], mod_tree_b, [0])
+
+x_curve = Nx.linspace(-2.0, 2.0, n: 41)
+# New synthetic target, not a digitization of Sher's unknown graph in Fig. 3.2.
+y_curve = Nx.add(Nx.pow(x_curve, 2), Nx.multiply(0.3, x_curve))
+
+programs = [
+  {"A: source expression", mod_tree_a},
+  {"B: second parent", mod_tree_b},
+  {"A with changed constant", mod_tree_mutated},
+  {"A with B's subtree", mod_tree_child}
+]
+
+tbl_programs =
+  Enum.map(programs, fn {name, tree} ->
+    loss = Chapter03.Loss.mse(Chapter03.Tree.evaluate(tree, x_curve), y_curve) |> Nx.to_number()
+    %{candidate: name, expression: Chapter03.Tree.format(tree), nodes: Chapter03.Tree.size(tree), mse: loss}
+  end)
+
+Chapter03.Tables.tabs(
+  tbl_programs, [:candidate, :expression, :nodes, :mse],
+  "ch_03_tbl_02_expression_candidates.csv"
+)
+```
+
+```elixir
+tbl_curve_plot =
+  [{"Target", y_curve} | Enum.map(programs, fn {name, tree} ->
+    {name, Chapter03.Tree.evaluate(tree, x_curve)}
+  end)]
+  |> Enum.flat_map(fn {name, values} ->
+    Enum.zip(Nx.to_flat_list(x_curve), Nx.to_flat_list(values))
+    |> Enum.map(fn {x, y} -> %{x: x, y: y, candidate: name} end)
+  end)
+
+fig_curve =
+  Vl.new(width: 640, height: 300, title: "R3.3 - Different genotypes, different curves")
+  |> Vl.data_from_values(tbl_curve_plot)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "x", type: :quantitative)
+  |> Vl.encode_field(:y, "y", type: :quantitative)
+  |> Vl.encode_field(:color, "candidate", type: :nominal)
+
+fig_curve
+```
+
+Changing a constant and replacing a subtree are different generation operators.
+Neither guarantees a better score. The table measures their effects; a selection
+policy can now use those measurements.
+
+This is an **operator-and-evaluation demonstration**, not a claim that these four
+hand-selected expressions were discovered by a GP run. A complete population loop
+appears in the camouflage experiment below.
+
+Sher extends the same formulation to antennas and circuits: choose an encoding,
+map it to an evaluated design, and define the objective. His Fig. 3.5 connects tree,
+graph, and circuit representations. **Representation boundary:** our tuple
+interpreter implements trees only; it does not implement shared graph nodes,
+cycles, or circuit timing.
+
+## 3.4 The Different Flavors of Evolutionary Algorithms
+
+*Source: [S], Section 3.4, pp. 93-98.*
+
+Sher describes a common evolutionary mechanism with different representations
+and operators. He also discusses local optima, larger mutations, subpopulations,
+and rewarding differences as ways to change the search dynamics.
+
+The following table summarizes **Sher's emphasis in this chapter**, not an
+exhaustive modern definition of each field.
+
+| Family                        | Representation or emphasis in Sher's presentation | Distinctive choice                         |
+| ----------------------------- | ------------------------------------------------- | ------------------------------------------ |
+| Genetic algorithms (GA)       | Often strings or chromosomes                      | Crossover, with mutation also available    |
+| Genetic programming (GP)      | Programs, especially expression trees             | Variation over program structure           |
+| Evolutionary strategies (ES)  | Candidates together with evolutionary settings    | Adapt the strategy as well as the solution |
+| Evolutionary programming (EP) | Finite-state machines in his historical example   | Mutate state-transition systems            |
+| Memetic algorithms (MA)       | Candidates with a local improvement stage         | Combine global and local search            |
+
+These labels overlap in Sher's account. Use the label to communicate a design,
+not as a substitute for specifying its representation, operators, and decisions.
+
+## 3.4.1 Genetic Algorithms
+
+*Source: [S], Section 3.4.1, pp. 94-96; Figs. 3.6-3.7.*
+
+Sher introduces string-encoded candidates and a mating pool. Crossover recombines
+parts of parents; mutation introduces additional changes. His camouflage example
+represents an organism by a short bit string and scores how well its phenotype
+matches a green background.
+
+We follow the mapping stated in the detailed example: **0 is white, 1 is green**.
+For an all-green environment, fitness is simply the number of 1s:
+
+$$
+F(g)=\sum_{j=1}^{L}g_j,\qquad g_j\in\{0,1\}.
+$$
+
+**Source note:** the brief sentence introducing Fig. 3.6 reverses the color order;
+the subsequent explanation and the figure use the mapping above. It is stated
+explicitly here rather than left ambiguous.
+
+### Experiment 3 - Inspect crossover and mutation
+
+The illustrative parents and cut below are hand-picked, not a reconstruction of
+the exact generations in Sher's figures. The numerical operators accept matrices:
+one row per individual, one column per gene.
+
+```elixir
+defmodule Chapter03.BinaryGenome do
+  @moduledoc false
+  import Nx.Defn
+
+  @spec fitness(Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn fitness(population), do: Nx.sum(population, axes: [1])
+
+  # parent_a and parent_b: {offspring, genes}; cuts: {offspring, 1}
+  @spec crossover(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn crossover(parent_a, parent_b, cuts) do
+    positions = Nx.iota(Nx.shape(parent_a), axis: 1)
+    mask = positions < Nx.broadcast(cuts, Nx.shape(parent_a))
+    Nx.select(mask, parent_a, parent_b)
+  end
+
+  # The random draws and population have exactly the same shape.
+  @spec mutate(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t() | number()) :: Nx.Tensor.t()
+  defn mutate(population, draws, rate) do
+    Nx.select(draws < rate, 1 - population, population)
+  end
+end
+
+parent_a = Nx.tensor([[1, 1, 0, 0]], type: :s32)
+parent_b = Nx.tensor([[0, 0, 1, 1]], type: :s32)
+cut = Nx.tensor([[2]], type: :s32)
+child_a = Chapter03.BinaryGenome.crossover(parent_a, parent_b, cut)
+child_b = Chapter03.BinaryGenome.crossover(parent_b, parent_a, cut)
+mutated_child = Chapter03.BinaryGenome.mutate(
+  child_a, Nx.tensor([[0.9, 0.0, 0.9, 0.9]], type: :f32), 0.1
+)
+
+tbl_operators =
+  [{"Parent A", parent_a}, {"Parent B", parent_b},
+   {"Child A", child_a}, {"Child B", child_b}, {"Mutated child A", mutated_child}]
+  |> Enum.map(fn {name, genome} ->
+    %{candidate: name, genome: Enum.join(Nx.to_flat_list(genome)),
+      fitness: Chapter03.BinaryGenome.fitness(genome) |> Nx.squeeze() |> Nx.to_number()}
+  end)
+
+Chapter03.Tables.tabs(
+  tbl_operators, [:candidate, :genome, :fitness], "ch_03_tbl_03_binary_operators.csv"
+)
+```
+
+The two crossover children are `1111` and `0000`: the same parents can produce
+both a perfect match and a poor match. Mutation changes the first child to `1011`.
+Generation does not know which outcome selection will favor.
+
+### Experiment 4 - A complete batched camouflage search
+
+**Remaster settings:** 32 individuals, 16 genes, 60 generations, and independent
+per-gene mutation probability $1/16$. Retain the best half, choose parents from
+that half, and create enough offspring to restore the original population size.
+This implements the source's elite-parent-plus-offspring pattern, but uses new
+population sizes, random choices, and stopping settings.
+
+Randomness uses an explicit **Nx.Random key**. Every random call returns the next
+key. Reusing an old key repeats a draw; it does not advance hidden global state.
+[D2]
+
+```elixir
+defmodule Chapter03.Camouflage do
+  @moduledoc false
+
+  @type trace_row :: %{generation: non_neg_integer(), best: number(), mean: number()}
+  @type result :: %{
+    population: Nx.Tensor.t(), key: Nx.Tensor.t(), history: [trace_row()],
+    archive: %{genome: Nx.Tensor.t(), fitness: number()}
+  }
+
+  @spec elite(Nx.Tensor.t(), pos_integer()) :: Nx.Tensor.t()
+  def elite(population, count) do
+    indices =
+      population
+      |> Chapter03.BinaryGenome.fitness()
+      |> Nx.argsort(direction: :desc, stable: true)
+      |> Nx.slice_along_axis(0, count)
+
+    Nx.take(population, indices, axis: 0)
+  end
+
+  @spec next_generation(Nx.Tensor.t(), Nx.Tensor.t(), number()) ::
+          {Nx.Tensor.t(), Nx.Tensor.t()}
+  def next_generation(population, key, mutation_rate) do
+    {size, genes} = Nx.shape(population)
+    kept = div(size, 2)
+    parents = elite(population, kept)
+    children_count = size - kept
+
+    {ids_a, key} = Nx.Random.randint(key, 0, kept, shape: {children_count})
+    {ids_b, key} = Nx.Random.randint(key, 0, kept, shape: {children_count})
+    {cuts, key} = Nx.Random.randint(key, 1, genes, shape: {children_count, 1})
+    {draws, key} = Nx.Random.uniform(key, shape: {children_count, genes})
+
+    children =
+      Chapter03.BinaryGenome.crossover(Nx.take(parents, ids_a), Nx.take(parents, ids_b), cuts)
+      |> Chapter03.BinaryGenome.mutate(draws, mutation_rate)
+
+    {Nx.concatenate([parents, children], axis: 0), key}
+  end
+
+  @spec summary(Nx.Tensor.t(), non_neg_integer()) :: trace_row()
+  def summary(population, generation) do
+    scores = Chapter03.BinaryGenome.fitness(population)
+    %{generation: generation, best: Nx.to_number(Nx.reduce_max(scores)),
+      mean: Nx.to_number(Nx.mean(scores))}
+  end
+
+  @spec champion(Nx.Tensor.t()) :: %{genome: Nx.Tensor.t(), fitness: number()}
+  def champion(population) do
+    scores = Chapter03.BinaryGenome.fitness(population)
+    index = Nx.argmax(scores)
+    %{genome: Nx.take(population, index), fitness: Nx.to_number(Nx.take(scores, index))}
+  end
+
+  @spec run(integer(), pos_integer(), pos_integer(), pos_integer(), number()) :: result()
+  def run(seed, generations, size, genes, mutation_rate) do
+    unless is_integer(generations) and generations > 0 and
+             is_integer(size) and size >= 4 and rem(size, 2) == 0 and
+             is_integer(genes) and genes >= 2 and
+             is_number(mutation_rate) and mutation_rate >= 0 and mutation_rate <= 1 do
+      raise ArgumentError, "require positive generations, even size >= 4, genes >= 2, and rate in [0, 1]"
+    end
+
+    {population, key} = Nx.Random.randint(Nx.Random.key(seed), 0, 2, shape: {size, genes})
+    archive = champion(population)
+    initial = {population, key, [summary(population, 0)], archive}
+
+    {population, key, history, archive} =
+      Enum.reduce(1..generations, initial, fn generation, {current, key, history, archive} ->
+        {next, key} = next_generation(current, key, mutation_rate)
+        candidate = champion(next)
+        archive = if candidate.fitness > archive.fitness, do: candidate, else: archive
+        {next, key, [summary(next, generation) | history], archive}
+      end)
+
+    %{population: population, key: key, history: Enum.reverse(history), archive: archive}
+  end
+end
+
+result_ga = Chapter03.Camouflage.run(20261029, 60, 32, 16, 1.0 / 16.0)
+tbl_ga_trace = result_ga.history
+
+Chapter03.Tables.tabs(
+  tbl_ga_trace, [:generation, :best, :mean], "ch_03_tbl_04_camouflage_trace.csv"
+)
+```
+
+```elixir
+tbl_ga_plot =
+  Enum.flat_map(tbl_ga_trace, fn row ->
+    [%{generation: row.generation, fitness: row.best, statistic: "Best"},
+     %{generation: row.generation, fitness: row.mean, statistic: "Mean"}]
+  end)
+
+fig_ga =
+  Vl.new(width: 640, height: 280, title: "R3.4 - Camouflage across generations")
+  |> Vl.data_from_values(tbl_ga_plot)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "generation", type: :quantitative)
+  |> Vl.encode_field(:y, "fitness", type: :quantitative)
+  |> Vl.encode_field(:color, "statistic", type: :nominal)
+
+fig_ga
+```
+
+```elixir
+tbl_population =
+  result_ga.population
+  |> Nx.to_flat_list()
+  |> Enum.chunk_every(16)
+  |> Enum.with_index()
+  |> Enum.map(fn {bits, id} ->
+    %{individual: id, genome: Enum.join(bits), green_fraction: Enum.sum(bits) / 16.0,
+      fitness: Enum.sum(bits)}
+  end)
+
+Chapter03.Tables.tabs(
+  tbl_population, [:individual, :genome, :green_fraction, :fitness],
+  "ch_03_tbl_05_final_camouflage_population.csv"
+)
+```
+
+The optimum has fitness **16**, but the notebook does not assume that a particular
+seed must find it within 60 generations. Inspect the actual trace. Best fitness
+cannot decrease in this deterministic elitist setup; mean fitness may decrease
+when new offspring enter.
+
+The one-entry champion archive records the best measured genotype independently
+of the final population. It is a remaster addition, not a diversity archive. Its
+admission policy accepts strict fitness improvements and retains the earlier
+entry on ties.
+
+Sher notes that a mutation-only search can also solve this problem, and that
+operators can extend fixed-length encodings to grow or shrink. Our batched
+implementation intentionally keeps all strings the same length. Tensor batching
+here depends on that shared shape.
+
+## 3.4.2 Genetic Programming
+
+*Source: [S], Section 3.4.2, pp. 96-97; tree formulation in Section 3.3.*
+
+In Sher's presentation, GP applies evolutionary search to program representations,
+especially trees. Crossover exchanges branches; mutation changes operators,
+constants, or structure. Trees can grow and shrink.
+
+We already implemented the core representation and operators in Experiment 2.
+The search loop need not change conceptually: generate programs, evaluate their
+outputs, then select. What changes is the **meaning and validity of variation**.
+
+| Operation on our tree | Example                                         | What must remain valid                           |
+| --------------------- | ----------------------------------------------- | ------------------------------------------------ |
+| Constant mutation     | Replace `{:const, 0.27}`                        | A numeric constant remains a valid leaf          |
+| Subtree insertion     | Replace a leaf with `{:add, :x, {:const, 1.0}}` | The new subtree has valid operators and children |
+| Subtree removal       | Replace a subtree by `:x`                       | The parent still has the required child          |
+| Crossover             | Copy a donor subtree into a recipient path      | The replacement fits the representation's rules  |
+
+### Executable structural checks
+
+```elixir
+mod_tree_grown = Chapter03.Tree.replace(mod_tree_a, [0, 1], {:add, :x, {:const, 1.0}})
+mod_tree_pruned = Chapter03.Tree.replace(mod_tree_a, [1], :x)
+
+tree_checks = [
+  {Chapter03.Tree.at(mod_tree_a, [0, 1]) == {:const, 0.27}, "Original constant is unchanged"},
+  {Chapter03.Tree.at(mod_tree_mutated, [0, 1]) == {:const, -0.5}, "Mutation replaces the chosen leaf"},
+  {Chapter03.Tree.at(mod_tree_child, [1]) == Chapter03.Tree.at(mod_tree_b, [0]),
+   "Crossover installs the donor subtree"},
+  {Chapter03.Tree.size(mod_tree_grown) > Chapter03.Tree.size(mod_tree_a), "Insertion grows the tree"},
+  {Chapter03.Tree.size(mod_tree_pruned) < Chapter03.Tree.size(mod_tree_a), "Pruning shrinks the tree"}
+]
+
+tbl_tree_checks = Enum.map(tree_checks, fn {ok, label} -> Chapter03.Support.check!(ok, label) end)
+Chapter03.Tables.tabs(tbl_tree_checks, [:check, :result], "ch_03_tbl_06_tree_checks.csv")
+```
+
+**Remaster implementation boundary:** a general-purpose GP system also needs
+explicit choices about size limits, evaluation failures, and valid operator inputs.
+Our small operator set avoids division and arbitrary program execution. It is not
+a full GP framework. The source discusses a much broader operator vocabulary.
+
+## 3.4.3 Evolutionary Strategies
+
+*Source: [S], Section 3.4.3, pp. 97-98.*
+
+Sher shifts attention from **what is varied** to **how variation is controlled**.
+Survivor fractions, offspring counts, mutation counts, operator probabilities,
+and choices of new node functions all influence the search. He describes
+inheriting and evolving these strategy settings alongside the candidate design.
+
+| Inherited information        | Role                                         |
+| ---------------------------- | -------------------------------------------- |
+| Solution parameters $\theta$ | Determine the candidate's behavior or output |
+| Strategy parameters $\sigma$ | Determine how descendants are varied         |
+
+### Experiment 5 - Mutate both a point and its mutation scale
+
+**Remaster rule:** a genome contains a two-dimensional point and a positive step
+size. The objective is to approach the origin. The following concrete equations
+are our illustration; Sher does not specify them in this section:
+
+$$
+\sigma'=\operatorname{clip}(\sigma e^{\tau z_\sigma},10^{-3},2),
+\qquad \theta'=\theta+\sigma' z_\theta,
+\qquad F(\theta)=-\|\theta\|^2.
+$$
+
+We supply fixed perturbations to make this single-generation example inspectable.
+A stochastic implementation can sample them instead. Selection compares the
+three parents and three offspring and keeps the best three. This explicit
+parent-plus-offspring policy is another remaster choice.
+
+```elixir
+defmodule Chapter03.Strategy do
+  @moduledoc false
+  import Nx.Defn
+
+  # theta and z_theta: {individuals, coordinates}; sigma and z_sigma: {individuals, 1}
+  @spec propose(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(),
+                Nx.Tensor.t() | number()) :: {Nx.Tensor.t(), Nx.Tensor.t()}
+  defn propose(theta, sigma, z_sigma, z_theta, tau) do
+    next_sigma = Nx.clip(sigma * Nx.exp(tau * z_sigma), 1.0e-3, 2.0)
+    next_theta = theta + Nx.broadcast(next_sigma, Nx.shape(theta)) * z_theta
+    {next_theta, next_sigma}
+  end
+
+  @spec fitness(Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn fitness(theta), do: -Nx.sum(Nx.pow(theta, 2), axes: [1])
+end
+
+theta_es = Nx.tensor([[2.0, -1.0], [-1.0, 2.0], [1.5, 1.5]], type: :f32)
+sigma_es = Nx.tensor([[0.4], [0.3], [0.2]], type: :f32)
+z_sigma_es = Nx.tensor([[0.5], [-0.5], [0.0]], type: :f32)
+z_theta_es = Nx.tensor([[-1.0, 0.5], [1.0, -1.0], [-0.5, -0.5]], type: :f32)
+
+{theta_es_child, sigma_es_child} =
+  Chapter03.Strategy.propose(theta_es, sigma_es, z_sigma_es, z_theta_es, 0.5)
+
+pool_theta_es = Nx.concatenate([theta_es, theta_es_child])
+pool_sigma_es = Nx.concatenate([sigma_es, sigma_es_child])
+pool_scores_es = Chapter03.Strategy.fitness(pool_theta_es)
+selected_ids_es =
+  pool_scores_es |> Nx.argsort(direction: :desc, stable: true) |> Nx.slice_along_axis(0, 3)
+selected_set_es = MapSet.new(Nx.to_flat_list(selected_ids_es))
+
+# Gather coordinates AND strategy parameters using the same selected identities.
+selected_theta_es = Nx.take(pool_theta_es, selected_ids_es)
+selected_sigma_es = Nx.take(pool_sigma_es, selected_ids_es)
+
+tbl_strategy =
+  Enum.zip([
+    Enum.chunk_every(Nx.to_flat_list(pool_theta_es), 2),
+    Nx.to_flat_list(pool_sigma_es), Nx.to_flat_list(pool_scores_es)
+  ])
+  |> Enum.with_index()
+  |> Enum.map(fn {{[x1, x2], sigma, fitness}, id} ->
+    %{candidate: id, origin: if(id < 3, do: "parent", else: "offspring"),
+      x1: x1, x2: x2, sigma: sigma, fitness: fitness, selected: MapSet.member?(selected_set_es, id)}
+  end)
+
+Chapter03.Tables.tabs(
+  tbl_strategy, [:candidate, :origin, :x1, :x2, :sigma, :fitness, :selected],
+  "ch_03_tbl_07_strategy_parameters.csv"
+)
+```
+
+The inherited step size changes along with the point. A smaller or larger step
+size is not rewarded directly: selection acts on the candidate outcome, and the
+associated strategy parameter is carried with the selected genotype.
+
+This is one illustrative generation, not evidence that step sizes have converged
+to an optimal strategy. It also does not implement every adaptive setting in
+Sher's discussion.
+
+## 3.4.4 Evolutionary Programming
+
+*Source: [S], Section 3.4.4, p. 98.*
+
+Sher introduces EP through the evolution of **finite-state machines** that predict
+future actions or environmental states. The mutable representation is a
+state-transition system rather than a bit string or expression tree.
+
+### Experiment 6 - A table-encoded predictor
+
+**Remaster toy task:** predict the next bit of an alternating sequence. Each
+transition maps `(state, observed bit)` to `(next state, predicted next bit)`.
+Only the current state and current observation produce the prediction. The next
+observation is used afterward to score it.
+
+We change one output entry, evaluate both machines, and compare their prediction
+accuracy. This demonstrates representation, mutation, and evaluation; it is not a
+complete historical EP implementation. Alternation is deliberately simple and
+does not require hidden memory; this is not a test of a machine's memory capacity.
+
+```elixir
+defmodule Chapter03.FSM do
+  @moduledoc false
+
+  @type bit :: 0 | 1
+  @type state :: 0 | 1
+  @type genome :: %{required({state(), bit()}) => {state(), bit()}}
+  @type row :: %{step: pos_integer(), state: state(), observed: bit(),
+                 prediction: bit(), target: bit(), correct: boolean()}
+
+  @spec rollout(genome(), [bit()]) :: [row()]
+  def rollout(genome, observations) do
+    {rows, _state} =
+      observations
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.with_index(1)
+      |> Enum.map_reduce(0, fn {[observed, target], step}, state ->
+        {next_state, prediction} = Map.fetch!(genome, {state, observed})
+        {%{step: step, state: state, observed: observed, prediction: prediction,
+           target: target, correct: prediction == target}, next_state}
+      end)
+    rows
+  end
+
+  @spec accuracy([row()]) :: float()
+  def accuracy([]), do: raise(ArgumentError, "at least one prediction is required")
+  def accuracy(rows), do: Enum.count(rows, & &1.correct) / length(rows)
+end
+
+mod_fsm_parent = %{
+  {0, 0} => {1, 0}, {0, 1} => {0, 0},
+  {1, 0} => {1, 0}, {1, 1} => {0, 0}
+}
+mod_fsm_child = Map.replace!(mod_fsm_parent, {0, 0}, {1, 1})
+sequence_fsm = [0, 1, 0, 1, 0, 1, 0]
+rollout_fsm_parent = Chapter03.FSM.rollout(mod_fsm_parent, sequence_fsm)
+rollout_fsm_child = Chapter03.FSM.rollout(mod_fsm_child, sequence_fsm)
+
+tbl_fsm =
+  Enum.flat_map([{"parent", rollout_fsm_parent}, {"mutant", rollout_fsm_child}], fn {name, rows} ->
+    Enum.map(rows, &Map.put(&1, :candidate, name))
+  end)
+
+Chapter03.Tables.tabs(
+  tbl_fsm, [:candidate, :step, :state, :observed, :prediction, :target, :correct],
+  "ch_03_tbl_08_finite_state_predictions.csv"
+)
+```
+
+The parent predicts three of six next bits correctly; the mutant predicts all six.
+This result is specific to the supplied sequence and initial state. The unused
+transitions have not thereby been validated, nor has generalization to other
+sequences been demonstrated.
+
+## 3.5 A Few Words on Memetic Computing
+
+*Source: [S], Section 3.5, pp. 98-102; Figs. 3.8-3.9.*
+
+Sher separates search into **global design changes** and **local improvement**.
+A promising structure can look poor before its parameters are tuned. Discarding
+it immediately may discard useful potential.
+
+His function example uses
+
+$$
+f(x)=A+B\,[F(Cx+D)]^E,
+\qquad F\in\{\sin,\cos,\tan,\tanh\}.
+$$
+
+The global operator changes $F$. The local operator perturbs $A,B,C,D,$ or $E$.
+A candidate is judged after the local search has explored its neighborhood.
+
+```mermaid
+flowchart LR
+    G[Generate or change a design family] --> P[Initial numerical parameters]
+    P --> L[Local parameter search]
+    L --> E[Evaluate the locally tuned candidate]
+    E --> S[Select survivors and parents]
+    S --> G
+```
+
+*Figure R3.5 - Global variation and local improvement. New diagram of the
+relationship illustrated by Sher's Figs. 3.8-3.9.*
+
+Sher gives two further intuitions: a changed body may need a retuned controller,
+and a changed neural topology may need retuned synaptic weights. In each case,
+the coarse design and the parameters must work together.
+
+**Interpretation boundary:** a finite local search measures the result of a
+particular tuning procedure and budget. It does not reveal a structure's exact
+best possible fitness. Sher's discussion motivates giving structures a chance;
+our experiment measures only the chance we actually provide.
+
+### Experiment 7 - Compare function families before and after tuning
+
+**Explicit remaster changes:** we keep all four source function choices but fix
+$E=1$. We enumerate the four families rather than implementing a stochastic outer
+population. Inside each family, we use deterministic coordinate search rather
+than randomly choosing perturbations. This is a controlled demonstration of the
+global/local distinction, not a complete memetic evolutionary platform.
+
+The new synthetic target is
+
+$$
+y(x)=0.2+0.8\cos(1.1x+0.1),\qquad -1\le x\le1.
+$$
+
+It is not a digitization of Fig. 3.8. Each family starts from the same
+$(A,B,C,D)=(0,0.5,0.5,0)$ and receives the same tuning budget.
+
+| Parameter | Allowed interval in this experiment | Reason for the choice    |
+| --------- | ----------------------------------- | ------------------------ |
+| $A$       | $[-1,1]$                            | Bounded offset search    |
+| $B$       | $[-2,2]$                            | Bounded amplitude search |
+| $C$       | $[0.25,1.25]$                       | Bounded input scale      |
+| $D$       | $[-0.2,0.2]$                        | Bounded phase shift      |
+
+For these inputs and bounds, $|Cx+D|\le1.45<\pi/2$, so the tangent branch avoids
+its poles. Fixing $E=1$ also avoids fractional powers of negative values. These
+are experiment constraints, not restrictions claimed for Sher's general encoding.
+
+At each step, evaluate the incumbent and its eight coordinate neighbors in one
+Nx batch, then keep the lowest-error candidate. Including the incumbent makes
+local error nonincreasing. Every $\operatorname{select}$ below has a scalar
+predicate or a predicate explicitly matched to the selected tensor's shape.
+
+```elixir
+defmodule Chapter03.Memetic do
+  @moduledoc false
+  import Nx.Defn
+
+  @type trace_row :: %{step: non_neg_integer(), mse: number(), evaluations: pos_integer()}
+  @type result :: %{params: Nx.Tensor.t(), initial_loss: number(), final_loss: number(),
+                    history: [trace_row()]}
+
+  # params: {candidates, 4}; x: {observations}; family is a scalar 0..3.
+  @spec predict(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t() | number()) :: Nx.Tensor.t()
+  defn predict(params, x, family) do
+    a = Nx.slice_along_axis(params, 0, 1, axis: 1)
+    b = Nx.slice_along_axis(params, 1, 1, axis: 1)
+    c = Nx.slice_along_axis(params, 2, 1, axis: 1)
+    d = Nx.slice_along_axis(params, 3, 1, axis: 1)
+    z = c * Nx.new_axis(x, 0) + d
+
+    basis = Nx.select(family == 0, Nx.sin(z),
+              Nx.select(family == 1, Nx.cos(z),
+                Nx.select(family == 2, Nx.tan(z), Nx.tanh(z))))
+    a + b * basis
+  end
+
+  @spec losses(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(),
+               Nx.Tensor.t() | number()) :: Nx.Tensor.t()
+  defn losses(params, x, target, family) do
+    Nx.mean(Nx.pow(predict(params, x, family) - Nx.new_axis(target, 0), 2), axes: [1])
+  end
+
+  @spec project(Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn project(params) do
+    params
+    |> Nx.max(Nx.tensor([-1.0, -2.0, 0.25, -0.2], type: :f32))
+    |> Nx.min(Nx.tensor([1.0, 2.0, 1.25, 0.2], type: :f32))
+  end
+
+  @spec neighborhood(Nx.Tensor.t(), Nx.Tensor.t() | number()) :: Nx.Tensor.t()
+  defn neighborhood(params, step_size) do
+    directions = Nx.eye(4, type: :f32)
+    offsets = Nx.concatenate([Nx.broadcast(0.0, {1, 4}), directions, -directions], axis: 0)
+    project(Nx.new_axis(params, 0) + step_size * offsets)
+  end
+
+  @spec tune(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), 0 | 1 | 2 | 3, [number()]) :: result()
+  def tune(seed, x, target, family, schedule) when family in 0..3 do
+    seed = project(seed)
+    initial_loss = losses(Nx.new_axis(seed, 0), x, target, family) |> Nx.squeeze() |> Nx.to_number()
+    history = [%{step: 0, mse: initial_loss, evaluations: 1}]
+
+    {params, history} =
+      schedule
+      |> Enum.with_index(1)
+      |> Enum.reduce({seed, history}, fn {step_size, step}, {params, history} ->
+        candidates = neighborhood(params, step_size)
+        errors = losses(candidates, x, target, family)
+        winner = Nx.argmin(errors)
+        next = Nx.take(candidates, winner)
+        row = %{step: step, mse: Nx.to_number(Nx.take(errors, winner)), evaluations: 1 + 9 * step}
+        {next, [row | history]}
+      end)
+
+    %{params: params, initial_loss: initial_loss, final_loss: hd(history).mse,
+      history: Enum.reverse(history)}
+  end
+end
+
+x_memetic = Nx.linspace(-1.0, 1.0, n: 41)
+y_memetic = Nx.add(0.2, Nx.multiply(0.8, Nx.cos(Nx.add(Nx.multiply(1.1, x_memetic), 0.1))))
+mod_memetic_seed = Nx.tensor([0.0, 0.5, 0.5, 0.0], type: :f32)
+families_memetic = [{"sin", 0}, {"cos", 1}, {"tan", 2}, {"tanh", 3}]
+schedule_memetic = for step_size <- [0.4, 0.2, 0.1, 0.05, 0.02, 0.01], _sweep <- 1..6, do: step_size
+
+results_memetic =
+  Enum.map(families_memetic, fn {name, family} ->
+    result = Chapter03.Memetic.tune(mod_memetic_seed, x_memetic, y_memetic, family, schedule_memetic)
+    {name, family, result}
+  end)
+
+tbl_memetic =
+  Enum.map(results_memetic, fn {name, _family, result} ->
+    [a, b, c, d] = Nx.to_flat_list(result.params)
+    %{family: name, initial_mse: result.initial_loss, tuned_mse: result.final_loss,
+      a: a, b: b, c: c, d: d, evaluations: List.last(result.history).evaluations}
+  end)
+
+Chapter03.Tables.tabs(
+  tbl_memetic, [:family, :initial_mse, :tuned_mse, :a, :b, :c, :d, :evaluations],
+  "ch_03_tbl_09_memetic_family_comparison.csv"
+)
+```
+
+```elixir
+tbl_memetic_trace =
+  Enum.flat_map(results_memetic, fn {name, _family, result} ->
+    Enum.map(result.history, &Map.put(&1, :family, name))
+  end)
+
+Chapter03.Tables.tabs(
+  tbl_memetic_trace, [:family, :step, :mse, :evaluations],
+  "ch_03_tbl_10_local_search_traces.csv"
+)
+```
+
+```elixir
+fig_local_search =
+  Vl.new(width: 640, height: 280, title: "R3.6 - Local improvement within each family")
+  |> Vl.data_from_values(tbl_memetic_trace)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "evaluations", type: :quantitative, title: "Candidate evaluations per family")
+  |> Vl.encode_field(:y, "mse", type: :quantitative)
+  |> Vl.encode_field(:color, "family", type: :nominal)
+
+fig_local_search
+```
+
+```elixir
+tbl_memetic_curves =
+  [{"Target", y_memetic} | Enum.map(results_memetic, fn {name, family, result} ->
+    {name, Chapter03.Memetic.predict(Nx.new_axis(result.params, 0), x_memetic, family)}
+  end)]
+  |> Enum.flat_map(fn {name, values} ->
+    Enum.zip(Nx.to_flat_list(x_memetic), Nx.to_flat_list(values))
+    |> Enum.map(fn {x, y} -> %{x: x, y: y, family: name} end)
+  end)
+
+fig_memetic_fit =
+  Vl.new(width: 640, height: 300, title: "R3.7 - Tuned curves on the evaluation points")
+  |> Vl.data_from_values(tbl_memetic_curves)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "x", type: :quantitative)
+  |> Vl.encode_field(:y, "y", type: :quantitative)
+  |> Vl.encode_field(:color, "family", type: :nominal)
+
+fig_memetic_fit
+```
+
+Each family receives **325 candidate evaluations**: one initial evaluation plus
+36 batches of nine. These are candidate-level counts, not counts of individual
+sample predictions. Duplicates created by clipping are still evaluated and counted.
+This budget is exposed so that local improvement is not treated as free work.
+
+Independent float32 reference calculations give a cosine-family MSE of about
+**0.1453 before tuning** and **0.00000663 after tuning**. The other three families
+finish near 0.0185-0.0191 with this budget. These are numerical reference values,
+not outputs from an executed Elixir runtime. Small floating-point differences can
+alter choices between nearly tied neighbors.
+
+The curves are evaluated on the same 41 points used for tuning. The result is a
+fit to this task, not evidence of unseen-data generalization, a global optimum,
+or universal superiority of memetic search. In a stochastic comparison, repeated
+runs and a common total evaluation budget would be additional design choices.
+
+**Inheritance is explicit:** `tune/5` returns the improved parameters. This
+experiment does not breed descendants. A complete memetic system must decide
+whether descendants inherit those improved parameters or the original starting
+parameters. Local tuning and inheritance are separate choices.
+
+## 3.6 The Different Sides of the Same Coin
+
+*Source: [S], Section 3.6, pp. 102-103.*
+
+Sher's conclusion is that GA, GP, ES, EP, and MA share an evolutionary core.
+Their names highlight different encodings, operators, or search phases. He
+discusses linear programs, tree programs, graph programs, and neural computations
+as representations that can be placed inside that general approach.
+
+His bridge to the next chapter is direct: graph nodes can perform neural signal
+aggregation and activation, and evolution can change how those nodes are arranged.
+We retain that bridge without treating every graph encoding as interchangeable or
+claiming that the representations have identical search behavior.
+
+### The common design contract
+
+| Question                 | Decision to record                                                       |
+| ------------------------ | ------------------------------------------------------------------------ |
+| What is inherited?       | Genotype structure and parameter types                                   |
+| What does it produce?    | The genotype-to-phenotype mapping                                        |
+| How can it change?       | Mutation, crossover, and any local improvement operators                 |
+| What is measured?        | Fitness, behavior, or other explicitly chosen measurements               |
+| What persists?           | Parent choice, survivor policy, archive policy                           |
+| What constrains the run? | Population size, valid encodings, evaluation conditions, stopping budget |
+
+Our GES boundary is useful because these decisions can change independently.
+Evaluation can remain fixed while selection changes. The encoding can change
+while the overall loop remains recognizable.
+
+### Elixir/BEAM and Nx
+
+| Work                                    | Implementation used in this chapter   |
+| --------------------------------------- | ------------------------------------- |
+| Tree structure and subtree operations   | Elixir tuples and recursive functions |
+| Finite-state representation             | Elixir maps                           |
+| Run orchestration and archive decisions | Ordinary Elixir control flow          |
+| Population bit variation and scoring    | Batched Nx kernels                    |
+| Candidate ranking and selection indices | Nx sorting and gathering              |
+| Numeric strategy mutation               | Nx tensors with explicit shapes       |
+| Local parameter neighborhoods           | Batched Nx evaluation                 |
+
+**The boundary is dynamic structure versus regular numerical computation, not
+Generation/Selection versus Evaluation.** The GA shows all three GES operations
+using Nx where the data representation permits it. We do not add a process per
+gene or candidate merely to make the system concurrent.
+
+### Executable checks
+
+Run this after all previous cells. The checks validate the examples and contracts,
+not every possible genotype, tensor shape, backend, or parameter setting.
+
+```elixir
+y_tree_reference = Nx.multiply(Nx.add(x_curve, 0.27), Nx.tanh(x_curve))
+Chapter03.Support.close!(Chapter03.Tree.evaluate(mod_tree_a, x_curve), y_tree_reference, 1.0e-5)
+
+# Replay one generation with the same explicit random key.
+replay_key = Nx.Random.key(301)
+replay_population = Nx.tensor([[1, 0, 0, 1], [0, 0, 0, 0], [1, 1, 0, 1], [0, 1, 0, 0]])
+{replay_a, replay_key_a} = Chapter03.Camouflage.next_generation(replay_population, replay_key, 0.25)
+{replay_b, replay_key_b} = Chapter03.Camouflage.next_generation(replay_population, replay_key, 0.25)
+
+sigma_reference = Nx.clip(Nx.multiply(sigma_es, Nx.exp(Nx.multiply(0.5, z_sigma_es))), 1.0e-3, 2.0)
+zero_draws = Nx.broadcast(0.0, Nx.shape(parent_a))
+zero_flip = Chapter03.BinaryGenome.mutate(parent_a, zero_draws, 0.0)
+all_flip = Chapter03.BinaryGenome.mutate(parent_a, zero_draws, 1.0)
+
+cos_reference_params = Nx.tensor([[0.2, 0.8, 1.1, 0.1]], type: :f32)
+exact_cos_loss = Chapter03.Memetic.losses(cos_reference_params, x_memetic, y_memetic, 1) |> Nx.squeeze() |> Nx.to_number()
+
+checks = [
+  {selected_parent.candidate == "A" and selected_archive.candidate == "B",
+   "Parent and archive selection can use different measurements"},
+  {Chapter03.Support.max_error(Chapter03.Tree.evaluate(mod_tree_a, x_curve), y_tree_reference) < 1.0e-5,
+   "Tree evaluation matches the source expression"},
+  {Chapter03.Tree.size(mod_tree_a) == 6 and length(tbl_tree_checks) == 5,
+   "All tree-operator checks passed"},
+  {Nx.to_flat_list(child_a) == [1, 1, 1, 1] and Nx.to_flat_list(child_b) == [0, 0, 0, 0],
+   "Crossover respects the cut and parent orientation"},
+  {Nx.to_flat_list(mutated_child) == [1, 0, 1, 1], "Mutation changes only the chosen bit"},
+  {Chapter03.Support.max_error(zero_flip, parent_a) == 0 and
+     Nx.to_flat_list(all_flip) == [0, 0, 1, 1], "Mutation rate boundaries behave correctly"},
+  {Nx.shape(result_ga.population) == {32, 16}, "GA population size and genome length are preserved"},
+  {Enum.all?(Nx.to_flat_list(result_ga.population), &(&1 in [0, 1])), "GA genes remain binary"},
+  {length(tbl_ga_trace) == 61, "GA trace includes initialization and all 60 generations"},
+  {Chapter03.Support.nondecreasing?(Enum.map(tbl_ga_trace, & &1.best)),
+   "Elitism preserves best fitness under the fixed evaluation"},
+  {result_ga.archive.fitness == List.last(tbl_ga_trace).best and
+     Nx.to_number(Nx.sum(result_ga.archive.genome)) == result_ga.archive.fitness,
+   "The archive contains a correctly scored champion"},
+  {Chapter03.Support.max_error(replay_a, replay_b) == 0 and
+     Chapter03.Support.max_error(replay_key_a, replay_key_b) == 0,
+   "The same population and random key reproduce one generation"},
+  {Chapter03.Support.max_error(sigma_es_child, sigma_reference) < 1.0e-6,
+   "Strategy mutation follows the declared step-size rule"},
+  {Nx.shape(selected_theta_es) == {3, 2} and Nx.shape(selected_sigma_es) == {3, 1} and
+     Enum.all?(Nx.to_flat_list(selected_sigma_es), &(&1 > 0)),
+   "Selection carries positive strategy parameters with the chosen candidates"},
+  {Chapter03.FSM.accuracy(rollout_fsm_parent) == 0.5 and
+     Chapter03.FSM.accuracy(rollout_fsm_child) == 1.0,
+   "The finite-state mutation changes the demonstrated prediction accuracy"},
+  {exact_cos_loss < 1.0e-10, "The target is representable by the declared cosine family"},
+  {Nx.shape(Chapter03.Memetic.neighborhood(mod_memetic_seed, 0.1)) == {9, 4},
+   "Local search evaluates an incumbent plus eight coordinate neighbors"},
+  {Enum.all?(results_memetic, fn {_name, _family, result} ->
+      Chapter03.Support.nonincreasing?(Enum.map(result.history, & &1.mse))
+    end), "Local error never increases when the incumbent remains eligible"},
+  {Enum.all?(tbl_memetic, &(&1.evaluations == 325)), "Every family receives the same candidate budget"},
+  {Enum.all?(results_memetic, fn {_name, _family, result} ->
+      Chapter03.Support.max_error(Chapter03.Memetic.project(result.params), result.params) == 0
+    end), "All returned local-search parameters satisfy the declared bounds"}
+]
+
+tbl_checks = Enum.map(checks, fn {ok, label} -> Chapter03.Support.check!(ok, label) end)
+Chapter03.Tables.tabs(tbl_checks, [:check, :result], "ch_03_tbl_11_validation_checks.csv")
+```
+
+### Exercises
+
+| Exercise                   | Change                                                        | What to inspect                                                  |
+| -------------------------- | ------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Mutation without crossover | In the GA, clone selected parents instead of recombining them | Does variation still produce useful descendants?                 |
+| Crossover without mutation | Set the GA mutation rate to zero                              | Can an allele appear at a locus where no selected parent has it? |
+| Different environment      | Score agreement with a mixed target bit string                | Which genotypes become fit?                                      |
+| Tree growth                | Replace a leaf with a larger valid subtree                    | Does increased size improve the measured fit?                    |
+| Strategy inheritance       | Keep a selected point but reset its mutation scale            | Which inherited information have you removed?                    |
+| Unseen FSM transitions     | Change the input sequence or initial state                    | Which transitions were never tested by alternation?              |
+| Fair local-search budget   | Vary the number of coordinate sweeps                          | How much improvement does each extra evaluation buy?             |
+| Changed selection policy   | Replace elite survival by offspring-only survival             | Which nondecreasing-fitness check is no longer justified?        |
+
+### Self-check
+
+| Question                                                     | Answer                                                                             |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| Is mutation guaranteed to improve a candidate?               | No. Evaluation measures the result and selection decides its consequences.         |
+| Must genotype and phenotype always be distinct objects?      | No. Sher explicitly allows them to coincide for suitable tasks.                    |
+| Does a fitness score itself decide reproduction?             | No. That requires a selection policy.                                              |
+| Does elitism prove convergence to the global optimum?        | No. It preserves selected incumbents under the stated evaluation conditions.       |
+| Does ES change only the candidate's output parameters?       | Sher emphasizes adapting inherited variation settings as well.                     |
+| Does local tuning reveal a structure's true maximum fitness? | Not with a finite, possibly imperfect tuning procedure.                            |
+| Does using Nx require a GPU?                                 | No. These examples use the CPU BinaryBackend.                                      |
+| What unifies the algorithm families here?                    | Encodings, variation, evaluation, and decisions about descendants and persistence. |
+
+**The key insight:** an evolutionary algorithm searches the possibilities that its
+representation and operators make available, under the consequences its evaluator
+measures and its selection policy rewards.
+
+**Next:** Chapter 4 applies these ideas to neural-network encodings, weight and
+topology mutation, and neuroevolutionary methods.
+
+## 3.7 References and adaptation notes
+
+### Primary source
+
+**[S]** Gene I. Sher. *Handbook of Neuroevolution Through Erlang*. Springer, 2013.
+Chapter 3, "Introduction to Evolutionary Computation," printed pp. 81-104.
+DOI: `10.1007/978-1-4614-4463-3_3`.
+
+The source was read from the complete Library copy, whose PDF pages 59-82 contain
+this chapter. Printed page numbers, not PDF offsets, are used in the section notes.
+Source figures were inspected. Diagrams and plots in this notebook are new
+renderings or new experimental outputs; none is an extracted book illustration.
+
+| Source location  | Material retained                                                                    | Remaster treatment                                                        |
+| ---------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
+| 3.1, pp. 81-85   | Replication, variation, competition, environmental change, extinction, divergence    | Condensed narrative with explicit limits on inevitability claims          |
+| 3.2, pp. 85-88   | Population, genotype, phenotype, mapping, evaluation, selection, termination         | GES separation and a labeled optional archive                             |
+| 3.3, pp. 88-93   | Curve fitting, expression trees, mutation, crossover, other design domains           | Source Fig. 3.3 expression plus new synthetic target and MSE objective    |
+| 3.4, pp. 93-94   | Shared algorithmic core, local optima, variation and diversity choices               | Source-framed comparison table                                            |
+| 3.4.1, pp. 94-96 | String encodings, camouflage, crossover, mutation, length changes                    | Fixed-length batched GA with new settings and an explicit random key      |
+| 3.4.2, pp. 96-97 | Programs as trees; structural operators                                              | Typed tuple representation, subtree operations, structural checks         |
+| 3.4.3, pp. 97-98 | Evolving strategy settings alongside candidate designs                               | New bounded multiplicative step-size example                              |
+| 3.4.4, p. 98     | Finite-state prediction systems                                                      | New table-encoded predictor and one-entry mutation                        |
+| 3.5, pp. 98-102  | Function families, global/local search, body-controller and topology-weight examples | All four families, fixed exponent, bounded deterministic local comparison |
+| 3.6, pp. 102-103 | Overlap among algorithm families; bridge to neuroevolution                           | Common design contract and runtime distinction                            |
+| 3.7, pp. 103-104 | Bibliography                                                                         | Selected reading pointers below                                           |
+
+### Selected references from Sher's bibliography
+
+Original reference numbers are retained. These are condensed bibliographic
+pointers from [S], not claims that the referenced works were independently
+reviewed for this notebook.
+
+| Original number | Work                                                                                                                   | Connection                    |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| [2]             | Lewontin (1970). "The Units of Selection."                                                                             | Biological selection          |
+| [3]             | Kimura (1991). "The Neutral Theory of Molecular Evolution: A Review of Recent Evidence."                               | Biological evolution          |
+| [6]             | Dawkins (1976). *The Selfish Gene*.                                                                                    | Replicator framing            |
+| [8]             | Koza (1992). *Genetic Programming*.                                                                                    | Tree-encoded programs         |
+| [11]            | Holland (1975). *Adaptation in Natural and Artificial Systems*.                                                        | Genetic algorithms            |
+| [13]            | Cramer (1985). "A Representation for the Adaptive Generation of Simple Sequential Programs."                           | Program representations       |
+| [18]            | Back, Hoffmeister, and Schwefel (1991). "A Survey of Evolution Strategies."                                            | Evolution strategies          |
+| [20]            | Fogel, Owens, and Walsh (1966). *Artificial Intelligence through Simulated Evolution*.                                 | Evolutionary programming      |
+| [21]            | Moscato (1989). "On Evolution, Search, Optimization, Genetic Algorithms and Martial Arts: Towards Memetic Algorithms." | Memetic algorithms            |
+| [23]            | Sher (2010). "DXNN Platform: The Shedding of Biological Inefficiencies."                                               | Memetic neuroevolution        |
+| [24]            | Kassahun and Sommer (2005). "Efficient Reinforcement Learning Through Evolutionary Acquisition of Neural Topologies."  | Topology evolution and tuning |
+| [25]            | Siebel and Sommer (2007). "Evolutionary Reinforcement Learning of Artificial Neural Networks."                         | Neural evolutionary learning  |
+
+### Software references for the remaster implementations
+
+| Key | Official source                                                                                                                                                                              | Used for                                               |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| D1  | [Nx](https://nx.hexdocs.pm/Nx.html) and [Nx.Defn](https://nx.hexdocs.pm/Nx.Defn.html)                                                                                                        | Tensors, shapes, numerical kernels, sorting, gathering |
+| D2  | [Nx 1.0.0 random implementation](https://hex.pm/packages/nx/1.0.0/files/lib/nx/random.ex?fallback=default)                                                                                   | Explicit random keys, integer sampling, uniform draws  |
+| D3  | [Kino layout implementation](https://hex.pm/packages/kino/0.19.1/files/lib/kino/layout.ex) and [data table implementation](https://hex.pm/packages/kino/0.19.1/files/lib/kino/data_table.ex) | Tabs and ordered data-table columns                    |
+| D4  | [Kino.Download](https://hexdocs.pm/kino/Kino.Download.html)                                                                                                                                  | Binary-producing download callbacks                    |
+| D5  | [Elixir typespec reference](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/pages/references/typespecs.md)                                                                        | Function contracts and named types                     |
+
+Software references were consulted on 2026-10-29. The web-served unversioned Nx
+API pages included older version labels; they were used only for the shown API
+contracts, not as proof of successful execution of Nx 1.0.0. Package pins are
+unchanged from Chapter 2. No backend speedup or Elixir execution is claimed.
+
+### Deliberate interpretation and implementation choices
+
+| Issue                                         | Explicit treatment                                                                                          |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Biological inevitability language             | Preserved as Sher's framing, not used as a mathematical guarantee                                           |
+| Search-space versus solution-space vocabulary | Retained; the mapper connects encoded candidates to evaluated consequences                                  |
+| Reciprocal graph distance                     | Described as the source objective; executable examples explicitly use MSE instead                           |
+| Reversed camouflage color sentence            | Use 0 = white and 1 = green, matching the detailed example and figure                                       |
+| Algorithm-family descriptions                 | Presented as the chapter's emphasis, not exhaustive contemporary definitions                                |
+| Trees versus graphs                           | Tuple examples support trees only; broader source discussion is not silently implemented                    |
+| Memetic expression domain                     | Fix E = 1 and bound C and D so the tangent example remains finite                                           |
+| Local tuning and inheritance                  | Keep the two decisions distinct; the controlled comparison does not breed offspring                         |
+| GES, novelty, and archive roles               | Clearly marked as our remaster framework and additions                                                      |
+| Verification                                  | Independent deterministic reference calculations plus in-notebook assertions; no claimed Livebook execution |
+
+**End of Chapter 3.**

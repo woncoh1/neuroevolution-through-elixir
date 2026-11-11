@@ -1,0 +1,533 @@
+# Chapter 1. Motivations and Applications
+
+## Section
+
+**Neuroevolution through Elixir · Chapter 1**
+
+*An original learning-oriented remaster of Chapter 1, “Introduction: Applications & Motivations,” from Gene I. Sher, **Handbook of Neuroevolution Through Erlang** (Springer, 2013), pp. 1–39.*
+
+> **Core idea:** Neuroevolution searches for neural-network designs by generating variants, evaluating their behavior, and selecting which variants continue.
+
+This chapter is an introduction, not yet a complete neuroevolution framework. It preserves Sher's five main sections and ten application areas, but presents the ideas in simpler language, uses new diagrams, and adds a small executable Elixir experiment. The **Generation–Evaluation–Selection (GES)** architecture and the **Nx** integration plan are additions to this remaster, not claims made by the original text.
+
+**Learning goals**
+
+* Explain what neuroevolution changes and what it measures.
+* Describe a neural agent using sensors, a neural controller, actuators, and an environment (*scape*).
+* Recognize the same evolutionary loop in very different applications.
+* Run a small, dependency-free evolutionary experiment in Elixir.
+* Distinguish the jobs of **Elixir/BEAM** and **Nx** in the chapters ahead.
+
+## 1.1 Motivations
+
+### What is neuroevolution?
+
+A **neural network** transforms inputs into outputs. **Evolutionary computation** searches across candidate solutions. **Neuroevolution** combines them: the candidates are neural networks, or systems built around them.
+
+We may evolve:
+
+| Evolvable feature  | Example                                        |
+| ------------------ | ---------------------------------------------- |
+| **Parameters**     | Connection weights and biases                  |
+| **Topology**       | Neurons, connections, recurrence, modules      |
+| **Learning rules** | How synapses change during an agent's lifetime |
+| **Morphology**     | Which sensors and actuators an agent has       |
+
+Sher emphasizes **topology-and-weight evolving artificial neural networks (TWEANNs)**: evolution can change both the numerical parameters and the structure of a network.
+
+The three broad motivations in the source are **optimization**, **control**, and **invention**:
+
+1. **Optimization:** We know what good performance looks like, but not which design achieves it.
+2. **Control:** We need an agent that acts in a changing environment using sensory feedback.
+3. **Invention:** We want to discover useful designs that a programmer did not specify in advance.
+
+Evolutionary search is useful when the design is discrete, irregular, or difficult to differentiate. It is **not** automatically better than gradient-based learning; the appropriate method depends on the problem and computational budget.
+
+### Our foundational triad: Generation–Evaluation–Selection
+
+```mermaid
+graph LR
+    A["Selected parents<br/>and archive"] --> G["1 · Generation<br/>mutation / crossover"]
+    G --> C["Candidate networks"]
+    C --> E["2 · Evaluation<br/>fitness / novelty"]
+    E --> S["3 · Selection<br/>survival / reproduction / archiving"]
+    S --> A
+```
+
+| Stage          | Question                              | Typical operations                       |
+| -------------- | ------------------------------------- | ---------------------------------------- |
+| **Generation** | What new possibilities should we try? | Mutation, crossover, recombination       |
+| **Evaluation** | How do the possibilities behave?      | Fitness, novelty, robustness, efficiency |
+| **Selection**  | What persists or propagates?          | Survival, reproduction, archiving        |
+
+**Evaluation produces measurements; selection makes decisions.** A novel but currently weak agent might be archived as a useful stepping stone, even if it is not chosen for immediate reproduction.
+
+A compact abstract model is:
+
+$$
+C_t = G(P_t, A_t), \qquad
+R_t = E(C_t, \mathcal{W}_t), \qquad
+(P_{t+1}, A_{t+1}) = S(P_t, C_t, R_t, A_t).
+$$
+
+Here $P_t$ is the population, $A_t$ an archive, $C_t$ the new candidates, $R_t$ their evaluations, and $\mathcal{W}_t$ the evaluation environment. This notation is our remaster's conceptual model, not a formal equation from Sher.
+
+### Why Elixir?
+
+Sher selected **Erlang** because biological organisms and neural systems are highly concurrent, dynamic, and fault-tolerant. **Elixir runs on the same BEAM virtual machine** and retains these strengths.
+
+The remaster adds a second computational layer:
+
+| Elixir / BEAM                    | Nx (when useful)                 |
+| -------------------------------- | -------------------------------- |
+| Agents and independent processes | Tensor-based neural inference    |
+| Population orchestration         | Batched network evaluation       |
+| Genotype graphs and mutation     | Matrix operations and plasticity |
+| Supervision and recovery         | Vectorized numerical simulation  |
+
+**Design rule:** Use BEAM to coordinate evolving systems; use Nx for suitable numerical kernels. A process per neuron is a valuable teaching model, but not necessarily the fastest representation for a large dense network.
+
+## 1.2 Applications
+
+Across different tasks, the same basic system reappears:
+
+```mermaid
+flowchart LR
+    W["Environment / scape"] -->|observations| S["Sensors"]
+    S --> N["Neural controller"]
+    N --> A["Actuators"]
+    A -->|actions| W
+    W -.->|outcomes| F["Evaluation"]
+    F -.->|scores / descriptors| G["Evolutionary loop"]
+    G -.->|new controller| N
+```
+
+A *scape* is Sher's term for an environment in which an agent interacts and is assessed. Sensors translate observations into network inputs; actuators translate network outputs into actions. The environment determines the consequences.
+
+### 1.2.1 Robotics
+
+**Task:** Evolve a neural controller for a robot that moves, avoids obstacles, or performs useful work.
+
+* **Sensors:** Camera, range, touch, or battery readings.
+* **Actuators:** Wheels, motors, steering, or grippers.
+* **Evaluation:** Reward the desired behavior; penalize collisions, energy use, or failures.
+
+A simple cleaning-robot fitness could be:
+
+$$
+F = aT_{\mathrm{active}} + bC_{\mathrm{cleaned}} - cN_{\mathrm{collisions}},
+\qquad a,b,c > 0.
+$$
+
+Sher describes evolving controllers in simulation and then transferring them to real robots. The main challenge is the **simulation-to-reality gap**: simulated sensors, actuators, and physics do not perfectly match the world. Testing across noisy and varied environments helps, but does not eliminate this gap.
+
+Sher also introduces **coevolution**: two populations improve in response to each other rather than against a fixed opponent. Competitive environments can create a changing evaluation landscape.
+
+### 1.2.2 Financial Markets
+
+**Task:** Evolve an agent that reads a sequence of market observations and outputs a decision.
+
+A simplified interface is:
+
+$$
+[p_{t-k+1},\ldots,p_t]
+\longrightarrow \mathrm{NN}
+\longrightarrow a_t \in \{-1,0,+1\},
+$$
+
+where the actions represent sell, hold, and buy. Sher describes both autonomous traders and **oracles** that predict price movements without placing trades.
+
+He also describes **committees** of evolved networks:
+
+* **Homogeneous committee:** Diverse champions consider the same input.
+* **Specialized committee:** Different champions are trained for different market conditions, and observations are routed accordingly.
+
+**Modern caution:** Good backtest performance is not evidence of reliable live profit. A realistic evaluation must account for transaction costs, slippage, chronological train/test separation, changing markets, and overfitting. These are practical safeguards added in this remaster.
+
+### 1.2.3 Artificial Life
+
+**Task:** Create simulated organisms whose behavior—and possibly bodies—evolve.
+
+Sher's central example is a **predator–prey world**. Organisms sense other objects, move, gather energy, compete, and reproduce. A mutation might add a color sensor; a later neural mutation might allow an organism to use that new information.
+
+Two forms of evolution matter:
+
+| Form                        | What changes?                                                  |
+| --------------------------- | -------------------------------------------------------------- |
+| **Neural evolution**        | The controller's connections and computations                  |
+| **Morphological evolution** | The organism's available sensors, actuators, and body features |
+
+Unlike experiments that replace a whole generation at once, a living simulation often needs **steady-state evolution**: when an organism dies, another is introduced while the rest continue. Sher proposes retaining recently evaluated genotypes in a pool from which parents can be chosen.
+
+This application illustrates **open-endedness**: interesting adaptations may emerge that were not explicitly specified as the final target. It does not guarantee indefinite complexity growth.
+
+### 1.2.4 Image Analysis and Computer Vision
+
+**Task:** Evolve a network that classifies or detects visual patterns.
+
+$$
+\text{Image} \longrightarrow \text{Encoded values}
+\longrightarrow \text{Neural network}
+\longrightarrow \text{Prediction}.
+$$
+
+Sher illustrates image recognition using simple labeled categories and suggests facial stress recognition as another possible task. In a modern implementation, performance would be measured on held-out data, including difficult and shifted examples.
+
+**Important limitation:** Facial appearance is not a dependable direct measurement of a person's internal emotional state. Any high-stakes use would require careful validation and safeguards.
+
+**Nx opportunity:** Tensors naturally represent batches of images and network computations. We will introduce these operations in Chapter 2.
+
+### 1.2.5 Data Compression
+
+**Task:** Find a compact representation that preserves information useful for reconstruction.
+
+Sher uses a network with layer widths **10 → 5 → 10**. The first part compresses ten input values into five latent values; the second reconstructs the input.
+
+```mermaid
+flowchart LR
+    X["Input<br/>10 values"] --> ENC["Encoder"]
+    ENC --> Z["Latent code<br/>5 values"]
+    Z --> DEC["Decoder"]
+    DEC --> XR["Reconstruction<br/>10 values"]
+```
+
+One possible evaluation criterion is reconstruction error:
+
+$$
+L = \frac{1}{N}\sum_{i=1}^{N}\left\|x_i-\hat{x}_i\right\|_2^2.
+$$
+
+Evolution may search for weights, topology, or bottleneck size. A narrower latent vector does **not** by itself guarantee lossless compression, fewer transmitted bits, or good reconstruction on unseen data.
+
+### 1.2.6 Games and Entertainment
+
+**Task:** Evolve behaviors or content that keep a simulated world interesting.
+
+Examples from Sher include non-player characters that adapt over time, changing game elements, and terrain generators whose output is evaluated by human players.
+
+Human preference is one possible evaluation signal:
+
+$$
+\text{Generated design} \rightarrow \text{Human rating}
+\rightarrow \text{Selection} \rightarrow \text{New designs}.
+$$
+
+This is **interactive evolution**. It is especially useful when interestingness or aesthetic quality is difficult to define with an explicit formula. Human evaluation, however, can be slow and inconsistent.
+
+### 1.2.7 Network Security
+
+**Task:** Investigate adaptive defensive agents in an isolated network simulation.
+
+Sher's historical discussion includes competing offensive and defensive software agents. The broader methodological lesson is **coevolution**: the quality of one strategy depends partly on the strategies it encounters.
+
+For a safe defensive example, a simulated agent could classify events as benign or suspicious, with:
+
+$$
+F_{\mathrm{defense}}
+= aN_{\mathrm{threats\ detected}}
+
+* bN_{\mathrm{benign\ allowed}}
+
+* cN_{\mathrm{false\ alarms}}.
+  $$
+
+The simulation can deliberately introduce new benign and suspicious patterns to test whether the defender generalizes. The learning environment should remain isolated from real networks.
+
+### 1.2.8 Circuit Creation and Optimization
+
+**Task:** Evolve networks of logical operations rather than conventional numerical neurons.
+
+Instead of activation functions such as $\tanh$, the nodes can represent gates such as **AND**, **OR**, and **NOT**. The evolved phenotype is then a digital logic circuit.
+
+Sher's illustrative target is **XOR**:
+
+| $x_1$ | $x_2$ | $x_1 \oplus x_2$ |
+| ----: | ----: | ---------------: |
+| 0     | 0     | 0                |
+| 0     | 1     | 1                |
+| 1     | 0     | 1                |
+| 1     | 1     | 0                |
+
+A simple multiobjective trade-off can be written as:
+
+$$
+F = \mathrm{Accuracy} - \lambda\,\mathrm{CircuitCost}.
+$$
+
+Evolution can **complexify** a circuit by adding nodes or **prune** it by removing unnecessary ones. The best circuit is not necessarily the largest; correctness, cost, and robustness all matter.
+
+### 1.2.9 Optimizing Shapes and Structures
+
+**Task:** Evolve a network that generates a two- or three-dimensional object.
+
+Sher describes a geometric **substrate**: a grid with coordinates normalized to $[-1,1]$. A network receives each coordinate and emits a value indicating whether the corresponding voxel belongs to a shape.
+
+$$
+(x,y,z) \xrightarrow{\ \mathrm{NN}\ } o,
+\qquad
+\mathrm{filled}(x,y,z) = \mathbb{1}[o\geq0].
+$$
+
+For a grid with resolution $r_x\times r_y\times r_z$, the total number of locations is:
+
+$$N_{\mathrm{voxels}}=r_xr_yr_z.$$
+
+At $100\times100\times100$, one candidate shape requires **one million coordinate evaluations**. This is an especially natural future application for Nx batching.
+
+A shape evaluator might combine volume constraints, structural requirements, and aerodynamic properties. Human-guided selection can also favor visually interesting shapes, even without a single numerical objective.
+
+### 1.2.10 Computational Intelligence and the Long-Term Goal
+
+Sher's most ambitious motivation is the possibility of evolving increasingly capable computational intelligence. His argument draws an analogy with biological evolution, which generated nervous systems over long timescales.
+
+The analogy is a **research motivation, not a proof** that any current neuroevolution system will produce general intelligence. Search spaces, environments, evaluation criteria, computational resources, and learning mechanisms all constrain what can emerge.
+
+**Question to carry forward:** What kinds of environments and selection pressures produce genuinely new capabilities, rather than only higher scores on a narrow test?
+
+## 1.3 A Whirlwind Overview
+
+Sher builds the book step by step: from neural-network fundamentals to a full TWEANN platform, then to artificial-life and trading applications. Our remaster retains that progression while translating implementations into modern Elixir.
+
+| Chapters    | What we build                         | Main computing emphasis                      |
+| ----------- | ------------------------------------- | -------------------------------------------- |
+| **2–4**   | Neural and evolutionary foundations   | Mathematical concepts; first Nx examples     |
+| **5–6**   | BEAM architecture and neural networks | Elixir processes + numerical inference       |
+| **7–9**   | Training, evolution, mutation, tests  | GES loop and reproducible experiments        |
+| **10–14** | DXNN, modularization, benchmarking    | Pluggable algorithms and parallel evaluation |
+| **15–17** | Plasticity and substrate encoding     | Nx-friendly numerical kernels                |
+| **18–19** | Artificial life and market agents     | Agents, scapes, simulations                  |
+| **20**      | Conclusions                           | Open questions and future systems            |
+
+### Mini-lab: Evolve a neural OR gate
+
+We will implement **one sigmoid neuron** that learns the Boolean **OR** function through evolution alone. This is a deliberately small example of **weight evolution**. Later chapters will evolve network topology and more complex behaviors.
+
+For two inputs, the neuron computes:
+
+$$
+\hat y = \sigma(w_1x_1+w_2x_2+b),\qquad
+\sigma(z)=\frac{1}{1+e^{-z}}.
+$$
+
+Our fitness is $1-\mathrm{MSE}$ over the four possible Boolean inputs. Higher is better. We use **mutation**, **fitness evaluation**, **elitist selection**, and a small archive of observed *binary behaviors*. The archive is only descriptive in this example; it does **not** drive selection or calculate novelty scores.
+
+**Setup:** No `Mix.install/1` is required. Evaluate the following code cells in order in Livebook.
+
+```elixir
+# One self-contained module for the introductory experiment.
+defmodule Neuroevo.Ch01 do
+  # Global variable: truth table
+  @cases [
+    {{0.0, 0.0}, 0.0},
+    {{0.0, 1.0}, 1.0},
+    {{1.0, 0.0}, 1.0},
+    {{1.0, 1.0}, 1.0}
+  ]
+
+  # A single artificial neuron: two weights and one bias.
+  def predict([w1, w2, bias], {x1, x2}) do
+    z = w1 * x1 + w2 * x2 + bias # Weighted sum with bias
+    1.0 / (1.0 + :math.exp(-z)) # Activation function: Sigmoid
+  end
+
+  # EVALUATION: smooth fitness, unlike all-or-nothing accuracy.
+  def fitness(weights) do
+    squared_errors =
+      Enum.map(@cases, fn {inputs, target} ->
+        error = predict(weights, inputs) - target
+        error * error
+      end)
+
+    mse = Enum.sum(squared_errors) / length(@cases)
+    1.0 - mse
+  end
+
+  def behavior(weights) do
+    Enum.map(@cases, fn {inputs, _target} ->
+      if predict(weights, inputs) >= 0.5, do: 1, else: 0
+    end)
+  end
+
+  def random_weights do
+    for _ <- 1..3, do: 6.0 * :rand.uniform() - 3.0
+  end
+
+  # GENERATION: small random changes in all three parameters.
+  def mutate(weights, sigma) do
+    Enum.map(weights, fn weight -> weight + sigma * :rand.normal() end)
+  end
+
+  # EVALUATION: return {fitness, genotype} for each candidate.
+  def evaluate(population) do
+    Enum.map(population, fn weights -> {fitness(weights), weights} end)
+  end
+
+  # SELECTION: keep a small pool of the best-scoring parents.
+  def select(scored, count) do
+    scored
+    |> Enum.sort_by(fn {score, _weights} -> score end, :desc)
+    |> Enum.take(count)
+  end
+
+  # GENERATION: retain the champion, mutate sampled parents.
+  def generate(parents, population_size, sigma) do
+    {_score, champion} = hd(parents)
+
+    children =
+      for _ <- 1..(population_size - 1) do
+        {_score, weights} = Enum.random(parents)
+        mutate(weights, sigma)
+      end
+
+    [champion | children]
+  end
+
+  def run(generations \\ 60, population_size \\ 32, parent_count \\ 8) do
+    # Deterministic pseudo-random sequence for repeatable teaching runs.
+    :rand.seed(:exsss, {11, 22, 33})
+
+    initial = for _ <- 1..population_size, do: random_weights()
+
+    {final_population, history, archive} =
+      Enum.reduce(
+        0..generations, {initial, [], MapSet.new()},
+        fn generation, {population, history, archive} ->
+          scores = evaluate(population)
+          parents = select(scores, parent_count)
+          {best_score, _weights} = hd(parents)
+  
+          archive =
+            Enum.reduce(population, archive, fn weights, acc ->
+              MapSet.put(acc, behavior(weights))
+            end)
+  
+          entry = %{
+            generation: generation,
+            best_fitness: best_score,
+            archived_behaviors: MapSet.size(archive)
+          }
+  
+          next =
+            if generation < generations do
+              generate(parents, population_size, 0.65)
+            else
+              population
+            end
+  
+          {next, [entry | history], archive}
+        end
+      )
+
+    {best_fitness, best_weights} =
+      final_population |> evaluate() |> select(1) |> hd()
+
+    %{
+      best_fitness: best_fitness,
+      best_weights: best_weights,
+      behavior: behavior(best_weights),
+      history: Enum.reverse(history),
+      archive_size: MapSet.size(archive)
+    }
+  end
+end
+```
+
+Run the experiment:
+
+```elixir
+result = Neuroevo.Ch01.run()
+
+IO.puts("Generation | Best fitness | Behaviors discovered")
+IO.puts("-----------+--------------+---------------------")
+
+for row <- result.history, rem(row.generation, 10) == 0 do
+  IO.puts(
+    "#{String.pad_leading(to_string(row.generation), 10)} | " <>
+      "#{:erlang.float_to_binary(row.best_fitness, decimals: 5) |> String.pad_leading(12)} | " <>
+      "#{row.archived_behaviors}"
+  )
+end
+
+%{
+  final_fitness: Float.round(result.best_fitness, 5),
+  evolved_behavior: result.behavior,
+  desired_behavior: [0, 1, 1, 1],
+  unique_behaviors_seen: result.archive_size
+}
+```
+
+**Interpretation:** The four entries in `evolved_behavior` correspond to inputs $(0,0)$, $(0,1)$, $(1,0)$, and $(1,1)$. A correct OR classifier produces `[0, 1, 1, 1]`. The fitness is continuous, so even candidates with the same classification can differ in how confidently they predict each answer.
+
+Observe the final neuron's numerical outputs:
+
+```elixir
+for inputs <- [{0.0, 0.0}, {0.0, 1.0}, {1.0, 0.0}, {1.0, 1.0}] do
+  %{inputs: inputs, probability: Neuroevo.Ch01.predict(result.best_weights, inputs)}
+end
+```
+
+**What this experiment does—and does not—show**
+
+* It demonstrates a full **Generation → Evaluation → Selection** loop acting on neural weights.
+* Its archive records which distinct four-bit behaviors were observed; archiving alone is **not** novelty search.
+* The best individual survives unchanged each generation (*elitism*).
+* There is no crossover, recurrent memory, structural mutation, or Nx in this first experiment.
+* Training is stochastic and numerical fitness is bounded above by 1.0; results depend on the search settings.
+
+### A glimpse of BEAM concurrency
+
+Evaluating different candidates is often independent. Elixir can distribute those evaluations across BEAM processes with `Task.async_stream/3`:
+
+```elixir
+sample_population = for _ <- 1..12, do: Neuroevo.Ch01.random_weights()
+
+parallel_scores =
+  sample_population
+  |> Task.async_stream(&Neuroevo.Ch01.fitness/1,
+    max_concurrency: System.schedulers_online(),
+    ordered: true,
+    timeout: 30_000
+  )
+  |> Enum.map(fn {:ok, score} -> score end)
+
+%{
+  evaluated: length(parallel_scores),
+  max_fitness: Enum.max(parallel_scores)
+}
+```
+
+For **this tiny neuron**, process overhead may exceed the work being parallelized. BEAM parallelism becomes more useful with independent, expensive agent evaluations. Nx will become useful when many comparable numerical computations can be **batched**.
+
+## 1.4 Endgame
+
+Sher closes with an ambitious vision: computational systems that evolve increasingly complex neural intelligence. His central engineering argument is more immediate: such systems need a flexible way to represent changing network structures, distributed agents, environments, and evolutionary algorithms.
+
+Our remaster retains that architectural ambition, while separating three questions:
+
+1. **Can we build it?** Can Elixir represent changing organisms and reliable evolutionary experiments?
+2. **Can we measure it?** Do our fitness and novelty measurements reflect real capabilities?
+3. **Can it keep discovering?** Do selection, archives, and environments preserve useful stepping stones instead of prematurely eliminating them?
+
+**Takeaway:** The quality of evolution is determined not only by how candidates are generated, but also by the environments in which they are evaluated and the information retained through selection.
+
+**Before Chapter 2, consider:**
+
+* Why can an accurate fitness function still produce undesirable behavior?
+* When is archiving a novel but low-fitness candidate valuable?
+* Which operations should become BEAM processes, and which should become Nx tensor operations?
+
+## 1.5 References and provenance
+
+**Primary source**
+
+Sher, G. I. (2013). “Introduction: Applications & Motivations.” In *Handbook of Neuroevolution Through Erlang*, Chapter 1, pp. 1–39. Springer. DOI: [10.1007/978-1-4614-4463-3_1](https://doi.org/10.1007/978-1-4614-4463-3_1).
+
+The historical chapter also cites work on neuroevolution, evolutionary robotics, HyperNEAT, Picbreeder, DXNN, simulated worlds, and artificial life. Consult **§1.5 of the original PDF** for its complete 34-entry reference list.
+
+**Further implementation reading**
+
+* [Elixir documentation](https://hexdocs.pm/elixir/): modules, collections, processes, and tasks.
+* [Nx documentation](https://hexdocs.pm/nx/): tensor programming for later chapters.
+* [Livebook documentation](https://livebook.dev/): executable notebooks, mathematical expressions, and Mermaid diagrams.
+
+*All prose, Mermaid diagrams, mathematical abstractions beyond the source examples, and Elixir code in this notebook are newly authored for this remaster. Descriptions of the original author's long-term predictions reflect the 2013 source, not established outcomes. No figures or code were copied from the source PDF.*

@@ -1,0 +1,517 @@
+# Chapter 0. Neuroevolution through Elixir
+
+## Cover
+
+**A Livebook remaster**
+
+### Part 0: Cover and Table of Contents
+
+*Build neural agents. Evolve their networks. Study adaptation.*
+
+Based on **Gene I. Sher's** *Handbook of Neuroevolution Through Erlang*
+(Springer, 2013).
+
+This series rebuilds the book as Elixir notebooks. It follows the original
+progression from neural networks and evolution to a working platform,
+controlled experiments, and applications.
+
+The original work is Sher's. The concise explanations, Elixir implementations,
+and notebook organization are being developed for this remaster.
+
+## Reading Guide
+
+Each supplied chapter becomes one `.livemd` notebook. Explanations stay simple,
+clear, and concise. Each idea uses the form that makes it easiest to understand.
+
+| Form                    | Purpose                                                     |
+| ----------------------- | ----------------------------------------------------------- |
+| Prose                   | Explain meaning, assumptions, and intuition.                |
+| Mathematical expression | Define quantities, relationships, and objectives precisely. |
+| Elixir source code      | Implement an idea and make it executable.                   |
+| Table                   | Compare alternatives or map concepts to implementations.    |
+| Figure                  | Show structure, behavior, or experimental results.          |
+
+Read the chapters in order. Use Livebook's **Outline** to move between the
+sections of this notebook.
+
+**Numbering.** Chapter and section numbers follow the original book. Part 0 is
+new front matter for this remaster. Chapter 1 remains before Part I.
+
+**Titles.** The headings below are concise adaptations. Implementation headings
+describe planned Elixir equivalents; identifiers from the source are retained
+where they help cross-reference the original. Details will be checked against
+each chapter PDF as it is remastered.
+
+**Pages.** Every source page is a printed page in the 2013 book, not a page in
+this notebook or the uploaded PDF.
+
+**This notebook.** Part 0 contains the cover and contents only. It has no
+executable cells, package dependencies, or external assets.
+
+## Chapter Map
+
+The detailed contents preserve all 20 chapters and all 258 numbered sections
+and subsections. Chapter aims are short editorial summaries of the source
+contents.
+
+| Part    | Chapter | Remastered title                    | Source page |
+| ------- | ------: | ----------------------------------- | ----------: |
+| Opening | 1       | Why Neuroevolution?                 | 1           |
+| I       | 2       | Neural Networks                     | 43          |
+| I       | 3       | Evolutionary Computation            | 81          |
+| I       | 4       | Neuroevolution                      | 105         |
+| I       | 5       | Elixir and the BEAM                 | 143         |
+| II      | 6       | Build a Feedforward Neural Network  | 153         |
+| II      | 7       | Train with Stochastic Hill Climbing | 187         |
+| II      | 8       | Build a Neuroevolution Platform     | 229         |
+| II      | 9       | Test the Neuroevolution Platform    | 347         |
+| III     | 10      | DXNN: A Case Study                  | 399         |
+| IV      | 11      | Modularize the Platform             | 447         |
+| IV      | 12      | Track Evolutionary Statistics       | 527         |
+| IV      | 13      | Build a Benchmark Runner            | 547         |
+| IV      | 14      | Pole Balancing and T-Maze           | 573         |
+| IV      | 15      | Neural Plasticity                   | 609         |
+| IV      | 16      | Substrate Encoding                  | 661         |
+| IV      | 17      | Substrate Plasticity                | 735         |
+| V       | 18      | Artificial Life in Flatland         | 755         |
+| V       | 19      | Evolve Currency-Trading Agents      | 785         |
+| VI      | 20      | Conclusions and Next Steps          | 829         |
+
+## Opening chapter
+
+### Chapter 1: Why Neuroevolution?
+
+**Aim:** Identify the motivations, applications, and central questions of neuroevolution.
+
+| Section | Topic                                          | Source page |
+| ------- | ---------------------------------------------- | ----------: |
+| **1.1** | **Motivations**                                | 2           |
+| **1.2** | **Applications**                               | 5           |
+| 1.2.1   | Robotics                                       | 5           |
+| 1.2.2   | Financial markets                              | 10          |
+| 1.2.3   | Artificial life                                | 14          |
+| 1.2.4   | Image analysis and computer vision             | 18          |
+| 1.2.5   | Data compression                               | 19          |
+| 1.2.6   | Games and entertainment                        | 21          |
+| 1.2.7   | Cyber warfare                                  | 22          |
+| 1.2.8   | Circuit design and optimization                | 26          |
+| 1.2.9   | Shape and structure optimization               | 30          |
+| 1.2.10  | Computational intelligence and the singularity | 34          |
+| **1.3** | **An overview of neuroevolution**              | 34          |
+| **1.4** | **The long-term goal**                         | 37          |
+| **1.5** | **References**                                 | 38          |
+
+## Part I: Foundations
+
+### Chapter 2: Neural Networks
+
+**Aim:** Connect neurons, network structure, recurrence, and learning rules.
+
+| Section | Topic                                    | Source page |
+| ------- | ---------------------------------------- | ----------: |
+| **2.1** | **Biological neural networks**           | 45          |
+| **2.2** | **Artificial neural networks**           | 51          |
+| 2.2.1   | Inside an artificial neuron              | 54          |
+| **2.3** | **Networks and complete neural systems** | 57          |
+| 2.3.1   | Recurrent networks and memory            | 59          |
+| 2.3.2   | A complete neural system                 | 60          |
+| **2.4** | **Learning and training**                | 61          |
+| **2.5** | **Supervised learning**                  | 63          |
+| **2.6** | **Unsupervised learning**                | 66          |
+| 2.6.1   | Hebbian learning                         | 67          |
+| 2.6.2   | Neuromodulation                          | 70          |
+| 2.6.3   | Competitive learning                     | 73          |
+| 2.6.4   | Self-organizing maps                     | 74          |
+| 2.6.5   | Combining the ideas                      | 76          |
+| **2.7** | **Summary**                              | 78          |
+| **2.8** | **References**                           | 78          |
+
+### Chapter 3: Evolutionary Computation
+
+**Aim:** Express a problem through representations, variation, evaluation, and selection.
+
+| Section | Topic                                      | Source page |
+| ------- | ------------------------------------------ | ----------: |
+| **3.1** | **Evolution**                              | 81          |
+| **3.2** | **The essentials of biological evolution** | 85          |
+| **3.3** | **Formulate an evolutionary problem**      | 88          |
+| **3.4** | **Families of evolutionary algorithms**    | 93          |
+| 3.4.1   | Genetic algorithms                         | 94          |
+| 3.4.2   | Genetic programming                        | 96          |
+| 3.4.3   | Evolution strategies                       | 97          |
+| 3.4.4   | Evolutionary programming                   | 98          |
+| **3.5** | **Memetic computing**                      | 98          |
+| **3.6** | **How the approaches relate**              | 102         |
+| **3.7** | **References**                             | 103         |
+
+### Chapter 4: Neuroevolution
+
+**Aim:** Relate neural genotypes, phenotypes, mutation, and evolutionary search.
+
+| Section | Topic                                               | Source page |
+| ------- | --------------------------------------------------- | ----------: |
+| **4.1** | **Neural encoding and mutation**                    | 106         |
+| 4.1.1   | Mutation operators                                  | 106         |
+| 4.1.2   | Genotype encoding                                   | 108         |
+| 4.1.3   | The neural phenotype                                | 113         |
+| **4.2** | **Neuroevolution with genetic algorithms**          | 118         |
+| 4.2.1   | Example 1: Evolve XOR                               | 118         |
+| 4.2.2   | Example 2: Evolve a pole-balancing controller       | 123         |
+| 4.2.3   | Example 3: Toward evolved intelligence              | 127         |
+| **4.3** | **Neuroevolution with memetic algorithms**          | 135         |
+| **4.4** | **Neural networks as graph-based genetic programs** | 138         |
+| **4.5** | **References**                                      | 140         |
+
+### Chapter 5: Elixir and the BEAM
+
+**Aim:** Map neural systems onto processes, messages, and fault-tolerant runtime structures.
+
+| Section | Topic                                        | Source page |
+| ------- | -------------------------------------------- | ----------: |
+| **5.1** | **Required language features**               | 144         |
+| **5.2** | **From telecom networks to neural networks** | 146         |
+| **5.3** | **Map neural networks to BEAM processes**    | 147         |
+| **5.4** | **Robustness and fault tolerance**           | 149         |
+| **5.5** | **Prior experience and the path ahead**      | 149         |
+| **5.6** | **References**                               | 150         |
+
+## Part II: Building a Neuroevolution System
+
+### Chapter 6: Build a Feedforward Neural Network
+
+**Aim:** Implement neurons, network genotypes, and genotype-to-phenotype construction.
+
+| Section | Topic                              | Source page |
+| ------- | ---------------------------------- | ----------: |
+| **6.1** | **Simulate a neuron**              | 155         |
+| **6.2** | **Build a one-neuron network**     | 158         |
+| **6.3** | **Plan the system architecture**   | 162         |
+| **6.4** | **Represent the genotype**         | 166         |
+| **6.5** | **Build the genotype constructor** | 168         |
+| **6.6** | **Map genotype to phenotype**      | 174         |
+| **6.7** | **Summary**                        | 184         |
+
+### Chapter 7: Train with Stochastic Hill Climbing
+
+**Aim:** Connect an agent to an environment and optimize its weights through stochastic search.
+
+| Section | Topic                                                          | Source page |
+| ------- | -------------------------------------------------------------- | ----------: |
+| **7.1** | **Stochastic hill climbing**                                   | 188         |
+| 7.1.1   | Evolutionary algorithms and hill climbing with random restarts | 191         |
+| **7.2** | **The trainer**                                                | 194         |
+| **7.3** | **The exoself**                                                | 195         |
+| **7.4** | **The scape**                                                  | 197         |
+| **7.5** | **Scapes, sensors, actuators, morphologies, and fitness**      | 199         |
+| **7.6** | **Extend the architecture**                                    | 202         |
+| 7.6.1   | Update the genotype module                                     | 203         |
+| 7.6.2   | Update the morphology module                                   | 204         |
+| 7.6.3   | Build the trainer module                                       | 205         |
+| 7.6.4   | Update the exoself module                                      | 207         |
+| 7.6.5   | Build the scape module                                         | 210         |
+| 7.6.6   | Update the cortex module                                       | 213         |
+| 7.6.7   | Update the neuron module                                       | 214         |
+| 7.6.8   | Update the sensor module                                       | 218         |
+| 7.6.9   | Update the actuator module                                     | 219         |
+| **7.7** | **Compile and run XOR**                                        | 219         |
+| **7.8** | **Add the benchmarker**                                        | 223         |
+| **7.9** | **Summary**                                                    | 226         |
+
+### Chapter 8: Build a Neuroevolution Platform
+
+**Aim:** Add populations, persistent genotypes, and mutations to evolve network structure.
+
+| Section | Topic                                          | Source page |
+| ------- | ---------------------------------------------- | ----------: |
+| **8.1** | **The expanded architecture**                  | 231         |
+| **8.2** | **New data structures**                        | 233         |
+| **8.3** | **Build the polis module**                     | 236         |
+| **8.4** | **Update the genotype module**                 | 242         |
+| 8.4.1   | Move from ETS to Mnesia                        | 243         |
+| 8.4.2   | A neural adaptive agent                        | 243         |
+| 8.4.3   | Neuron identifiers and recurrent connections   | 244         |
+| 8.4.4   | Seed computational intelligence                | 247         |
+| 8.4.5   | Constraints                                    | 248         |
+| 8.4.6   | The updated genotype module                    | 249         |
+| **8.5** | **Build the genotype mutator**                 | 262         |
+| 8.5.1   | Create and remove connections                  | 266         |
+| 8.5.2   | Mutate weights: `mutate_weights`               | 274         |
+| 8.5.3   | Add and remove bias: `add_bias`, `remove_bias` | 276         |
+| 8.5.4   | Mutate activation functions: `mutate_af`       | 278         |
+| 8.5.5   | Add output links: `add_outlink`                | 279         |
+| 8.5.6   | Add input links: `add_inlink`                  | 281         |
+| 8.5.7   | Add sensor links: `add_sensorlink`             | 284         |
+| 8.5.8   | Add actuator links: `add_actuatorlink`         | 285         |
+| 8.5.9   | Add a neuron: `add_neuron`                     | 287         |
+| 8.5.10  | Splice an output connection: `outsplice`       | 289         |
+| 8.5.11  | Add a sensor: `add_sensor`                     | 294         |
+| 8.5.12  | Add an actuator: `add_actuator`                | 296         |
+| 8.5.13  | Complete the mutation design                   | 298         |
+| 8.5.14  | Implement the genotype mutator                 | 301         |
+| 8.5.15  | Build the population monitor                   | 309         |
+| 8.5.16  | Update the exoself module                      | 327         |
+| 8.5.17  | Update the neuron module                       | 337         |
+| **8.6** | **Summary**                                    | 345         |
+| **8.7** | **References**                                 | 346         |
+
+### Chapter 9: Test the Neuroevolution Platform
+
+**Aim:** Check mutation operators and diagnose evolutionary behavior with XOR.
+
+| Section | Topic                                             | Source page |
+| ------- | ------------------------------------------------- | ----------: |
+| **9.1** | **Test mutation operators**                       | 347         |
+| **9.2** | **Test evolution on XOR**                         | 369         |
+| 9.2.1   | The `mutate_af` error                             | 375         |
+| 9.2.2   | Inconsistent neuron identifiers in `evo_hist`     | 378         |
+| 9.2.3   | Multiple actuators of the same type               | 379         |
+| 9.2.4   | Generalized sensors and actuators in fingerprints | 382         |
+| 9.2.5   | Unexpected topology in the fittest network        | 383         |
+| **9.3** | **Retest the platform**                           | 388         |
+| **9.4** | **Summary**                                       | 395         |
+
+## Part III: DXNN Case Study
+
+### Chapter 10: DXNN: A Case Study
+
+**Aim:** Examine memetic optimization, evolutionary schedules, and direct versus indirect encoding.
+
+| Section  | Topic                                              | Source page |
+| -------- | -------------------------------------------------- | ----------: |
+| **10.1** | **Why combine evolution and weight tuning?**       | 399         |
+| **10.2** | **DXNN encoding and architecture**                 | 402         |
+| **10.3** | **Generational evolution**                         | 405         |
+| 10.3.1   | Step 1: Initialization                             | 407         |
+| 10.3.2   | Step 4: Parameter tuning                           | 409         |
+| 10.3.3   | Steps 8 and 13: Selection and offspring allocation | 413         |
+| 10.3.4   | Step 18: Topological mutation                      | 415         |
+| **10.4** | **Steady-state evolution**                         | 417         |
+| **10.5** | **Direct and indirect encoding**                   | 421         |
+| 10.5.1   | Neural substrates                                  | 423         |
+| 10.5.2   | Genotype representation                            | 427         |
+| 10.5.3   | Substrate phenotype representation                 | 435         |
+| **10.6** | **The DXNN group and research repository**         | 439         |
+| **10.7** | **Research projects in 2013**                      | 440         |
+| 10.7.1   | Cyber warfare                                      | 440         |
+| 10.7.2   | Coevolving unmanned aerial vehicle maneuvers       | 441         |
+| 10.7.3   | Evolving and optimizing CPU architectures          | 442         |
+| **10.8** | **Summary and future work**                        | 443         |
+| **10.9** | **References**                                     | 443         |
+
+## Part IV: Advanced Neuroevolution
+
+### Chapter 11: Modularize the Platform
+
+**Aim:** Separate selection, fitness processing, signal aggregation, plasticity, and evolution.
+
+| Section  | Topic                                    | Source page |
+| -------- | ---------------------------------------- | ----------: |
+| **11.1** | **What can be separated?**               | 448         |
+| **11.2** | **Update the genotype representation**   | 451         |
+| 11.2.1   | Sensor and actuator data structures      | 452         |
+| 11.2.2   | Neuron data structure                    | 453         |
+| 11.2.3   | Agent data structure                     | 454         |
+| 11.2.4   | Population data structure                | 456         |
+| 11.2.5   | Constraint data structure                | 457         |
+| **11.3** | **Update shared Elixir data structures** | 460         |
+| **11.4** | **Update the modules**                   | 465         |
+| 11.4.1   | Update the genotype module               | 465         |
+| 11.4.2   | Update the genome mutator                | 468         |
+| 11.4.3   | Update the population monitor            | 478         |
+| 11.4.4   | Build the selection algorithm module     | 485         |
+| 11.4.5   | Build the fitness postprocessor          | 489         |
+| 11.4.6   | Build the steady-state evolutionary loop | 490         |
+| 11.4.7   | Update the exoself module                | 495         |
+| 11.4.8   | Update the neuron module                 | 508         |
+| 11.4.9   | Build the signal aggregator              | 514         |
+| 11.4.10  | Build the plasticity module              | 516         |
+| **11.5** | **Compile and test**                     | 518         |
+| **11.6** | **Summary and discussion**               | 525         |
+| **11.7** | **References**                           | 526         |
+
+### Chapter 12: Track Evolutionary Statistics
+
+**Aim:** Record population traces and network summaries to understand evolutionary runs.
+
+| Section  | Topic                                | Source page |
+| -------- | ------------------------------------ | ----------: |
+| **12.1** | **Required system additions**        | 528         |
+| **12.2** | **Trace format**                     | 530         |
+| **12.3** | **Implementation**                   | 532         |
+| 12.3.1   | Update shared Elixir data structures | 532         |
+| 12.3.2   | Summarize network topology           | 533         |
+| 12.3.3   | Handle asynchronous trace updates    | 535         |
+| 12.3.4   | Update the exoself module            | 541         |
+| **12.4** | **Compile and test**                 | 542         |
+| **12.5** | **Summary and discussion**           | 545         |
+
+### Chapter 13: Build a Benchmark Runner
+
+**Aim:** Organize repeated experiments and collect comparable benchmark results.
+
+| Section  | Topic                             | Source page |
+| -------- | --------------------------------- | ----------: |
+| **13.1** | **Benchmarker architecture**      | 548         |
+| **13.2** | **Add benchmark data structures** | 549         |
+| **13.3** | **Update the population monitor** | 555         |
+| **13.4** | **Implement the benchmarker**     | 557         |
+| **13.5** | **Compile and test**              | 564         |
+| **13.6** | **Summary**                       | 570         |
+| **13.7** | **References**                    | 571         |
+
+### Chapter 14: Pole Balancing and T-Maze
+
+**Aim:** Evaluate agents in control and memory tasks beyond XOR.
+
+| Section  | Topic                                   | Source page |
+| -------- | --------------------------------------- | ----------: |
+| **14.1** | **Pole-balancing simulation**           | 573         |
+| 14.1.1   | Implement the pole-balancing scape      | 577         |
+| 14.1.2   | Implement the pole-balancing morphology | 581         |
+| 14.1.3   | Benchmark results                       | 583         |
+| **14.2** | **T-maze simulation**                   | 590         |
+| 14.2.1   | Implement the T-maze                    | 598         |
+| 14.2.2   | Benchmark results                       | 604         |
+| **14.3** | **Summary and discussion**              | 607         |
+| **14.4** | **References**                          | 608         |
+
+### Chapter 15: Neural Plasticity
+
+**Aim:** Implement Hebbian learning, Oja's rule, neuromodulation, and evolving plasticity parameters.
+
+| Section  | Topic                                         | Source page |
+| -------- | --------------------------------------------- | ----------: |
+| **15.1** | **Hebbian learning**                          | 610         |
+| 15.1.1   | Update the `input_idps` and `pf` formats      | 613         |
+| 15.1.2   | Implement the Hebbian rule                    | 617         |
+| **15.2** | **Oja's rule**                                | 620         |
+| 15.2.1   | Implement Oja's rule                          | 621         |
+| **15.3** | **Neuromodulation**                           | 623         |
+| 15.3.1   | Neuromodulatory architecture                  | 626         |
+| 15.3.2   | Implement `self_modulation` rules             | 631         |
+| 15.3.3   | Implement `input_idps_modulation` plasticity  | 635         |
+| **15.4** | **Mutate plasticity parameters**              | 641         |
+| 15.4.1   | Mutate weight parameters                      | 642         |
+| 15.4.2   | Mutate neuron parameters                      | 643         |
+| 15.4.3   | Combine weight and neuron parameter mutations | 644         |
+| 15.4.4   | Update the genome mutator                     | 645         |
+| **15.5** | **Tune networks with plastic neurons**        | 650         |
+| **15.6** | **Compile and test**                          | 656         |
+| **15.7** | **Summary and discussion**                    | 658         |
+| **15.8** | **References**                                | 659         |
+
+### Chapter 16: Substrate Encoding
+
+**Aim:** Construct neural substrates through indirect encoding and test their behavior.
+
+| Section   | Topic                                 | Source page |
+| --------- | ------------------------------------- | ----------: |
+| **16.1**  | **Overview of substrate encoding**    | 662         |
+| **16.2**  | **Update the system architecture**    | 669         |
+| **16.3**  | **The substrate-encoded genotype**    | 672         |
+| **16.4**  | **The substrate-encoded phenotype**   | 679         |
+| **16.5**  | **Implement substrate CPPs and CEPs** | 686         |
+| 16.5.1    | Implement the `substrate_cpp` module  | 691         |
+| 16.5.2    | Implement the `substrate_cep` module  | 694         |
+| **16.6**  | **Update the genotype module**        | 696         |
+| **16.7**  | **Update the exoself module**         | 701         |
+| **16.8**  | **Implement the substrate module**    | 705         |
+| **16.9**  | **Update the genome mutator**         | 724         |
+| **16.10** | **Implement `add_cpp` and `add_cep`** | 726         |
+| **16.11** | **Test substrate encoding**           | 728         |
+| **16.12** | **Summary and discussion**            | 733         |
+| **16.13** | **References**                        | 733         |
+
+### Chapter 17: Substrate Plasticity
+
+**Aim:** Add and benchmark learning rules within indirectly encoded neural substrates.
+
+| Section  | Topic                                                  | Source page |
+| -------- | ------------------------------------------------------ | ----------: |
+| **17.1** | **Update the architecture**                            | 736         |
+| **17.2** | **Implement the `abcn` learning rule**                 | 737         |
+| 17.2.1   | Update the substrate module                            | 737         |
+| 17.2.2   | Update the morphology module                           | 741         |
+| 17.2.3   | Update the `substrate_cpp` and `substrate_cep` modules | 743         |
+| 17.2.4   | Benchmark substrate plasticity                         | 745         |
+| **17.3** | **Implement the `iterative` learning rule**            | 746         |
+| 17.3.1   | Benchmark iterative substrate plasticity               | 750         |
+| **17.4** | **Discussion**                                         | 752         |
+
+## Part V: Applications
+
+### Chapter 18: Artificial Life in Flatland
+
+**Aim:** Evolve agents in food-gathering and predator-prey simulations.
+
+| Section  | Topic                                           | Source page |
+| -------- | ----------------------------------------------- | ----------: |
+| **18.1** | **Flatland: Environment and organisms**         | 755         |
+| **18.2** | **The scape and fitness function**              | 756         |
+| 18.2.1   | Public scapes, the polis interface, and sectors | 759         |
+| 18.2.2   | The Flatland interface                          | 761         |
+| **18.3** | **Encode Flatland avatars**                     | 762         |
+| **18.4** | **Update morphologies, sensors, and actuators** | 763         |
+| **18.5** | **Update the exoself module**                   | 766         |
+| **18.6** | **Simulations and results**                     | 768         |
+| 18.6.1   | Food gathering                                  | 769         |
+| 18.6.2   | Food gathering with hazards                     | 773         |
+| 18.6.3   | Predators and prey                              | 776         |
+| **18.7** | **Discussion**                                  | 781         |
+| **18.8** | **Summary**                                     | 782         |
+| **18.9** | **References**                                  | 783         |
+
+### Chapter 19: Evolve Currency-Trading Agents
+
+**Aim:** Build a trading environment and test agents for generalization.
+
+| Section   | Topic                               | Source page |
+| --------- | ----------------------------------- | ----------: |
+| **19.1**  | **Introduction to forex**           | 786         |
+| **19.2**  | **Trading objectives**              | 788         |
+| **19.3**  | **The forex simulator**             | 794         |
+| **19.4**  | **Implement the forex simulator**   | 797         |
+| **19.5**  | **Implement sensors and actuators** | 806         |
+| **19.6**  | **Test generalization**             | 809         |
+| **19.7**  | **Benchmarks and results**          | 815         |
+| 19.7.1    | Run the benchmark                   | 817         |
+| **19.8**  | **Discussion**                      | 822         |
+| **19.9**  | **Summary**                         | 823         |
+| **19.10** | **References**                      | 824         |
+
+## Part VI: Conclusions
+
+### Chapter 20: Conclusions and Next Steps
+
+**Aim:** Consolidate the platform's ideas and identify directions for further work.
+
+| Section  | Topic          | Source page |
+| -------- | -------------- | ----------: |
+| **20.1** | **References** | 830         |
+
+## Back Matter
+
+| Item          | Source page |
+| ------------- | ----------: |
+| Abbreviations | 831         |
+
+## Source and Edition Notes
+
+**Original book:** Gene I. Sher. *Handbook of Neuroevolution Through Erlang*.
+Springer, 2013. [DOI: 10.1007/978-1-4614-4463-3](https://doi.org/10.1007/978-1-4614-4463-3).
+
+| Bibliographic detail     | Original edition                                             |
+| ------------------------ | ------------------------------------------------------------ |
+| Print ISBN               | 978-1-4614-4462-6                                            |
+| eBook ISBN               | 978-1-4614-4463-3                                            |
+| Foreword                 | Joe Armstrong                                                |
+| Source for this notebook | Supplied front-matter PDF; contents on printed pages xiii-xx |
+
+The six numbered parts retain the original chapter grouping, with shorter
+part titles where useful. Section 10.7 describes research projects presented
+in the 2013 edition.
+
+**Notebook format:** [Live Markdown specification](https://hex.pm/packages/livebook/0.19.10/files/lib/livebook/live_markdown.ex).
+**Navigation and Markdown:** [Official Livebook introduction](https://github.com/livebook-dev/livebook/blob/main/lib/livebook/notebook/learn/intro_to_livebook.livemd).
+
+**Next:** Chapter 1, *Why Neuroevolution?*
