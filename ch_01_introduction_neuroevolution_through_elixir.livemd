@@ -223,13 +223,12 @@ Sher's historical discussion includes competing offensive and defensive software
 For a safe defensive example, a simulated agent could classify events as benign or suspicious, with:
 
 $$
-F_{\mathrm{defense}}
-= aN_{\mathrm{threats\ detected}}
-
-* bN_{\mathrm{benign\ allowed}}
-
-* cN_{\mathrm{false\ alarms}}.
-  $$
+\begin{aligned}
+F_{\mathrm{defense}} &= aN_{\text{threats detected}} \\
+&\quad + bN_{\text{benign allowed}} \\
+&\quad - cN_{\text{false alarms}}.
+\end{aligned}
+$$
 
 The simulation can deliberately introduce new benign and suspicious patterns to test whether the defender generalizes. The learning environment should remain isolated from real networks.
 
