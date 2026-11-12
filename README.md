@@ -10,10 +10,10 @@
 - Antithesis: Introduce Numerical Elixir (Nx), and convert the actor model to tensor parallelism
 - Synthesis: Fuse the strengths of pure Elixir and Nx to enable neuroevolution that is both flexible and computationally efficient
 
-## Generation-Evaluation-Selection
+## Generate-Evaluate-Select
 
 > This is a conceptual framework of evolution we use to organize source code:
 
 - Generation: mutation, cross-over, and other mechanisms of creating diversity
-- Evaluation: fitness, reward, energy cost, or other methods and indicators to measure value
+- Evaluation: fitness, reward, novelty, energy cost, or other indicators to measure value
 - Selection: survival, reproduction, archiving, and other constraints
