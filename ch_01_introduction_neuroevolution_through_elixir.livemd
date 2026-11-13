@@ -314,7 +314,27 @@ Our fitness is $1-\mathrm{MSE}$ over the four possible Boolean inputs. Higher is
 
 ```elixir
 # One self-contained module for the introductory experiment.
-defmodule Neuroevo.Ch01 do
+defmodule Chapter01 do
+  # A genotype contains three parameters: [w1, w2, bias].
+  @type weights :: [float()]
+  @type inputs :: {float(), float()}
+  @type behavior_pattern :: [0 | 1]
+  @type scored_candidate :: {float(), weights()}
+
+  @type history_entry :: %{
+          generation: non_neg_integer(),
+          best_fitness: float(),
+          archived_behaviors: non_neg_integer()
+        }
+
+  @type result :: %{
+          best_fitness: float(),
+          best_weights: weights(),
+          behavior: behavior_pattern(),
+          history: [history_entry()],
+          archive_size: non_neg_integer()
+        }
+
   # Global variable: truth table
   @cases [
     {{0.0, 0.0}, 0.0},
@@ -324,12 +344,15 @@ defmodule Neuroevo.Ch01 do
   ]
 
   # A single artificial neuron: two weights and one bias.
+  @spec predict(weights(), inputs()) :: float()
   def predict([w1, w2, bias], {x1, x2}) do
     z = w1 * x1 + w2 * x2 + bias # Weighted sum with bias
     1.0 / (1.0 + :math.exp(-z)) # Activation function: Sigmoid
   end
 
   # EVALUATION: smooth fitness, unlike all-or-nothing accuracy.
+  # Fitness = how accurately the neuron predicts
+  @spec fitness(weights()) :: float()
   def fitness(weights) do
     squared_errors =
       Enum.map(@cases, fn {inputs, target} ->
@@ -341,34 +364,43 @@ defmodule Neuroevo.Ch01 do
     1.0 - mse
   end
 
+  # Behavior = actual decisions made by the neuron
+  @spec behavior(weights()) :: behavior_pattern()
   def behavior(weights) do
     Enum.map(@cases, fn {inputs, _target} ->
       if predict(weights, inputs) >= 0.5, do: 1, else: 0
     end)
   end
 
+  # Create a random genotype
+  @spec random_weights() :: weights()
   def random_weights do
+    # for comprehension creates a list of 3 elements, each ranging from -3 to 3
     for _ <- 1..3, do: 6.0 * :rand.uniform() - 3.0
   end
 
   # GENERATION: small random changes in all three parameters.
+  @spec mutate(weights(), number()) :: weights()
   def mutate(weights, sigma) do
     Enum.map(weights, fn weight -> weight + sigma * :rand.normal() end)
   end
 
   # EVALUATION: return {fitness, genotype} for each candidate.
+  @spec evaluate([weights()]) :: [scored_candidate()]
   def evaluate(population) do
     Enum.map(population, fn weights -> {fitness(weights), weights} end)
   end
 
   # SELECTION: keep a small pool of the best-scoring parents.
+  @spec select([scored_candidate()], non_neg_integer()) :: [scored_candidate()]
   def select(scored, count) do
     scored
     |> Enum.sort_by(fn {score, _weights} -> score end, :desc)
     |> Enum.take(count)
   end
 
-  # GENERATION: retain the champion, mutate sampled parents.
+  # GENERATION: retain the champion (elitism), mutate sampled parents.
+  @spec generate([scored_candidate()], pos_integer(), number()) :: [weights()]
   def generate(parents, population_size, sigma) do
     {_score, champion} = hd(parents)
 
@@ -381,6 +413,10 @@ defmodule Neuroevo.Ch01 do
     [champion | children]
   end
 
+  @spec run() :: result()
+  @spec run(non_neg_integer()) :: result()
+  @spec run(non_neg_integer(), pos_integer()) :: result()
+  @spec run(non_neg_integer(), pos_integer(), pos_integer()) :: result()
   def run(generations \\ 60, population_size \\ 32, parent_count \\ 8) do
     # Deterministic pseudo-random sequence for repeatable teaching runs.
     :rand.seed(:exsss, {11, 22, 33})
@@ -434,7 +470,7 @@ end
 Run the experiment:
 
 ```elixir
-result = Neuroevo.Ch01.run()
+result = Chapter01.run()
 
 IO.puts("Generation | Best fitness | Behaviors discovered")
 IO.puts("-----------+--------------+---------------------")
@@ -461,7 +497,7 @@ Observe the final neuron's numerical outputs:
 
 ```elixir
 for inputs <- [{0.0, 0.0}, {0.0, 1.0}, {1.0, 0.0}, {1.0, 1.0}] do
-  %{inputs: inputs, probability: Neuroevo.Ch01.predict(result.best_weights, inputs)}
+  %{inputs: inputs, probability: Chapter01.predict(result.best_weights, inputs)}
 end
 ```
 
@@ -478,11 +514,11 @@ end
 Evaluating different candidates is often independent. Elixir can distribute those evaluations across BEAM processes with `Task.async_stream/3`:
 
 ```elixir
-sample_population = for _ <- 1..12, do: Neuroevo.Ch01.random_weights()
+sample_population = for _ <- 1..12, do: Chapter01.random_weights()
 
 parallel_scores =
   sample_population
-  |> Task.async_stream(&Neuroevo.Ch01.fitness/1,
+  |> Task.async_stream(&Chapter01.fitness/1,
     max_concurrency: System.schedulers_online(),
     ordered: true,
     timeout: 30_000
