@@ -1,0 +1,2442 @@
+# Chapter 7. Adding the Stochastic Hill-Climber Learning Algorithm
+
+```elixir
+Mix.install([
+  {:nx, "1.0.0"},
+  {:kino, "0.19.1"},
+  {:kino_vega_lite, "0.1.13"}
+])
+```
+
+## Reader's guide
+
+**Neuroevolution through Elixir**  
+Part II - Neuroevolution: Taking the First Step
+
+**The central idea:** keep the best weights, propose a perturbation, evaluate it,
+and either accept it or restore the previous weights. When a run stops improving,
+start again without losing the best network found across runs.
+
+This notebook remasters Gene I. Sher's *Handbook of Neuroevolution Through Erlang*
+(2013), Chapter 7, printed pp. 187-227, referred to as **[S]**. It retains Sections
+**7.1-7.9**, including **7.1.1** and **7.6.1-7.6.9**. Page references below are
+printed page numbers, not PDF indices.
+
+Sher supplies the augmented stochastic hill climber, trainer, exoself,
+private/public scape distinction, XOR interface, and repeated-run benchmark.
+**All Elixir/Nx code, the three-way architecture comparison, recorded random tapes,
+new diagrams, and executable checks are remaster implementations.** Corrections
+and engineering choices are identified rather than silently attributed to Sher.
+
+### Three implementations, one optimization contract
+
+| Stage | Implementation | What remains explicit |
+| --- | --- | --- |
+| Thesis | Scalar Elixir actors: sensor, neurons, actuator, cortex, scape; trainer and exoself tasks | Messages, episode boundaries, weight backup and restoration |
+| Antithesis | Actor-free Nx numerical core, including the complete random-restart search loop | Tensor state, masks, acceptance, patience, archive, termination |
+| Synthesis | Trainer/exoself actors controlling a network-level Nx actor | Coarse process ownership with tensor inference and mutation |
+
+The synthesis is **not** another process around every tensor scalar. One worker
+owns the complete network's tensor parameters. All three versions use the same
+parameter order, recorded random draws, scoring rule, and stopping policy.
+
+### Chapter map
+
+| Section | Question | Main artifact |
+| --- | --- | --- |
+| 7.1 | How does augmented hill climbing work? | Two patience counters and a perturbation law |
+| 7.1.1 | How does this differ from a population-based EA? | Comparison with our GES framework |
+| 7.2-7.3 | Who manages restarts and local tuning? | Trainer and exoself |
+| 7.4-7.5 | How does a task communicate observations, fitness, and completion? | Scape contract and message sequence |
+| 7.6 | How are the Chapter 6 components extended? | Actor, tensor, and hybrid implementations |
+| 7.7 | Does the system work on XOR? | Matched experiments, rollback tests, checkpoint export |
+| 7.8 | How do we summarize repeated searches? | Per-run data and population-standard-deviation summaries |
+| 7.9 | What has been built, and what comes next? | Summary, exercises, and adaptation notes |
+
+### Running the notebook
+
+Evaluate the setup cell, then the remaining cells in order. No earlier notebook
+or external dataset is required. The portable Chapter 6 genotype and its validator
+are included under the **Chapter07** namespace. The new morphology replaces
+`rng`/`pts` with `xor_get_input`/`xor_send_output` and a shared private `xor_sim`.
+`Morphology.upgrade/1` adapts a compatible Chapter 6 genotype without changing its
+weights or connections.
+
+The dependency pins are inherited from Chapter 6. The default execution target is
+**Nx.BinaryBackend with Nx.Defn.Evaluator**, using **f64** tensors to compare with
+ordinary Elixir floating-point arithmetic. No GPU or native compiler is required.
+Installation needs network access or a prepared package cache. Restart the runtime
+before changing dependencies. [D1, D2]
+
+Every handwritten named function has an `@spec`, including callbacks and numerical
+transforms. Explanatory tables are ordinary Markdown. **Computed data tables only**
+have Interactive, Markdown, and CSV tabs. Download callbacks return binaries.
+
+The examples have finite evaluation budgets. Reaching a budget is a valid result,
+not a failed notebook. Do not replace it with an assertion that every stochastic
+run must solve XOR. The fault-injection check intentionally kills one neuron and
+may produce a supervisor diagnostic.
+
+**Validation status:** independent Python/NumPy checks cover the numerical rules
+and equivalent nested/flat search state machines. Static checks cover the notebook
+and specification coverage. Elixir/BEAM, Nx execution, OTP lifecycle behavior, and
+Livebook visual rendering have **not** been executed in the authoring environment.
+Run the included checks in Livebook before relying on the implementation.
+
+### Shared display and scalar helpers
+
+`tbl_` identifies data rows and `fig_` identifies charts. Actor arithmetic contains
+no Nx operations. A parameter vector always contains each neuron's incoming
+weights followed by its bias, in canonical layer and neuron order.
+
+```elixir
+alias VegaLite, as: Vl
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+```
+
+```elixir
+defmodule Chapter07.Tables do
+  @moduledoc false
+  @type column :: atom() | String.t()
+
+  @spec tabs([map()], [column()], String.t()) :: term()
+  def tabs(rows, columns, filename) do
+    text_csv = csv(rows, columns)
+
+    Kino.Layout.tabs([
+      {"Interactive", Kino.DataTable.new(rows, keys: columns)},
+      {"Markdown", Kino.Markdown.new(markdown(rows, columns))},
+      {"CSV", Kino.Layout.grid([
+        Kino.Markdown.new("```csv\n" <> text_csv <> "\n```"),
+        Kino.Download.new(fn -> text_csv end, filename: filename, label: "Download CSV")
+      ])}
+    ])
+  end
+
+  @spec csv([map()], [column()]) :: String.t()
+  def csv(rows, columns) do
+    records = [columns | Enum.map(rows, fn row -> Enum.map(columns, &Map.fetch!(row, &1)) end)]
+    Enum.map_join(records, "\r\n", fn record ->
+      Enum.map_join(record, ",", fn value ->
+        "\"" <> String.replace(text(value), "\"", "\"\"") <> "\""
+      end)
+    end) <> "\r\n"
+  end
+
+  @spec markdown([map()], [column()]) :: String.t()
+  def markdown(rows, columns) do
+    records = [columns, List.duplicate("---", length(columns)) |
+      Enum.map(rows, fn row -> Enum.map(columns, &Map.fetch!(row, &1)) end)]
+
+    Enum.map_join(records, "\n", fn record ->
+      "| " <> Enum.map_join(record, " | ", &escape/1) <> " |"
+    end)
+  end
+
+  @spec text(term()) :: String.t()
+  defp text(value) when is_binary(value), do: value
+  defp text(value) when is_atom(value) or is_number(value), do: to_string(value)
+  defp text(value), do: inspect(value, limit: :infinity, printable_limit: :infinity)
+
+  @spec escape(term()) :: String.t()
+  defp escape(value) do
+    value |> text() |> String.replace("\\", "\\\\") |> String.replace("|", "\\|")
+    |> String.replace("\r\n", "<br>") |> String.replace("\n", "<br>")
+  end
+end
+
+defmodule Chapter07.Support do
+  @moduledoc false
+
+  @spec check!(boolean(), String.t()) :: map()
+  def check!(true, label), do: %{check: label, result: "PASS"}
+  def check!(false, label), do: raise("Check failed: #{label}")
+
+  @spec max_error(Nx.Tensor.t(), Nx.Tensor.t()) :: number()
+  def max_error(a, b) do
+    unless Nx.shape(a) == Nx.shape(b), do: raise(ArgumentError, "shape mismatch")
+    a |> Nx.subtract(b) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()
+  end
+
+  @spec close?(Nx.Tensor.t(), Nx.Tensor.t(), float()) :: boolean()
+  def close?(a, b, tolerance) do
+    Nx.shape(a) == Nx.shape(b) and
+      (a |> Nx.subtract(b) |> Nx.abs() |> Nx.reduce_max() |> Nx.to_number()) <= tolerance
+  end
+
+  @spec raises_argument?((-> term())) :: boolean()
+  def raises_argument?(fun) do
+    try do
+      fun.()
+      false
+    rescue
+      ArgumentError -> true
+    end
+  end
+end
+
+defmodule Chapter07.Math do
+  @moduledoc "Scalar arithmetic used by the actor baseline; no Nx calls."
+
+  @spec vector!([number()], pos_integer()) :: [number()]
+  def vector!(values, width) do
+    unless is_list(values) and length(values) == width and Enum.all?(values, &is_number/1) do
+      raise ArgumentError, "expected a numerical vector of length #{width}"
+    end
+    values
+  end
+
+  @spec dot([number()], [number()]) :: number()
+  def dot(x, weights) do
+    vector!(x, length(weights))
+    Enum.zip(x, weights) |> Enum.reduce(0.0, fn {a, b}, sum -> sum + a * b end)
+  end
+
+  @spec neuron([number()], [number()], number()) :: float()
+  def neuron(x, weights, bias), do: :math.tanh(dot(x, weights) + bias)
+end
+```
+
+## 7.1 The Learning Method
+
+*Source: [S], pp. 188-191; Fig. 7.1.*
+
+Chapter 6 gave us a functioning network with fixed weights. This chapter adds
+**stochastic hill climbing (SHC)** to one fixed topology. Population management and
+topological mutation still belong to Chapter 8.
+
+Let $\theta$ be the accepted parameter vector and $F(\theta)$ its fitness. Generate
+one proposal $\theta'$, evaluate it, and retain the proposal only when it improves
+fitness:
+
+$$
+\theta_{k+1}=
+\begin{cases}
+\theta'_k,&F(\theta'_k)>F(\theta_k),\\
+\theta_k,&\text{otherwise}.
+\end{cases}
+$$
+
+Our strict comparison follows the source listing: **ties are rejected**. A rejected
+proposal must not become the parent of the next proposal. Restore the accepted
+weights first, or retain them unchanged in the tensor state.
+
+Sher's augmentation uses consecutive failures rather than a fixed total number of
+perturbations. Let $a$ count unsuccessful proposals:
+
+$$
+a' = \begin{cases}0,&\text{proposal improves fitness},\\a+1,&\text{otherwise}.\end{cases}
+$$
+
+Stop this local run when $a$ reaches `local_patience`. The trainer then generates
+fresh random weights and starts another local run. It maintains a separate
+**best-of-all-runs archive**. Its `restart_patience` counts completed or
+budget-terminated local runs that fail to improve that archive.
+
+| Quantity | Meaning | Reset condition |
+| --- | --- | --- |
+| Local accepted weights | Best parameters in the current run | Fresh random start |
+| Local failure counter | Consecutive non-improving perturbations | Strict local improvement |
+| Global champion | Best parameters found across every start | Only overwritten by strict global improvement |
+| Restart failure counter | Consecutive starts that do not improve the global champion | A start produces a better champion |
+| Evaluation counter | Complete four-case XOR evaluations | Never reset inside a trainer invocation |
+
+**Remaster convention:** the seed is evaluated and backed up before perturbation;
+it is not counted as a failed proposal. Both failure counters start at zero.
+An evaluation includes all four XOR cases, even when the parameters were unchanged.
+Stopping after several unsuccessful proposals is a search policy, not a proof of
+local or global optimality.
+
+```mermaid
+flowchart TD
+    A[Fresh random weights] --> B[Evaluate and retain seed]
+    B --> C{Target or budget reached?}
+    C -- No --> D[Perturb accepted weights]
+    D --> E[Evaluate proposal]
+    E --> F{Strictly better?}
+    F -- Yes --> G[Backup proposal; reset local failures]
+    F -- No --> H[Restore accepted weights; increment failures]
+    G --> C
+    H --> I{Local patience exhausted?}
+    I -- No --> C
+    I -- Yes --> J[Compare local best with global champion]
+    C -- Yes --> J
+    J --> K{Trainer stopping condition?}
+    K -- No --> A
+    K -- Yes --> L[Return global champion and statistics]
+```
+
+*Figure R7.1 - The two nested decisions in Sher's Fig. 7.1, with explicit budget
+and archive semantics. New diagram; not a reproduction of the source illustration.*
+
+### Which weights are perturbed?
+
+For $N$ neurons, first select each neuron with probability $1/\sqrt N$. For a
+selected neuron $j$, select each parameter with probability $1/\sqrt{d_j}$, where
+$d_j$ is its number of incoming synaptic weights. Add a uniform perturbation in
+$(-\pi,\pi]$, then clamp to $[-2\pi,2\pi]$:
+
+$$
+\theta'_{j,k} =
+\begin{cases}
+\operatorname{clip}(\theta_{j,k}+\delta_{j,k},-2\pi,2\pi),&m_j q_{j,k}=1,\\
+\theta_{j,k},&m_j q_{j,k}=0.
+\end{cases}
+$$
+
+Here $m_j$ is the neuron gate and $q_{j,k}$ the parameter gate. The **bias is
+eligible for perturbation using the same probability**, but the printed
+`Tot_Weights` calculation counts incoming weights, not the trailing scalar bias
+([S], pp. 217-218). This implementation preserves that detail.
+
+A proposal may change no parameters. We do **not** force a mutation: a no-op is
+still evaluated and counts as an unsuccessful proposal. Changing that policy would
+change the search distribution.
+
+The source suggests making local patience proportional to $\sqrt N$, but does not
+supply a usable multiplier in the displayed exoself listing. We expose it as an
+explicit parameter and use **80** in the main experiment. That is our notebook
+setting, not a recovered source constant.
+
+## 7.1.1 Comparing EA to Random Restart SHC
+
+*Source: [S], pp. 191-194; Fig. 7.2.*
+
+Sher contrasts a population exploring several lineages with a sequential search
+that follows one accepted lineage at a time. His diagrams illustrate possible
+search histories, not a performance guarantee.
+
+| Operation | RR-SHC in this chapter | Population-based EA discussed by Sher |
+| --- | --- | --- |
+| Generation | One perturbed candidate, or a fresh random start | Offspring from selected individuals |
+| Evaluation | Compare a candidate's performance on the task | Measure many individuals |
+| Selection | Accept an improvement; otherwise restore | Choose parents, survivors, or other retained individuals |
+| Memory | One local incumbent plus a global champion | Multiple active lineages and possibly archives |
+| Topology | Fixed during this implementation | Can change through structural mutation |
+
+**Remaster GES connection:** SHC already separates Generation, Evaluation, and
+Selection, but it is not the population-based system promised in Chapter 8.
+Likewise, processing four independent XOR inputs together is numerical batching,
+not a population of evolving networks.
+
+## 7.2 The Trainer
+
+*Source: [S], pp. 194-195 and 205-207; Listing 7.3.*
+
+The trainer owns the **outer loop**. It creates a fresh genotype, asks an exoself
+to tune it, and compares the resulting local best with the global champion.
+The source uses files named `experimental` and `best`. We keep those roles but
+hold the current run and champion explicitly in returned data. Persistence is
+available through ETS and a versioned download; benchmark runs do not overwrite
+one another's `best` file.
+
+Training ends when the fitness target is reached, the evaluation budget is spent,
+or restart patience is exhausted. The original uses the atom `inf` and Erlang term
+ordering to disable some comparisons. This notebook uses explicit finite budgets.
+To disable the fitness target for the displayed XOR scoring rule, a value above
+its $100{,}000$ ceiling, such as `100_001.0`, is sufficient.
+
+**Budget clarification:** the source trainer checks its evaluation limit between
+local runs. Our implementation checks before every complete evaluation, so it
+cannot overshoot the requested budget. The target is also checked immediately
+after an evaluation. These are deliberate, shared remaster policies.
+
+## 7.3 The Exoself
+
+*Source: [S], pp. 195-197 and 207-210; Fig. 7.3 and Listing 7.4.*
+
+The exoself is outside the neural network. It can evaluate it, request weight
+backup, perturb its weights, and restore the accepted version after rejection.
+The cortex remains responsible for synchronization within an evaluation.
+
+| Responsibility | Owner in the actor implementation |
+| --- | --- |
+| Compare fresh starts and retain the global champion | Trainer task |
+| Run local SHC and choose backup versus restore | Exoself task |
+| Trigger observations and wait for completed actions | Cortex process |
+| Hold current and accepted neural parameters | Neuron processes |
+| Maintain the problem cursor and calculate fitness | Private scape process |
+
+The source describes future monitoring and self-repair, while explicitly limiting
+this chapter's implementation to activation, training, and termination. Our added
+monitors detect worker failure and **abort the evaluation without assigning a
+fitness**. They do not perform transparent graph repair or resume an interrupted
+training run. Rebuilding from a genotype remains an explicit operation.
+
+## 7.4 The Scape
+
+*Source: [S], pp. 197-199; Figs. 7.4-7.5.*
+
+A **scape** combines a task or environment with a way to measure performance.
+It need not simulate physical space: a truth table plus an evaluator is a scape.
+
+| Scape type | Lifetime | Sharing | Source example |
+| --- | --- | --- | --- |
+| Private | Created for one neural agent; removed with it | One agent's evaluation state | Pole balancing; implemented here as XOR |
+| Public | Exists independently of any individual agent | Can contain interacting agents | Artificial-life world |
+
+The source describes both types but implements only the private `xor_sim` here.
+So does this notebook. Public worlds, shared resource dynamics, and their reset
+policies are not silently substituted with independent batch rows.
+
+The XOR sensor and actuator specify the **same** scape. Deduplicate that
+specification: create one private simulator, not one simulator per interface.
+Its cursor resets only after the fourth action has been scored.
+
+## 7.5 Scapes, Sensors, Actuators, Morphologies, and Fitness
+
+*Source: [S], pp. 199-202; Fig. 7.6.*
+
+The sensor asks the scape for an observation. The network processes it. The
+actuator sends the output to the scape, waits for fitness and the halt flag, and
+only then acknowledges the cycle to the cortex. This ordering prevents the cortex
+from starting a new cycle before it learns that the episode has ended.
+
+```mermaid
+sequenceDiagram
+    participant E as Exoself
+    participant C as Cortex
+    participant S as Sensor
+    participant N as Neuron actors
+    participant A as Actuator
+    participant W as Private XOR scape
+    E->>C: Evaluate accepted or proposed parameters
+    loop Four XOR cases
+        C->>S: Synchronize current cycle
+        S->>W: Sense
+        W-->>S: Input vector
+        S->>N: Forward input
+        N->>A: Ordered neural outputs
+        A->>W: Action output
+        W-->>A: Fitness increment and halt flag
+        A-->>C: Acknowledge output, fitness, halt
+    end
+    C-->>E: Evaluation complete; remain paused
+    E->>N: Backup or restore; wait for acknowledgements
+```
+
+*Figure R7.2 - New sequence diagram of the source's Fig. 7.6. Epoch and cycle
+identifiers in our code prevent stale or duplicate messages from closing a cycle.*
+
+An actor evaluation completes **four sense-think-act cycles**. The tensor version
+computes the same four independent input-output pairs as one batch. This is valid
+for XOR because an action does not change the next input. Do not generalize that
+shortcut to recurrent networks, online plasticity, or stateful environments without
+preserving their time dependence.
+
+### Source audit: what does the printed fitness actually compute?
+
+Listing 7.6 calls its error `MSE`, but `list_compare/3` already takes a square root
+for each output vector, and `xor_sim/3` takes another square root after summing
+those per-case distances:
+
+$$
+E_{\mathrm{printed}}=
+\sqrt{\sum_{r=1}^{4}\sqrt{\sum_j(\widehat y_{rj}-y_{rj})^2}},
+\qquad
+F_{\mathrm{printed}}=\frac{1}{E_{\mathrm{printed}}+10^{-5}}.
+$$
+
+For XOR's one-value outputs, this simplifies to
+$E_{\mathrm{printed}}=\sqrt{\sum_r|\widehat y_r-y_r|}$.
+It is neither mean squared error nor root mean squared error.
+
+**All three implementations below preserve this printed formula.** Conventional
+MSE appears only as an explicitly labeled diagnostic. The target of 100 therefore
+means $E_{\mathrm{printed}}\leq0.00999$, not an MSE of 0.001. The source's prose
+on p. 220 mixes error values; we do not reproduce that ambiguity in the checks.
+
+## 7.6 Developing the Extended Architecture
+
+*Source: [S], pp. 202-219; Fig. 7.7 and Listings 7.1-7.10.*
+
+We first implement the actor system in the source's conceptual order. Then we
+replace the numerical search with an actor-free tensor implementation. Finally,
+we combine the actor controller with a coarse-grained tensor worker.
+
+| Source module | Modern counterpart | Principal change |
+| --- | --- | --- |
+| `genotype` | `Genotype`, `Constructor`, `Layout`, `Store` | Validated maps, canonical parameters, scoped ETS ownership |
+| `morphology` | `Morphology` | Explicit `xor_mimic` interface and scape declaration |
+| `trainer` | `Trainer` | Outer restart task; explicit champion and budgets |
+| `exoself` | `Exoself` plus backend control interface | Local-search task; acknowledged backup/restore |
+| `scape` | `XOR` and `Actor.Scape` | Source scoring preserved; state isolated |
+| `cortex` | `Actor.Cortex` | Episode synchronization and failure reporting |
+| `neuron` | `Actor.Neuron` | Scalar computation; current and backed-up parameters |
+| `sensor`, `actuator` | `Actor.Sensor`, `Actor.Actuator` | Source observation/action/feedback path |
+
+### 7.6.1 Modifying the genotype Module
+
+*Source: [S], pp. 203-204; Listing 7.1.*
+
+The persistent genotype remains a list of readable maps with stable IDs. Runtime
+PIDs never enter that genotype. The Chapter 6 validation rules remain: fully
+connected adjacent layers, one sensor and actuator, canonical input order, and
+`tanh` activation. This chapter's executable morphology requires two inputs and
+one output; hidden-layer widths remain configurable.
+
+The storage adapter uses ETS entries `{id, record}` because our records are maps,
+not Erlang record tuples with their key in position 2. Tables are unnamed and
+private to their owner. Reading a file or saving a genotype always closes the
+temporary table. These are resource-management choices, not changes to the neural
+network. [D3]
+
+The constructor and validator are repeated to keep this notebook self-contained.
+
+```elixir
+defmodule Chapter07.Genotype do
+  @moduledoc "One portable, PID-free genotype shared by all three implementations."
+  @type id :: {:sensor | :actuator | :cortex, pos_integer()} |
+              {:neuron, {pos_integer(), pos_integer()}}
+  @type input :: {id(), [number()]} | {:bias, number()}
+  @type record :: map()
+  @type t :: [record()]
+
+  @spec one(t(), atom()) :: record()
+  def one(genotype, kind) do
+    case Enum.filter(genotype, &(&1.kind == kind)) do
+      [record] -> record
+      _ -> raise ArgumentError, "expected exactly one #{kind} record"
+    end
+  end
+
+  @spec layers(t()) :: [[record()]]
+  def layers(genotype) do
+    genotype
+    |> Enum.filter(&(&1.kind == :neuron))
+    |> Enum.group_by(fn %{id: {:neuron, {layer, _}}} -> layer end)
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(fn {_layer, nodes} -> Enum.sort_by(nodes, & &1.id) end)
+  end
+
+  @spec links_and_bias(record()) :: {[{id(), [number()]}], number()}
+  def links_and_bias(node) do
+    {links, tail} = Enum.split_while(node.input_idps, fn {id, _} -> id != :bias end)
+    case tail do
+      [{:bias, bias}] when is_number(bias) -> {links, bias}
+      _ -> raise ArgumentError, "each neuron needs one final {:bias, value} entry"
+    end
+  end
+
+  @spec replace_inputs(t(), %{id() => [input()]}) :: t()
+  def replace_inputs(genotype, updates) do
+    Enum.map(genotype, fn
+      %{kind: :neuron} = n -> %{n | input_idps: Map.fetch!(updates, n.id)}
+      other -> other
+    end) |> validate!()
+  end
+
+  @spec validate!(t()) :: t()
+  def validate!(genotype) do
+    expect!(is_list(genotype) and genotype != [], "genotype must be a nonempty list")
+    expect!(Enum.all?(genotype, &is_map/1), "records must be maps")
+    expect!(Enum.all?(genotype, &(&1.kind in [:sensor, :actuator, :neuron, :cortex])), "unknown record kind")
+    ids = Enum.map(genotype, & &1.id)
+    expect!(length(ids) == length(Enum.uniq(ids)), "duplicate genotype IDs")
+    cx = one(genotype, :cortex)
+    sensor = one(genotype, :sensor)
+    actuator = one(genotype, :actuator)
+    expect!(match?({:cortex, n} when is_integer(n) and n > 0, cx.id), "invalid cortex ID")
+    expect!(match?({:sensor, n} when is_integer(n) and n > 0, sensor.id), "invalid sensor ID")
+    expect!(match?({:actuator, n} when is_integer(n) and n > 0, actuator.id), "invalid actuator ID")
+    expect!(sensor.name == :xor_get_input and actuator.name == :xor_send_output, "unsupported interface name")
+    expect!(is_integer(sensor.vl) and sensor.vl > 0, "invalid sensor width")
+    expect!(is_integer(actuator.vl) and actuator.vl > 0, "invalid actuator width")
+    expect!(cx.sensor_ids == [sensor.id] and cx.actuator_ids == [actuator.id], "cortex interface IDs disagree")
+    expect!(Enum.all?(Enum.reject(genotype, &(&1.kind == :cortex)), &(&1.cx_id == cx.id)), "cortex references disagree")
+
+    expect!(sensor.vl == 2 and actuator.vl == 1, "xor_mimic requires 2 inputs and 1 output")
+    expect!(sensor.scape == {:private, :xor_sim} and actuator.scape == sensor.scape, "morphology scapes disagree")
+
+    layers = layers(genotype)
+    expect!(layers != [], "at least one neural layer is required")
+    layer_ids = Enum.map(layers, fn layer -> Enum.map(layer, & &1.id) end)
+    expect!(cx.nids == List.flatten(layer_ids), "cortex neuron IDs are not in canonical layer order")
+    expect!(sensor.fanout_ids == hd(layer_ids), "sensor fan-out disagrees with first layer")
+    expect!(actuator.fanin_ids == List.last(layer_ids), "actuator fan-in order disagrees")
+    expect!(length(actuator.fanin_ids) == actuator.vl, "actuator width disagrees with output layer")
+
+    Enum.with_index(layers, 1) |> Enum.each(fn {nodes, layer} ->
+      expected_ids = Enum.map(1..length(nodes), &{:neuron, {layer, &1}})
+      expect!(Enum.map(nodes, & &1.id) == expected_ids, "layer IDs must be contiguous and ordered")
+      inputs = if layer == 1, do: [{sensor.id, sensor.vl}],
+        else: Enum.map(Enum.at(layer_ids, layer - 2), &{&1, 1})
+      outputs = if layer == length(layers), do: [actuator.id], else: Enum.at(layer_ids, layer)
+
+      Enum.each(nodes, fn node ->
+        {links, _bias} = links_and_bias(node)
+        expect!(node.af == :tanh, "this chapter supports only tanh")
+        expect!(node.output_ids == outputs, "neuron fan-out disagrees with next layer")
+        expect!(Enum.map(links, &elem(&1, 0)) == Enum.map(inputs, &elem(&1, 0)), "ordered fan-in mismatch")
+        Enum.zip(links, inputs) |> Enum.each(fn {{_id, weights}, {_source, width}} ->
+          Chapter07.Math.vector!(weights, width)
+        end)
+      end)
+    end)
+    genotype
+  end
+
+  @spec expect!(boolean(), String.t()) :: :ok
+  defp expect!(true, _message), do: :ok
+  defp expect!(false, message), do: raise(ArgumentError, message)
+end
+
+defmodule Chapter07.Constructor do
+  alias Chapter07.Genotype
+  @moduledoc "Fully connected adjacent layers; output density comes from actuator width."
+
+  @spec construct(:xor_get_input, :xor_send_output, [pos_integer()], :rand.state()) :: {Genotype.t(), :rand.state()}
+  def construct(:xor_get_input, :xor_send_output, hidden, state), do: new(2, hidden, 1, state)
+
+  @spec new(pos_integer(), [pos_integer()], pos_integer(), :rand.state()) :: {Genotype.t(), :rand.state()}
+  def new(input_width, hidden, output_width, state) do
+    unless is_integer(input_width) and input_width > 0 and
+      is_integer(output_width) and output_width > 0 and is_list(hidden) and
+      Enum.all?(hidden, &(is_integer(&1) and &1 > 0)) do
+      raise ArgumentError, "widths must be positive integers; hidden may be []"
+    end
+
+    layer_ids =
+      (hidden ++ [output_width])
+      |> Enum.with_index(1)
+      |> Enum.map(fn {width, layer} -> Enum.map(1..width, &{:neuron, {layer, &1}}) end)
+
+    cx_id = {:cortex, 1}
+    s_id = {:sensor, 1}
+    a_id = {:actuator, 1}
+
+    {layers, state} =
+      layer_ids |> Enum.with_index() |> Enum.map_reduce(state, fn {ids, index}, key ->
+        inputs = if index == 0, do: [{s_id, input_width}],
+          else: Enum.map(Enum.at(layer_ids, index - 1), &{&1, 1})
+        outputs = Enum.at(layer_ids, index + 1, [a_id])
+        Enum.map_reduce(ids, key, fn id, key ->
+          {input_idps, key} =
+            Enum.map_reduce(inputs, key, fn {source, width}, key ->
+              {weights, key} = weights(width, key)
+              {{source, weights}, key}
+            end)
+          {bias, key} = :rand.uniform_s(key)
+          node = %{kind: :neuron, id: id, cx_id: cx_id, af: :tanh,
+            input_idps: input_idps ++ [{:bias, bias - 0.5}], output_ids: outputs}
+          {node, key}
+        end)
+      end)
+
+    cortex = %{kind: :cortex, id: cx_id, sensor_ids: [s_id], actuator_ids: [a_id],
+      nids: List.flatten(layer_ids)}
+    sensor = %{kind: :sensor, id: s_id, cx_id: cx_id, name: :xor_get_input, scape: {:private, :xor_sim}, vl: input_width,
+      fanout_ids: hd(layer_ids)}
+    actuator = %{kind: :actuator, id: a_id, cx_id: cx_id, name: :xor_send_output, scape: {:private, :xor_sim}, vl: output_width,
+      fanin_ids: List.last(layer_ids)}
+    genotype = [cortex, sensor, actuator | List.flatten(layers)]
+    {Genotype.validate!(genotype), state}
+  end
+
+  @spec weights(pos_integer(), :rand.state()) :: {[float()], :rand.state()}
+  defp weights(width, state) do
+    Enum.map_reduce(1..width, state, fn _, key ->
+      {value, key} = :rand.uniform_s(key)
+      {value - 0.5, key}
+    end)
+  end
+end
+
+defmodule Chapter07.Layout do
+  alias Chapter07.{Genotype, Math}
+  @moduledoc "A fixed-topology parameter layout; the persistent genotype remains PID-free."
+  @type t :: %{widths: [pos_integer()], input_width: pos_integer(), neurons: pos_integer(),
+               parameters: pos_integer(), owners: [non_neg_integer()], probabilities: [float()],
+               slices: [map()]}
+
+  @spec new(Genotype.t()) :: t()
+  def new(genotype) do
+    Genotype.validate!(genotype)
+    layers = Genotype.layers(genotype)
+    {slices, total} =
+      layers |> List.flatten() |> Enum.with_index()
+      |> Enum.map_reduce(0, fn {node, index}, offset ->
+        {links, _} = Genotype.links_and_bias(node)
+        fanin = Enum.sum(Enum.map(links, fn {_id, weights} -> length(weights) end))
+        item = %{id: node.id, owner: index, offset: offset, count: fanin + 1, fanin: fanin}
+        {item, offset + fanin + 1}
+      end)
+    %{widths: Enum.map(layers, &length/1), input_width: Genotype.one(genotype, :sensor).vl,
+      neurons: length(slices), parameters: total, slices: slices,
+      owners: Enum.flat_map(slices, &List.duplicate(&1.owner, &1.count)),
+      probabilities: Enum.flat_map(slices, &List.duplicate(1.0 / :math.sqrt(&1.fanin), &1.count))}
+  end
+
+  @spec flatten(Genotype.t()) :: [number()]
+  def flatten(genotype) do
+    Genotype.layers(genotype) |> List.flatten() |> Enum.flat_map(fn node ->
+      {links, bias} = Genotype.links_and_bias(node)
+      Enum.flat_map(links, &elem(&1, 1)) ++ [bias]
+    end)
+  end
+
+  @spec restore(Genotype.t(), [number()]) :: Genotype.t()
+  def restore(template, theta) do
+    layout = new(template)
+    Math.vector!(theta, layout.parameters)
+    nodes = Map.new(template, &{&1.id, &1})
+    updates = Map.new(layout.slices, fn item ->
+      {links, _} = Genotype.links_and_bias(Map.fetch!(nodes, item.id))
+      values = Enum.slice(theta, item.offset, item.count)
+      {new_links, [bias]} = Enum.map_reduce(links, values, fn {id, weights}, remaining ->
+        {new_weights, rest} = Enum.split(remaining, length(weights))
+        {{id, new_weights}, rest}
+      end)
+      {item.id, new_links ++ [{:bias, bias}]}
+    end)
+    Genotype.replace_inputs(template, updates)
+  end
+end
+
+defmodule Chapter07.Store do
+  alias Chapter07.Genotype
+  @moduledoc "Private, unnamed ETS tables; file operations always release their table."
+
+  @spec open(Genotype.t()) :: :ets.tid()
+  def open(genotype) do
+    Genotype.validate!(genotype)
+    tid = :ets.new(:chapter07_genotype, [:set, :private])
+    :ets.insert(tid, Enum.map(genotype, &{&1.id, &1}))
+    tid
+  end
+
+  @spec read(:ets.tid(), Genotype.id()) :: map()
+  def read(tid, id), do: :ets.lookup_element(tid, id, 2)
+
+  @spec write(:ets.tid(), map()) :: true
+  def write(tid, record), do: :ets.insert(tid, {record.id, record})
+
+  @spec all(:ets.tid()) :: Genotype.t()
+  def all(tid) do
+    records = Enum.map(:ets.tab2list(tid), &elem(&1, 1))
+    Genotype.validate!(records)
+    [Genotype.one(records, :cortex), Genotype.one(records, :sensor),
+     Genotype.one(records, :actuator) | List.flatten(Genotype.layers(records))]
+  end
+
+  @spec close(:ets.tid()) :: true
+  def close(tid), do: :ets.delete(tid)
+
+  @spec save!(Genotype.t(), String.t()) :: :ok
+  def save!(genotype, path) do
+    tid = open(genotype)
+    try do
+      :ok = :ets.tab2file(tid, String.to_charlist(path))
+    after
+      close(tid)
+    end
+  end
+
+  @spec load!(String.t()) :: Genotype.t()
+  def load!(path) do
+    # Only load trusted local ETS files: this is storage, not a hostile-input format.
+    {:ok, tid} = :ets.file2tab(String.to_charlist(path))
+    try do
+      all(tid)
+    after
+      close(tid)
+    end
+  end
+
+  @spec encode(Genotype.t()) :: binary()
+  def encode(genotype), do: :erlang.term_to_binary({:chapter07, 1, Genotype.validate!(genotype)})
+
+  @spec decode(binary()) :: Genotype.t()
+  def decode(binary) do
+    case :erlang.binary_to_term(binary, [:safe]) do
+      {:chapter07, 1, genotype} -> Genotype.validate!(genotype)
+      _ -> raise ArgumentError, "unsupported Chapter 7 checkpoint"
+    end
+  end
+end
+```
+
+`Layout` gives every parameter one stable index. It also records the owning
+neuron and the mutation probability. For a 2-input, 2-hidden, 1-output network,
+there are three neurons and nine parameters. Packing does not change topology.
+`Layout.restore/2` maps a parameter vector back into the same persistent records.
+
+### 7.6.2 Modifying the morphology Module
+
+*Source: [S], pp. 204-205; Listing 7.2.*
+
+The morphology selects the observation interface, action interface, and scape.
+Both interfaces point to `{:private, :xor_sim}`. `scapes/1` deduplicates them.
+The mapper below deliberately supports this implemented private scape only.
+
+```elixir
+defmodule Chapter07.Morphology do
+  alias Chapter07.{Constructor, Genotype}
+  @moduledoc "xor_mimic connects one two-value sensor and one one-value actuator to the same scape."
+
+  @spec construct(:xor_mimic, [pos_integer()], :rand.state()) :: {Genotype.t(), :rand.state()}
+  def construct(:xor_mimic, hidden, key) do
+    Constructor.construct(:xor_get_input, :xor_send_output, hidden, key)
+  end
+
+  @spec scapes(Genotype.t()) :: [tuple()]
+  def scapes(genotype) do
+    genotype |> Enum.filter(&(&1.kind in [:sensor, :actuator]))
+      |> Enum.map(& &1.scape) |> Enum.uniq()
+  end
+
+  @spec upgrade([map()]) :: Genotype.t()
+  def upgrade(chapter06_genotype) do
+    Enum.map(chapter06_genotype, fn
+      %{kind: :sensor} = record -> Map.merge(record, %{name: :xor_get_input, scape: {:private, :xor_sim}})
+      %{kind: :actuator} = record -> Map.merge(record, %{name: :xor_send_output, scape: {:private, :xor_sim}})
+      other -> other
+    end) |> Genotype.validate!()
+  end
+
+end
+```
+
+### 7.6.3 Developing the trainer Module
+
+*Source: [S], pp. 205-207; Listing 7.3.*
+
+We first make the stopping policy and random input explicit. `Config.new/1`
+rejects non-positive budgets. The defaults are bounded notebook settings, not the
+source's `inf` defaults.
+
+For controlled comparisons, a **random tape** contains one initial parameter
+vector, one neuron-gate vector, one parameter-gate vector, and one delta vector
+for each possible evaluation index. At a fresh start, only the initial vector is
+used. At a perturbation, only the gates and deltas are used. Unused draws remain
+unused; all three implementations consume the same evaluation-indexed row.
+
+This preserves the source's initialization and perturbation distributions, not its
+process-local random sequence. It removes scheduling from random-number
+assignment. Preparing these inputs is outside the tensor search loop. The
+recorded representation is for comparison and teaching, not a claim of minimal
+memory usage for large populations.
+
+```elixir
+defmodule Chapter07.Config do
+  @moduledoc "Finite budgets and zero-based consecutive-failure counters."
+  @type t :: %{evaluation_limit: pos_integer(), local_patience: pos_integer(),
+               restart_patience: pos_integer(), fitness_target: float()}
+
+  @spec new() :: t()
+  @spec new(keyword()) :: t()
+  def new(options \\ []) do
+    options = Keyword.validate!(options, evaluation_limit: 1_200, local_patience: 80,
+      restart_patience: 5, fitness_target: 100.0)
+    config = Map.new(options)
+    Enum.each([:evaluation_limit, :local_patience, :restart_patience], fn name ->
+      value = Map.fetch!(config, name)
+      unless is_integer(value) and value > 0, do: raise(ArgumentError, "#{name} must be positive")
+    end)
+    unless is_number(config.fitness_target) and config.fitness_target > 0 do
+      raise ArgumentError, "fitness_target must be positive"
+    end
+    %{config | fitness_target: config.fitness_target * 1.0}
+  end
+
+  @spec reason(number(), non_neg_integer(), t()) :: atom()
+  def reason(fitness, evaluations, config) do
+    cond do
+      fitness >= config.fitness_target -> :fitness_target
+      evaluations >= config.evaluation_limit -> :evaluation_limit
+      true -> :restart_patience
+    end
+  end
+end
+
+defmodule Chapter07.Tape do
+  alias Chapter07.Layout
+  @moduledoc "Recorded uniform draws: randomness is an input, not a scheduling side effect."
+  @type row :: %{initial: [float()], neuron_u: [float()], parameter_u: [float()], delta: [float()]}
+  @type t :: %{rows: tuple(), seed: non_neg_integer(), limit: pos_integer(), rng_after: :rand.state()}
+
+  @spec new(Layout.t(), pos_integer(), non_neg_integer()) :: t()
+  def new(layout, limit, seed) when is_integer(limit) and limit > 0 and is_integer(seed) and seed >= 0 do
+    key = :rand.seed_s(:exsss, {seed + 1, seed + 101, seed + 10_001})
+    {rows, key} = Enum.map_reduce(1..limit, key, fn _, key ->
+      {initial, key} = uniform(layout.parameters, key)
+      {neuron_u, key} = uniform(layout.neurons, key)
+      {parameter_u, key} = uniform(layout.parameters, key)
+      {delta, key} = uniform(layout.parameters, key)
+      row = %{initial: Enum.map(initial, &(&1 - 0.5)), neuron_u: neuron_u,
+        parameter_u: parameter_u, delta: Enum.map(delta, &((&1 - 0.5) * 2.0 * :math.pi()))}
+      {row, key}
+    end)
+    %{rows: List.to_tuple(rows), seed: seed, limit: limit, rng_after: key}
+  end
+
+  @spec row(t(), non_neg_integer()) :: row()
+  def row(tape, index), do: elem(tape.rows, index)
+
+  @spec tensors(t()) :: {Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()}
+  def tensors(tape) do
+    rows = Tuple.to_list(tape.rows)
+    [:initial, :neuron_u, :parameter_u, :delta]
+    |> Enum.map(fn field -> Nx.tensor(Enum.map(rows, &Map.fetch!(&1, field)), type: :f64) end)
+    |> List.to_tuple()
+  end
+
+  @spec uniform(pos_integer(), :rand.state()) :: {[float()], :rand.state()}
+  defp uniform(count, key) do
+    Enum.map_reduce(1..count, key, fn _, key -> :rand.uniform_s(key) end)
+  end
+end
+```
+
+### 7.6.4 Modifying the exoself Module
+
+*Source: [S], pp. 207-210; Listing 7.4.*
+
+The local controller is small because it depends on a precise backend contract.
+`set`, `perturb`, `backup`, and `restore` return only after the operation is
+acknowledged. `evaluate` returns only after the full episode. One exoself owns its
+handle exclusively; concurrent callers must not interleave training operations.
+
+| Backend operation | Meaning |
+| --- | --- |
+| `open(genotype)` | Create the fixed-topology runtime |
+| `set(handle, theta)` | Install fresh initial parameters at an idle boundary |
+| `evaluate(handle)` | Return fitness, four predictions, and four logical cycles |
+| `backup(handle)` | Accept the current parameters |
+| `perturb(handle, draw)` | Propose a masked, bounded perturbation |
+| `restore(handle)` | Discard a rejected proposal |
+| `snapshot(handle)` | Read the current accepted parameters after decisions |
+| `close(handle)` | Stop the phenotype and its private state |
+
+The source sends asynchronous control messages and then reactivates the cortex.
+Our acknowledgements form an explicit barrier: no observation is released while
+some neurons still hold old parameters. The controller never mutates a running
+sense-think-act cycle.
+
+The following cell contains the local **Exoself** followed by the outer **Trainer**.
+Both run in task processes. Their numerical baseline is ordinary scalar Elixir;
+the same controller will later operate the hybrid backend. Backend modules are
+defined in the following cells; call the trainer only after those definitions.
+
+```elixir
+defmodule Chapter07.Exoself do
+  alias Chapter07.{Config, Genotype, Tape}
+  @moduledoc "One local SHC run. This executes in its own Task process."
+
+  @spec run(module(), Genotype.t(), Tape.t(), non_neg_integer(), Config.t(), pos_integer(), number()) :: map()
+  def run(backend, template, tape, offset, config, run_index, previous_global) do
+    handle = backend.open(template)
+    try do
+      :ok = backend.set(handle, Tape.row(tape, offset).initial)
+      result = backend.evaluate(handle)
+      ensure_cycles!(result)
+      :ok = backend.backup(handle)
+      row = trace_row(offset + 1, run_index, result.fitness, result.fitness,
+        max(previous_global, result.fitness), true, true, 0)
+      state = %{fitness: result.fitness, evaluations: offset + 1, failures: 0, trace: [row]}
+      state = loop(backend, handle, tape, config, run_index, previous_global, state)
+      Map.merge(state, %{theta: backend.snapshot(handle), trace: Enum.reverse(state.trace)})
+    after
+      backend.close(handle)
+    end
+  end
+
+  @spec loop(module(), term(), Tape.t(), Config.t(), pos_integer(), number(), map()) :: map()
+  defp loop(backend, handle, tape, config, run_index, previous_global, state) do
+    if state.fitness >= config.fitness_target or state.evaluations >= config.evaluation_limit or
+        state.failures >= config.local_patience do
+      state
+    else
+      :ok = backend.perturb(handle, Tape.row(tape, state.evaluations))
+      result = backend.evaluate(handle)
+      ensure_cycles!(result)
+      accepted = result.fitness > state.fitness
+      :ok = if accepted, do: backend.backup(handle), else: backend.restore(handle)
+      best = if accepted, do: result.fitness, else: state.fitness
+      failures = if accepted, do: 0, else: state.failures + 1
+      row = trace_row(state.evaluations + 1, run_index, result.fitness, best,
+        max(previous_global, best), accepted, false, failures)
+      next = %{fitness: best, evaluations: state.evaluations + 1,
+        failures: failures, trace: [row | state.trace]}
+      loop(backend, handle, tape, config, run_index, previous_global, next)
+    end
+  end
+
+  @spec ensure_cycles!(map()) :: :ok
+  defp ensure_cycles!(%{cycles: 4}), do: :ok
+  defp ensure_cycles!(_), do: raise("A complete XOR evaluation must contain four cycles")
+
+  @spec trace_row(pos_integer(), pos_integer(), number(), number(), number(), boolean(), boolean(), non_neg_integer()) :: map()
+  def trace_row(evaluation, run_index, fitness, local_best, global_best, accepted, seed?, failures) do
+    %{evaluation: evaluation, run: run_index, fitness: fitness, local_best: local_best,
+      global_best: global_best, accepted: accepted, seed: seed?, local_failures: failures}
+  end
+end
+
+defmodule Chapter07.Trainer do
+  alias Chapter07.{Config, Exoself, Genotype, Layout, Tape}
+  @moduledoc "Random restarts with a separate best-of-all-runs archive. No registered global names."
+
+  @spec run(module(), Genotype.t(), Tape.t(), Config.t()) :: map()
+  def run(backend, template, tape, config) do
+    Genotype.validate!(template)
+    unless tape.limit >= config.evaluation_limit, do: raise(ArgumentError, "random tape is too short")
+    started = System.monotonic_time()
+    {:ok, supervisor} = Task.Supervisor.start_link()
+    try do
+      trainer = Task.Supervisor.async_nolink(supervisor, fn ->
+        initial = %{theta: nil, fitness: -1.0, evaluations: 0, runs: 0, failed_runs: 0, trace: []}
+        loop(supervisor, backend, template, tape, config, initial)
+      end)
+      result = Task.await(trainer, :infinity)
+      elapsed = System.convert_time_unit(System.monotonic_time() - started, :native, :microsecond)
+      Map.merge(result, %{cycles: 4 * result.evaluations, restarts: result.runs - 1,
+        elapsed_ms: elapsed / 1_000.0, reason: Config.reason(result.fitness, result.evaluations, config),
+        genotype: Layout.restore(template, result.theta), seed: tape.seed})
+    after
+      Supervisor.stop(supervisor)
+    end
+  end
+
+  @spec loop(pid(), module(), Genotype.t(), Tape.t(), Config.t(), map()) :: map()
+  defp loop(supervisor, backend, template, tape, config, state) do
+    if state.evaluations >= config.evaluation_limit or state.fitness >= config.fitness_target or
+        state.failed_runs >= config.restart_patience do
+      state
+    else
+      task = Task.Supervisor.async_nolink(supervisor, fn ->
+        Exoself.run(backend, template, tape, state.evaluations, config, state.runs + 1, state.fitness)
+      end)
+      local = Task.await(task, :infinity)
+      improved = local.fitness > state.fitness
+      next = %{theta: if(improved, do: local.theta, else: state.theta),
+        fitness: max(local.fitness, state.fitness), evaluations: local.evaluations,
+        runs: state.runs + 1, failed_runs: if(improved, do: 0, else: state.failed_runs + 1),
+        trace: state.trace ++ local.trace}
+      loop(supervisor, backend, template, tape, config, next)
+    end
+  end
+end
+```
+
+Every completed evaluation increments the count, including the first seed and
+last rejected proposal. `cycles = 4 * evaluations`. The trainer's champion is
+separate from the current local run, so a poor restart cannot overwrite it.
+
+`try ... after` closes each phenotype. Tasks are supervised without linking a
+worker's exception directly to the caller. An operational error still aborts the
+run; it is not converted into an invented fitness value. [D4, D5]
+
+### 7.6.5 Developing the scape Module
+
+*Source: [S], pp. 210-212; Listings 7.5-7.6.*
+
+The case order follows the executable `XOR` list in Listing 7.6. It differs in
+order, not content, from the preceding Boolean truth table.
+
+| First input | Second input | Bipolar XOR target |
+| ---: | ---: | ---: |
+| -1 | -1 | -1 |
+| 1 | -1 | 1 |
+| -1 | 1 | 1 |
+| 1 | 1 | -1 |
+
+Sensing does not advance the cursor. An action scores the current case and
+advances it. The first three actions return zero fitness and `false`; the fourth
+returns the episode fitness and `true`, then resets the cursor and error together.
+Our additional phase check rejects an action before a sense operation.
+
+```elixir
+defmodule Chapter07.XOR do
+  alias Chapter07.Math
+  @moduledoc "Listing 7.6's exact scoring rule, with its misleading MSE name removed."
+  @type state :: %{index: non_neg_integer(), error: float(), sensed: boolean()}
+
+  @spec cases() :: [{[float()], [float()]}]
+  def cases do
+    [{[-1.0, -1.0], [-1.0]}, {[1.0, -1.0], [1.0]},
+     {[-1.0, 1.0], [1.0]}, {[1.0, 1.0], [-1.0]}]
+  end
+
+  @spec new() :: state()
+  def new, do: %{index: 0, error: 0.0, sensed: false}
+
+  @spec sense(state()) :: {[float()], state()}
+  def sense(state) do
+    {input, _target} = Enum.at(cases(), state.index)
+    {input, %{state | sensed: true}}
+  end
+
+  @spec action(state(), [number()]) :: {{float(), boolean()}, state()}
+  def action(%{sensed: true} = state, output) do
+    Math.vector!(output, 1)
+    {_input, target} = Enum.at(cases(), state.index)
+    error = state.error + row_distance(output, target)
+    if state.index == 3 do
+      {{1.0 / (:math.sqrt(error) + 1.0e-5), true}, new()}
+    else
+      {{0.0, false}, %{index: state.index + 1, error: error, sensed: false}}
+    end
+  end
+  def action(_state, _output), do: raise(ArgumentError, "sense must precede action")
+
+  @spec row_distance([number()], [number()]) :: float()
+  def row_distance(output, target) do
+    Math.vector!(output, length(target))
+    Enum.zip(output, target)
+    |> Enum.reduce(0.0, fn {a, b}, acc -> acc + (a - b) * (a - b) end)
+    |> :math.sqrt()
+  end
+
+  @spec fitness([[number()]]) :: float()
+  def fitness(predictions) do
+    unless length(predictions) == 4, do: raise(ArgumentError, "XOR needs four predictions")
+    error = Enum.zip(predictions, cases())
+      |> Enum.reduce(0.0, fn {output, {_input, target}}, acc -> acc + row_distance(output, target) end)
+    1.0 / (:math.sqrt(error) + 1.0e-5)
+  end
+end
+
+defmodule Chapter07.Actor.Scape do
+  use GenServer, restart: :temporary
+  alias Chapter07.XOR
+  @moduledoc "One private xor_sim instance shared by one network's sensor and actuator."
+
+  @spec start_link(term()) :: GenServer.on_start()
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil)
+
+  @impl true
+  @spec init(nil) :: {:ok, XOR.state()}
+  def init(nil), do: {:ok, XOR.new()}
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), XOR.state()) :: tuple()
+  def handle_call(:sense, _from, state) do
+    {input, next} = XOR.sense(state)
+    {:reply, input, next}
+  end
+  def handle_call({:action, output}, _from, state) do
+    {feedback, next} = XOR.action(state, output)
+    {:reply, feedback, next}
+  end
+  def handle_call(:state, _from, state), do: {:reply, state, state}
+end
+```
+
+#### Inspect the scoring discrepancy with one fixed residual pattern
+
+These are deliberately constructed predictions, not a training result. All four
+absolute errors equal 0.5. The resulting quantities cannot all be called MSE.
+
+```elixir
+predictions_audit = Enum.map(Chapter07.XOR.cases(), fn {_x, [target]} -> [0.5 * target] end)
+tbl_score_audit = [
+  %{measure: "Printed error", value: :math.sqrt(2.0), definition: "sqrt(sum of absolute errors)"},
+  %{measure: "Printed fitness", value: Chapter07.XOR.fitness(predictions_audit), definition: "1 / (printed error + 0.00001)"},
+  %{measure: "MSE diagnostic", value: 0.25, definition: "mean squared error; NOT the optimized source score"},
+  %{measure: "Root SSE diagnostic", value: 1.0, definition: "sqrt(sum of squared errors)"}
+]
+Chapter07.Tables.tabs(tbl_score_audit, [:measure, :value, :definition], "ch_07_tbl_01_score_audit.csv")
+```
+
+### 7.6.6 Modifying the cortex Module
+
+*Source: [S], pp. 213-214; Listing 7.7.*
+
+The cortex starts an episode only when requested. It accumulates feedback from
+completed actions, pauses on the scape's halt flag, and returns the predictions,
+fitness, and cycle count to the exoself. It does not issue a speculative fifth
+XOR observation.
+
+Epoch and cycle identifiers reject stale acknowledgements. Worker monitors and a
+cycle deadline prevent an indefinitely blocked evaluation. The source's
+`EFAcc`/`HFAcc` mismatch and `termiante` typo are not copied; see the adaptation
+notes in Section 7.9. A dead neuron invalidates the whole in-flight evaluation.
+
+```elixir
+defmodule Chapter07.Actor.Cortex do
+  use GenServer, restart: :temporary
+  @moduledoc "Run complete evaluations; pause before exoself changes any weights."
+
+  @spec start_link(term()) :: GenServer.on_start()
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil)
+
+  @impl true
+  @spec init(nil) :: {:ok, map()}
+  def init(nil), do: {:ok, %{sensor: nil, actuator: nil, epoch: nil, monitors: %{},
+    step: 0, pending: nil, halted: nil}}
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: tuple()
+  def handle_call({:wire, config}, _from, state) do
+    monitors = Map.new(config.workers, fn pid -> {pid, Process.monitor(pid)} end)
+    {:reply, :ok, state |> Map.merge(Map.delete(config, :workers)) |> Map.put(:monitors, monitors)}
+  end
+  def handle_call(:status, _from, state) do
+    {:reply, %{busy: state.pending != nil, halted: state.halted, cycles: state.step}, state}
+  end
+  def handle_call(:evaluate, _from, %{halted: reason} = state) when reason != nil do
+    {:reply, {:error, reason}, state}
+  end
+  def handle_call(:evaluate, _from, %{pending: pending} = state) when pending != nil do
+    {:reply, {:error, :busy}, state}
+  end
+  def handle_call(:evaluate, from, state) do
+    pending = %{from: from, fitness: 0.0, cycles: 0, predictions: [], timer: nil}
+    {:noreply, trigger(%{state | pending: pending})}
+  end
+
+  @impl true
+  @spec handle_info(term(), map()) :: {:noreply, map()}
+  def handle_info({:acted, epoch, step, actuator, output, fitness, halt?},
+      %{epoch: epoch, step: step, actuator: actuator, pending: pending} = state)
+      when pending != nil do
+    Process.cancel_timer(pending.timer)
+    pending = %{pending | fitness: pending.fitness + fitness, cycles: pending.cycles + 1,
+      predictions: [output | pending.predictions]}
+    cond do
+      halt? ->
+        result = %{fitness: pending.fitness, cycles: pending.cycles,
+          predictions: Enum.reverse(pending.predictions)}
+        GenServer.reply(pending.from, {:ok, result})
+        {:noreply, %{state | pending: nil}}
+      pending.cycles >= 4 ->
+        {:noreply, fail(%{state | pending: pending}, :missing_xor_halt)}
+      true ->
+        {:noreply, trigger(%{state | pending: pending})}
+    end
+  end
+  def handle_info({:deadline, epoch, step},
+      %{epoch: epoch, step: step, pending: pending} = state) when pending != nil do
+    {:noreply, fail(state, {:cycle_timeout, step})}
+  end
+  def handle_info({:DOWN, ref, :process, pid, reason}, state) do
+    if Map.get(state.monitors, pid) == ref do
+      {:noreply, fail(state, {:worker_down, reason})}
+    else
+      {:noreply, state}
+    end
+  end
+  def handle_info(_message, state), do: {:noreply, state}
+
+  @spec trigger(map()) :: map()
+  defp trigger(state) do
+    step = state.step + 1
+    timer = Process.send_after(self(), {:deadline, state.epoch, step}, 10_000)
+    send(state.sensor, {:sync, state.epoch, step, self()})
+    %{state | step: step, pending: %{state.pending | timer: timer}}
+  end
+
+  @spec fail(map(), term()) :: map()
+  defp fail(state, reason) do
+    if state.pending != nil do
+      Process.cancel_timer(state.pending.timer)
+      GenServer.reply(state.pending.from, {:error, reason})
+    end
+    %{state | pending: nil, halted: reason}
+  end
+end
+```
+
+### 7.6.7 Modifying the neuron Module
+
+*Source: [S], pp. 214-218; Listing 7.8.*
+
+Each neuron has **current parameters** and an **accepted backup**. Incoming
+vectors are buffered by sender but concatenated in the genotype's declared
+order, not arrival order. Duplicate and stale messages do not advance its cycle.
+
+Only an idle neuron accepts a parameter change. The exoself performs changes
+between complete evaluations and waits for every acknowledgement. The source's
+process-dictionary backup is replaced by an explicit state field.
+
+The neuron-gate decision is made outside the neuron, just as exoself selects
+neurons in the source. The parameter gates and supplied deltas are applied inside
+the selected neuron. The actor numerical path contains no Nx calls.
+
+```elixir
+defmodule Chapter07.Actor.Neuron do
+  use GenServer, restart: :temporary
+  alias Chapter07.{Genotype, Math}
+  @moduledoc "One neuron per process, with explicit current and accepted weights. No Nx."
+
+  @spec start_link(map()) :: GenServer.on_start()
+  def start_link(record), do: GenServer.start_link(__MODULE__, record)
+
+  @impl true
+  @spec init(map()) :: {:ok, map()}
+  def init(record) do
+    {links, bias} = Genotype.links_and_bias(record)
+    theta = Enum.flat_map(links, &elem(&1, 1)) ++ [bias]
+    {:ok, %{record: record, theta: theta, backup: theta, inputs: [], outputs: [],
+      epoch: nil, next_step: 1, pending: %{}}}
+  end
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: tuple()
+  def handle_call({:wire, wiring}, _from, state), do: {:reply, :ok, Map.merge(state, wiring)}
+  def handle_call(:snapshot, _from, state), do: {:reply, state.theta, state}
+  def handle_call(:backup, _from, %{pending: pending} = state) when map_size(pending) == 0 do
+    {:reply, :ok, %{state | backup: state.theta}}
+  end
+  def handle_call(:restore, _from, %{pending: pending} = state) when map_size(pending) == 0 do
+    {:reply, :ok, %{state | theta: state.backup}}
+  end
+  def handle_call({:set, theta}, _from, %{pending: pending} = state) when map_size(pending) == 0 do
+    Math.vector!(theta, length(state.theta))
+    {:reply, :ok, %{state | theta: theta}}
+  end
+  def handle_call({:perturb, selected, uniforms, deltas, probability}, _from,
+      %{pending: pending} = state) when map_size(pending) == 0 do
+    Math.vector!(uniforms, length(state.theta))
+    Math.vector!(deltas, length(state.theta))
+    limit = 2.0 * :math.pi()
+    theta = Enum.zip([state.theta, uniforms, deltas]) |> Enum.map(fn {w, u, delta} ->
+      if selected and u < probability, do: max(-limit, min(limit, w + delta)), else: w
+    end)
+    {:reply, :ok, %{state | theta: theta}}
+  end
+
+  @impl true
+  @spec handle_info(term(), map()) :: {:noreply, map()}
+  def handle_info({:forward, epoch, step, source, vector},
+      %{epoch: epoch, next_step: step} = state) do
+    case List.keyfind(state.inputs, source, 0) do
+      nil -> {:noreply, state}
+      {_pid, width} ->
+        if Map.has_key?(state.pending, source) do
+          {:noreply, state}
+        else
+          Math.vector!(vector, width)
+          pending = Map.put(state.pending, source, vector)
+          if map_size(pending) == length(state.inputs) do
+            input = Enum.flat_map(state.inputs, fn {pid, _} -> Map.fetch!(pending, pid) end)
+            {weights, [bias]} = Enum.split(state.theta, length(state.theta) - 1)
+            output = [Math.neuron(input, weights, bias)]
+            Enum.each(state.outputs, &send(&1, {:forward, epoch, step, self(), output}))
+            {:noreply, %{state | pending: %{}, next_step: step + 1}}
+          else
+            {:noreply, %{state | pending: pending}}
+          end
+        end
+    end
+  end
+  def handle_info(_message, state), do: {:noreply, state}
+end
+```
+
+### 7.6.8 Modifying the sensor Module
+
+*Source: [S], pp. 218-219; Listing 7.9.*
+
+`xor_get_input` requests an observation from its private scape and forwards it.
+The source substitutes a zero vector after an input-width mismatch. We instead
+fail the evaluation: fabricated observations would otherwise be scored as genuine
+behavior. This is an explicit remaster error-handling choice.
+
+```elixir
+defmodule Chapter07.Actor.Sensor do
+  use GenServer, restart: :temporary
+  @moduledoc "xor_get_input: request a percept, validate it, and fan it out."
+
+  @spec start_link(map()) :: GenServer.on_start()
+  def start_link(record), do: GenServer.start_link(__MODULE__, record)
+
+  @impl true
+  @spec init(map()) :: {:ok, map()}
+  def init(record), do: {:ok, %{record: record, epoch: nil, cortex: nil, scape: nil,
+    outputs: [], next_step: 1}}
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: tuple()
+  def handle_call({:wire, wiring}, _from, state), do: {:reply, :ok, Map.merge(state, wiring)}
+
+  @impl true
+  @spec handle_info(term(), map()) :: {:noreply, map()}
+  def handle_info({:sync, epoch, step, cortex},
+      %{epoch: epoch, next_step: step, cortex: cortex} = state) do
+    input = GenServer.call(state.scape, :sense, 5_000)
+    Chapter07.Math.vector!(input, state.record.vl)
+    Enum.each(state.outputs, &send(&1, {:forward, epoch, step, self(), input}))
+    {:noreply, %{state | next_step: step + 1}}
+  end
+  def handle_info(_message, state), do: {:noreply, state}
+end
+```
+
+### 7.6.9 Modifying the actuator Module
+
+*Source: [S], p. 219; Listing 7.10.*
+
+The actuator gathers outputs in declared order, sends its action to the scape,
+and forwards the returned fitness and halt flag to the cortex. The acknowledgement
+is deliberately **after** the scape reply.
+
+```elixir
+defmodule Chapter07.Actor.Actuator do
+  use GenServer, restart: :temporary
+  @moduledoc "xor_send_output: wait for scape feedback before acknowledging the cycle."
+
+  @spec start_link(map()) :: GenServer.on_start()
+  def start_link(record), do: GenServer.start_link(__MODULE__, record)
+
+  @impl true
+  @spec init(map()) :: {:ok, map()}
+  def init(record), do: {:ok, %{record: record, epoch: nil, cortex: nil, scape: nil,
+    inputs: [], next_step: 1, pending: %{}}}
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: tuple()
+  def handle_call({:wire, wiring}, _from, state), do: {:reply, :ok, Map.merge(state, wiring)}
+
+  @impl true
+  @spec handle_info(term(), map()) :: {:noreply, map()}
+  def handle_info({:forward, epoch, step, source, vector},
+      %{epoch: epoch, next_step: step} = state) do
+    if source in state.inputs and not Map.has_key?(state.pending, source) do
+      Chapter07.Math.vector!(vector, 1)
+      pending = Map.put(state.pending, source, vector)
+      if map_size(pending) == length(state.inputs) do
+        output = Enum.flat_map(state.inputs, &Map.fetch!(pending, &1))
+        Chapter07.Math.vector!(output, state.record.vl)
+        {fitness, halt?} = GenServer.call(state.scape, {:action, output}, 5_000)
+        send(state.cortex, {:acted, epoch, step, self(), output, fitness, halt?})
+        {:noreply, %{state | pending: %{}, next_step: step + 1}}
+      else
+        {:noreply, %{state | pending: pending}}
+      end
+    else
+      {:noreply, state}
+    end
+  end
+  def handle_info(_message, state), do: {:noreply, state}
+end
+```
+
+#### Thesis - map the genotype into the complete actor system
+
+The mapper creates one private scape, a cortex, the sensor, the actuator, and one
+process per neuron. Workers are temporary children: blindly restarting a neuron
+would leave its neighbors with stale PIDs. Recovery is not claimed here.
+
+The returned handle must have one owner during training. Parameters stay in the
+workers; `snapshot/1` reads the runtime values rather than returning an old copy
+of the input genotype. No process is registered under a global `trainer` or
+`benchmarker` name, so separate experiments do not share those names.
+
+```elixir
+defmodule Chapter07.Actor do
+  alias Chapter07.{Genotype, Layout, Math}
+  alias Chapter07.Actor.{Neuron, Sensor, Actuator, Scape, Cortex}
+  @moduledoc "Fine-grained phenotype and exoself's acknowledged control interface."
+  @type handle :: %{supervisor: pid(), cortex: pid(), scape: pid(), by_id: map(),
+                    genotype: Genotype.t(), layout: Layout.t(), epoch: reference()}
+
+  @spec open(Genotype.t()) :: handle()
+  def open(genotype) do
+    layout = Layout.new(genotype)
+    [{:private, :xor_sim}] = Chapter07.Morphology.scapes(genotype)
+    {:ok, supervisor} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    try do
+      {:ok, scape} = DynamicSupervisor.start_child(supervisor, {Scape, nil})
+      {:ok, cortex} = DynamicSupervisor.start_child(supervisor, {Cortex, nil})
+      units = Enum.reject(genotype, &(&1.kind == :cortex))
+      by_id = Enum.reduce(units, %{}, fn record, pids ->
+        module = case record.kind do
+          :sensor -> Sensor
+          :actuator -> Actuator
+          :neuron -> Neuron
+        end
+        {:ok, pid} = DynamicSupervisor.start_child(supervisor, {module, record})
+        Map.put(pids, record.id, pid)
+      end)
+      epoch = make_ref()
+      Enum.each(units, fn record ->
+        wiring = wiring(record, by_id, cortex, scape, epoch)
+        :ok = GenServer.call(Map.fetch!(by_id, record.id), {:wire, wiring})
+      end)
+      sensor = Genotype.one(genotype, :sensor)
+      actuator = Genotype.one(genotype, :actuator)
+      :ok = GenServer.call(cortex, {:wire, %{sensor: Map.fetch!(by_id, sensor.id),
+        actuator: Map.fetch!(by_id, actuator.id), epoch: epoch,
+        workers: [scape | Map.values(by_id)]}})
+      %{supervisor: supervisor, cortex: cortex, scape: scape, by_id: by_id,
+        genotype: genotype, layout: layout, epoch: epoch}
+    rescue
+      error ->
+        Supervisor.stop(supervisor)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  @spec wiring(map(), map(), pid(), pid(), reference()) :: map()
+  defp wiring(record, by_id, cortex, scape, epoch) do
+    case record.kind do
+      :sensor -> %{epoch: epoch, cortex: cortex, scape: scape,
+        outputs: Enum.map(record.fanout_ids, &Map.fetch!(by_id, &1))}
+      :actuator -> %{epoch: epoch, cortex: cortex, scape: scape,
+        inputs: Enum.map(record.fanin_ids, &Map.fetch!(by_id, &1))}
+      :neuron ->
+        {links, _} = Genotype.links_and_bias(record)
+        %{epoch: epoch, inputs: Enum.map(links, fn {id, w} -> {Map.fetch!(by_id, id), length(w)} end),
+          outputs: Enum.map(record.output_ids, &Map.fetch!(by_id, &1))}
+    end
+  end
+
+  @spec status(handle()) :: map()
+  def status(handle), do: GenServer.call(handle.cortex, :status)
+
+  @spec idle!(handle()) :: :ok
+  defp idle!(handle) do
+    state = status(handle)
+    unless not state.busy and state.halted == nil do
+      raise "Phenotype is not at a healthy evaluation boundary: #{inspect(state)}"
+    end
+    :ok
+  end
+
+  @spec set(handle(), [number()]) :: :ok
+  def set(handle, theta) do
+    idle!(handle)
+    Math.vector!(theta, handle.layout.parameters)
+    Enum.each(handle.layout.slices, fn item ->
+      values = Enum.slice(theta, item.offset, item.count)
+      :ok = GenServer.call(Map.fetch!(handle.by_id, item.id), {:set, values})
+    end)
+  end
+
+  @spec perturb(handle(), Chapter07.Tape.row()) :: :ok
+  def perturb(handle, draw) do
+    idle!(handle)
+    neuron_probability = 1.0 / :math.sqrt(handle.layout.neurons)
+    Enum.each(handle.layout.slices, fn item ->
+      selected = Enum.at(draw.neuron_u, item.owner) < neuron_probability
+      uniforms = Enum.slice(draw.parameter_u, item.offset, item.count)
+      deltas = Enum.slice(draw.delta, item.offset, item.count)
+      :ok = GenServer.call(Map.fetch!(handle.by_id, item.id),
+        {:perturb, selected, uniforms, deltas, 1.0 / :math.sqrt(item.fanin)})
+    end)
+  end
+
+  @spec backup(handle()) :: :ok
+  def backup(handle), do: control(handle, :backup)
+
+  @spec restore(handle()) :: :ok
+  def restore(handle), do: control(handle, :restore)
+
+  @spec control(handle(), :backup | :restore) :: :ok
+  defp control(handle, command) do
+    idle!(handle)
+    Enum.each(handle.layout.slices, fn item ->
+      :ok = GenServer.call(Map.fetch!(handle.by_id, item.id), command)
+    end)
+  end
+
+  @spec snapshot(handle()) :: [number()]
+  def snapshot(handle) do
+    idle!(handle)
+    Enum.flat_map(handle.layout.slices, fn item ->
+      GenServer.call(Map.fetch!(handle.by_id, item.id), :snapshot)
+    end)
+  end
+
+  @spec evaluate(handle()) :: map()
+  def evaluate(handle) do
+    case GenServer.call(handle.cortex, :evaluate, 45_000) do
+      {:ok, result} -> result
+      {:error, reason} -> raise "Evaluation aborted, not scored: #{inspect(reason)}"
+    end
+  end
+
+  @spec close(handle()) :: :ok
+  def close(handle) do
+    if Process.alive?(handle.supervisor), do: Supervisor.stop(handle.supervisor)
+    :ok
+  end
+end
+```
+
+#### Antithesis - the complete search as tensor state transitions
+
+The flat vector is reshaped into one row per neuron, with its bias in the last
+column. Each layer uses a matrix multiply and `tanh`. `apply_layers` is a
+**compile-time transform** over the fixed layer specification; it does not add a
+runtime actor or mutate topology. [D1, D2]
+
+The numerical search carries the accepted parameters, local fitness, global
+champion, two failure counters, evaluation count, and a bounded trace. Each
+iteration evaluates exactly one candidate. A seed resets local state; a rejected
+proposal leaves accepted state unchanged. The last proposal cannot accidentally
+replace the archived champion.
+
+| Tensor | Shape | Meaning |
+| --- | --- | --- |
+| Initial parameters | `{evaluation_limit, parameter_count}` | A possible fresh start at each evaluation index |
+| Neuron uniforms | `{evaluation_limit, neuron_count}` | Shared neuron-level gates |
+| Parameter uniforms and deltas | `{evaluation_limit, parameter_count}` | Parameter gates and perturbations |
+| Owners and probabilities | `{parameter_count}` | Parameter-to-neuron mapping and source probability |
+| Search trace | `{evaluation_limit, 8}` | Bounded record; only the evaluated prefix is displayed |
+
+`Nx.select/3` receives equal-shaped vectors for mutation masks and values.
+Scalar accept/reject conditions select complete parameter vectors. The loop carries
+all numerical inputs explicitly and preserves their types and shapes. `opts`
+contains only the static topology. There are no `Nx.to_number` calls or actor
+messages inside the numerical search loop. [D1, D2]
+
+**Scope of pure tensor:** numerical inference, mutation, acceptance, archive
+updates, local patience, restarts, and stopping all run in `defn`. Random input
+preparation, genotype validation, file storage, and display remain ordinary Elixir
+boundary operations. This is not a claim that Elixir's underlying BEAM runtime
+contains no processes.
+
+```elixir
+defmodule Chapter07.Tensor do
+  import Nx.Defn
+  alias Chapter07.{Config, Exoself, Genotype, Layout, Tape, XOR}
+  @moduledoc "Actor-free neural evaluation, perturbation, acceptance, and random restarts."
+
+  @spec forward(Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  @spec forward(Nx.Tensor.t(), Nx.Tensor.t(), keyword()) :: Nx.Tensor.t()
+  defn forward(theta, x, opts \\ []) do
+    opts = keyword!(opts, widths: [2, 1], input_width: 2)
+    apply_layers(theta, x, opts[:widths], opts[:input_width])
+  end
+
+  @spec apply_layers(Nx.Tensor.t(), Nx.Tensor.t(), [pos_integer()], pos_integer()) :: Nx.Tensor.t()
+  deftransformp apply_layers(theta, x, widths, input_width) do
+    {output, _offset, _width} = Enum.reduce(widths, {x, 0, input_width}, fn width, {input, offset, previous} ->
+      count = width * (previous + 1)
+      rows = theta |> Nx.slice_along_axis(offset, count, axis: 0) |> Nx.reshape({width, previous + 1})
+      weights = rows |> Nx.slice([0, 0], [width, previous]) |> Nx.transpose()
+      bias = rows |> Nx.slice([0, previous], [width, 1]) |> Nx.reshape({width})
+      {Nx.tanh(Nx.add(Nx.dot(input, weights), bias)), offset + count, width}
+    end)
+    output
+  end
+
+  @spec fitness(Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn fitness(predictions, targets) do
+    # Preserve BOTH square roots in Listing 7.6; this is not MSE.
+    row_distances = Nx.sqrt(Nx.sum(Nx.pow(predictions - targets, 2), axes: [1]))
+    1.0 / (Nx.sqrt(Nx.sum(row_distances)) + Nx.tensor(1.0e-5, type: :f64))
+  end
+
+  @spec perturb(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn perturb(theta, neuron_u, parameter_u, delta, owners, probabilities) do
+    neuron_probability = 1.0 / Nx.sqrt(Nx.as_type(Nx.axis_size(neuron_u, 0), :f64))
+    mask = (Nx.take(neuron_u, owners) < neuron_probability) and (parameter_u < probabilities)
+    limit = Nx.tensor(6.283185307179586, type: :f64)
+    # All three arguments have shape {parameters}; no implicit predicate expansion.
+    Nx.select(mask, Nx.clip(theta + delta, -limit, limit), theta)
+  end
+
+  @spec search(tuple(), tuple(), Nx.Tensor.t(), Nx.Tensor.t(), tuple()) :: tuple()
+  @spec search(tuple(), tuple(), Nx.Tensor.t(), Nx.Tensor.t(), tuple(), keyword()) :: tuple()
+  defn search(tape, metadata, x, y, limits, opts \\ []) do
+    opts = keyword!(opts, widths: [2, 1], input_width: 2)
+    {initial, _neuron_u, _parameter_u, _delta} = tape
+    theta = Nx.take(initial, 0, axis: 0)
+    zero = Nx.tensor(0, type: :s64)
+    low = Nx.tensor(-1.0, type: :f64)
+    trace = Nx.broadcast(Nx.tensor(0.0, type: :f64), {Nx.axis_size(initial, 0), 8})
+
+    {current, local_f, champion, champion_f, run_start_f, evaluations, failures,
+     failed_runs, runs, new_seed, trace, _tape, _metadata, _x, _y, _limits} =
+      while {current = theta, local_f = low, champion = theta, champion_f = low,
+             run_start_f = low, evaluations = zero, failures = zero, failed_runs = zero,
+             runs = zero, new_seed = Nx.tensor(1, type: :s64), trace,
+             tape, metadata, x, y, limits},
+            evaluations < Nx.axis_size(elem(tape, 0), 0) and
+            failed_runs < elem(limits, 1) and champion_f < elem(limits, 2) do
+        {initial, neuron_u, parameter_u, delta} = tape
+        {owners, probabilities} = metadata
+        {local_patience, _restart_patience, target} = limits
+        candidate = perturb(current, Nx.take(neuron_u, evaluations),
+          Nx.take(parameter_u, evaluations), Nx.take(delta, evaluations), owners, probabilities)
+        candidate = Nx.select(new_seed == 1, Nx.take(initial, evaluations), candidate)
+        candidate_f = fitness(forward(candidate, x, opts), y)
+        accepted = new_seed == 1 or candidate_f > local_f
+        run_start_f = Nx.select(new_seed == 1, champion_f, run_start_f)
+        current = Nx.select(accepted, candidate, current)
+        local_f = Nx.select(accepted, candidate_f, local_f)
+        failures = Nx.select(accepted, Nx.tensor(0, type: :s64), failures + 1)
+        better_global = candidate_f > champion_f
+        champion = Nx.select(better_global, candidate, champion)
+        champion_f = Nx.max(champion_f, candidate_f)
+        runs = runs + new_seed
+        ended = failures >= local_patience or
+          evaluations + 1 >= Nx.axis_size(initial, 0) or champion_f >= target
+        failed_runs = Nx.select(ended,
+          Nx.select(local_f > run_start_f, Nx.tensor(0, type: :s64), failed_runs + 1), failed_runs)
+        row = Nx.stack([Nx.as_type(evaluations + 1, :f64), Nx.as_type(runs, :f64),
+          candidate_f, local_f, champion_f, Nx.as_type(accepted, :f64),
+          Nx.as_type(new_seed, :f64), Nx.as_type(failures, :f64)]) |> Nx.reshape({1, 8})
+        trace = Nx.put_slice(trace, [evaluations, 0], row)
+        {current, local_f, champion, champion_f, run_start_f, evaluations + 1, failures,
+         failed_runs, runs, Nx.as_type(ended, :s64), trace, tape, metadata, x, y, limits}
+      end
+    # The remaining locals describe the last local run, not the global champion.
+    {champion, champion_f, evaluations, runs, failed_runs, trace}
+  end
+
+  @spec run(Genotype.t(), Tape.t(), Config.t()) :: map()
+  def run(template, tape, config) do
+    unless tape.limit == config.evaluation_limit do
+      raise ArgumentError, "tensor run requires tape.limit == evaluation_limit"
+    end
+    started = System.monotonic_time()
+    layout = Layout.new(template)
+    inputs = Nx.tensor(Enum.map(XOR.cases(), &elem(&1, 0)), type: :f64)
+    targets = Nx.tensor(Enum.map(XOR.cases(), &elem(&1, 1)), type: :f64)
+    metadata = {Nx.tensor(layout.owners, type: :s64), Nx.tensor(layout.probabilities, type: :f64)}
+    limits = {Nx.tensor(config.local_patience, type: :s64),
+      Nx.tensor(config.restart_patience, type: :s64), Nx.tensor(config.fitness_target, type: :f64)}
+    {theta, fitness, evaluations, runs, failed_runs, trace} =
+      search(Tape.tensors(tape), metadata, inputs, targets, limits,
+        widths: layout.widths, input_width: layout.input_width)
+    count = Nx.to_number(evaluations)
+    values = Nx.to_flat_list(theta)
+    score = Nx.to_number(fitness)
+    rows = trace |> Nx.slice_along_axis(0, count, axis: 0) |> Nx.to_flat_list()
+      |> Enum.chunk_every(8) |> Enum.map(fn [e, r, f, local, global, accepted, seed?, failures] ->
+        Exoself.trace_row(round(e), round(r), f, local, global, accepted == 1.0, seed? == 1.0, round(failures))
+      end)
+    elapsed = System.convert_time_unit(System.monotonic_time() - started, :native, :microsecond)
+    %{theta: values, fitness: score, evaluations: count, cycles: 4 * count,
+      runs: Nx.to_number(runs), restarts: Nx.to_number(runs) - 1,
+      failed_runs: Nx.to_number(failed_runs), trace: rows, elapsed_ms: elapsed / 1_000.0,
+      reason: Config.reason(score, count, config), genotype: Layout.restore(template, values), seed: tape.seed}
+  end
+end
+```
+
+The trace has unused zero rows after termination. `run/3` reads only its valid
+prefix. A full tensor run requires the tape length to equal the requested budget;
+this prevents an unnoticed discrepancy between allocated and effective budgets.
+
+#### Synthesis - a network actor with tensor internals
+
+The same trainer and exoself tasks now control one actor that owns current and
+accepted tensors. Inference and perturbation call the Nx kernels; backup and
+restoration retain immutable tensor values. XOR's four cases are evaluated in a
+batch. This removes per-neuron messaging without removing the outside controller.
+
+```mermaid
+flowchart LR
+    B[Benchmarker] --> T[Trainer task: fresh starts and archive]
+    T --> E[Exoself task: local search]
+    E --> W[Network actor: accepted and proposed tensors]
+    W --> N[Nx inference and masked perturbation]
+    N --> X[Pure XOR evaluation]
+    X --> W
+    W --> E
+```
+
+*Figure R7.3 - The synthesis uses process boundaries for runtime ownership and
+Nx for numerical work. The whole search need not be placed in a single GenServer
+callback; the outside controller can inspect each completed evaluation.*
+
+This version is not presumed faster or more robust. It trades fine-grained
+messaging for coarser ownership and performs tensor conversions at its boundaries.
+Those costs belong in the comparison.
+
+```elixir
+defmodule Chapter07.Hybrid do
+  use GenServer, restart: :temporary
+  alias Chapter07.{Genotype, Layout, Tape, Tensor, XOR}
+  @moduledoc "One network-level actor owns tensor parameters; Trainer/Exoself stay independent actors."
+  @type handle :: %{supervisor: pid(), worker: pid()}
+
+  @spec start_link(Genotype.t()) :: GenServer.on_start()
+  def start_link(genotype), do: GenServer.start_link(__MODULE__, genotype)
+
+  @spec open(Genotype.t()) :: handle()
+  def open(genotype) do
+    Genotype.validate!(genotype)
+    {:ok, supervisor} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    try do
+      {:ok, worker} = DynamicSupervisor.start_child(supervisor, {__MODULE__, genotype})
+      %{supervisor: supervisor, worker: worker}
+    rescue
+      error ->
+        Supervisor.stop(supervisor)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  @spec set(handle(), [number()]) :: :ok
+  def set(handle, theta), do: GenServer.call(handle.worker, {:set, theta}, 30_000)
+
+  @spec perturb(handle(), Tape.row()) :: :ok
+  def perturb(handle, draw), do: GenServer.call(handle.worker, {:perturb, draw}, 30_000)
+
+  @spec backup(handle()) :: :ok
+  def backup(handle), do: GenServer.call(handle.worker, :backup)
+
+  @spec restore(handle()) :: :ok
+  def restore(handle), do: GenServer.call(handle.worker, :restore)
+
+  @spec snapshot(handle()) :: [number()]
+  def snapshot(handle), do: GenServer.call(handle.worker, :snapshot, 30_000)
+
+  @spec evaluate(handle()) :: map()
+  def evaluate(handle), do: GenServer.call(handle.worker, :evaluate, 30_000)
+
+  @spec close(handle()) :: :ok
+  def close(handle) do
+    if Process.alive?(handle.supervisor), do: Supervisor.stop(handle.supervisor)
+    :ok
+  end
+
+  @impl true
+  @spec init(Genotype.t()) :: {:ok, map()}
+  def init(genotype) do
+    layout = Layout.new(genotype)
+    theta = Nx.tensor(Layout.flatten(genotype), type: :f64)
+    {:ok, %{theta: theta, backup: theta, layout: layout,
+      owners: Nx.tensor(layout.owners, type: :s64),
+      probabilities: Nx.tensor(layout.probabilities, type: :f64),
+      x: Nx.tensor(Enum.map(XOR.cases(), &elem(&1, 0)), type: :f64),
+      y: Nx.tensor(Enum.map(XOR.cases(), &elem(&1, 1)), type: :f64)}}
+  end
+
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: tuple()
+  def handle_call({:set, values}, _from, state) do
+    Chapter07.Math.vector!(values, state.layout.parameters)
+    {:reply, :ok, %{state | theta: Nx.tensor(values, type: :f64)}}
+  end
+  def handle_call({:perturb, draw}, _from, state) do
+    theta = Tensor.perturb(state.theta, Nx.tensor(draw.neuron_u, type: :f64),
+      Nx.tensor(draw.parameter_u, type: :f64), Nx.tensor(draw.delta, type: :f64),
+      state.owners, state.probabilities)
+    {:reply, :ok, %{state | theta: theta}}
+  end
+  def handle_call(:backup, _from, state), do: {:reply, :ok, %{state | backup: state.theta}}
+  def handle_call(:restore, _from, state), do: {:reply, :ok, %{state | theta: state.backup}}
+  def handle_call(:snapshot, _from, state), do: {:reply, Nx.to_flat_list(state.theta), state}
+  def handle_call(:evaluate, _from, state) do
+    output = Tensor.forward(state.theta, state.x,
+      widths: state.layout.widths, input_width: state.layout.input_width)
+    result = %{fitness: Tensor.fitness(output, state.y) |> Nx.to_number(), cycles: 4,
+      predictions: output |> Nx.to_flat_list() |> Enum.chunk_every(1)}
+    {:reply, result, state}
+  end
+end
+```
+
+## 7.7 Compiling Modules & Simulating the XOR Operation
+
+*Source: [S], pp. 219-223.*
+
+Livebook compiles the modules as their cells are evaluated. We use the source's
+`xor_mimic` morphology with hidden density `[2]`: two inputs, two hidden neurons,
+and one output neuron. The inherited weights start near zero. There is no
+backpropagation, crossover, structural mutation, or lifetime plasticity here.
+
+Sher's example reports one successful run and then examines its genotype. Our
+experiments keep a successful hand-designed fixture separate from the
+**stochastically trained** champions. A known solution tests the implementation;
+it is not inserted into the training tape.
+
+### Experiment 1 - Build the common genotype and audit its interfaces
+
+```elixir
+{genotype_template, _rng_after} = Chapter07.Morphology.construct(
+  :xor_mimic, [2], :rand.seed_s(:exsss, {7, 70, 700})
+)
+layout = Chapter07.Layout.new(genotype_template)
+config = Chapter07.Config.new(evaluation_limit: 1_200, local_patience: 80,
+  restart_patience: 5, fitness_target: 100.0)
+tape = Chapter07.Tape.new(layout, config.evaluation_limit, 73)
+
+tbl_layout = Enum.map(layout.slices, fn item ->
+  %{neuron: inspect(item.id), parameter_offset: item.offset, incoming_weights: item.fanin,
+    bias_included_count: item.count, weight_probability: 1.0 / :math.sqrt(item.fanin)}
+end)
+Chapter07.Tables.tabs(tbl_layout,
+  [:neuron, :parameter_offset, :incoming_weights, :bias_included_count, :weight_probability],
+  "ch_07_tbl_02_parameter_layout.csv")
+```
+
+### Experiment 2 - Source scape timing, backend parity, and rollback
+
+The following checks use a separately constructed XOR fixture. They test repeated
+evaluation, the four-cycle boundary, backup/restoration, and resource cleanup.
+The expected fixture score is approximately **188.95506** under the printed
+formula. That number is not a universal fitness maximum, nor a training result.
+
+The checks also exercise both patience counters on a deliberately constant tape,
+and stop after a deliberately worse final proposal. This makes bookkeeping
+errors testable without depending on a lucky optimization run.
+
+```elixir
+defmodule Chapter07.Checks do
+  alias Chapter07.{Actor, Config, Genotype, Hybrid, Layout, Support, Tape, Tensor, Trainer, XOR}
+  @moduledoc "Behavioral checks, not performance claims or a substitute for runtime validation."
+
+  @spec backend(module(), Genotype.t(), [number()], Tape.row()) :: [map()]
+  def backend(backend, template, theta, draw) do
+    handle = backend.open(template)
+    pids = DynamicSupervisor.which_children(handle.supervisor) |> Enum.map(&elem(&1, 1))
+    rows = try do
+      :ok = backend.set(handle, theta)
+      :ok = backend.backup(handle)
+      first = backend.evaluate(handle)
+      second = backend.evaluate(handle)
+      :ok = backend.perturb(handle, draw)
+      :ok = backend.restore(handle)
+      restored = backend.snapshot(handle)
+      expected = 188.95505963626906
+      [
+        Support.check!(first.cycles == 4, "#{inspect(backend)}: four cycles per evaluation"),
+        Support.check!(first.predictions == second.predictions, "#{inspect(backend)}: private scape resets"),
+        Support.check!(abs(first.fitness - expected) < 1.0e-5, "#{inspect(backend)}: known fixture score"),
+        Support.check!(abs(first.fitness - XOR.fitness(first.predictions)) < 1.0e-9,
+          "#{inspect(backend)}: actuator feedback agrees with predictions"),
+        Support.check!(restored == theta, "#{inspect(backend)}: restore recovers accepted weights")
+      ]
+    after
+      backend.close(handle)
+    end
+    rows ++ [Support.check!(Enum.all?(pids, &(not Process.alive?(&1))),
+      "#{inspect(backend)}: all phenotype workers stopped")]
+  end
+
+  @spec source_scape() :: {[map()], [map()]}
+  def source_scape do
+    {rows, final} = XOR.cases() |> Enum.with_index(1)
+      |> Enum.map_reduce(XOR.new(), fn {{input, target}, index}, state ->
+        {observed, state} = XOR.sense(state)
+        {observed_again, state} = XOR.sense(state)
+        true = observed == input and observed_again == input
+        {{fitness, halt?}, next} = XOR.action(state, target)
+        {%{cycle: index, input: inspect(input), output: hd(target), fitness: fitness, halt: halt?}, next}
+      end)
+    checks = [
+      Support.check!(Enum.map(rows, & &1.halt) == [false, false, false, true], "Scape halts only after fourth action"),
+      Support.check!(Enum.all?(Enum.take(rows, 3), &(&1.fitness == 0.0)) and
+        abs(List.last(rows).fitness - 100_000.0) < 1.0e-8, "Fitness is emitted only at episode end"),
+      Support.check!(final == XOR.new(), "Scape resets error and cursor together"),
+      Support.check!(Support.raises_argument?(fn -> XOR.action(XOR.new(), [0.0]) end), "Action before sense is rejected"),
+      Support.check!(Support.raises_argument?(fn -> XOR.row_distance([1.0, 0.0], [1.0]) end), "Wrong output width is rejected")
+    ]
+    {rows, checks}
+  end
+
+  @spec policies(Genotype.t(), Layout.t()) :: [map()]
+  def policies(template, layout) do
+    config = Config.new(evaluation_limit: 30, local_patience: 2, restart_patience: 2, fitness_target: 100.0)
+    original = Tape.new(layout, config.evaluation_limit, 13)
+    rows = original.rows |> Tuple.to_list() |> Enum.map(fn row ->
+      %{row | initial: List.duplicate(0.0, layout.parameters), neuron_u: List.duplicate(1.0, layout.neurons)}
+    end)
+    constant = %{original | rows: List.to_tuple(rows)}
+    small = [3.0, 3.0, 3.0, -3.0, -3.0, 3.0, 3.0, 3.0, -3.0]
+    rejected_config = Config.new(evaluation_limit: 2, local_patience: 2, restart_patience: 2, fitness_target: 100_001.0)
+    rejected = Tape.new(layout, 2, 17)
+    first = %{elem(rejected.rows, 0) | initial: small}
+    second = %{elem(rejected.rows, 1) | neuron_u: List.duplicate(0.0, layout.neurons),
+      parameter_u: List.duplicate(0.0, layout.parameters), delta: Enum.map(small, &(-&1))}
+    rejected = %{rejected | rows: {first, second}}
+
+    Enum.flat_map([:actor, :tensor, :hybrid], fn implementation ->
+      a = run(implementation, template, constant, config)
+      b = run(implementation, template, rejected, rejected_config)
+      [
+        Support.check!(a.evaluations == 9 and a.runs == 3 and a.failed_runs == 2,
+          "#{implementation}: nested patience stops after 9 evaluations / 3 starts"),
+        Support.check!(a.cycles == 36, "#{implementation}: cycles include baseline and terminal evaluations"),
+        Support.check!(a.reason == :restart_patience, "#{implementation}: correct stopping reason"),
+        Support.check!(Enum.all?(Enum.reject(a.trace, & &1.seed), &(not &1.accepted)),
+          "#{implementation}: tied/no-op proposals are rejected"),
+        Support.check!(b.evaluations == 2 and b.reason == :evaluation_limit,
+          "#{implementation}: hard evaluation budget is exact"),
+        Support.check!(b.theta == small and not List.last(b.trace).accepted,
+          "#{implementation}: terminal rejected weights are not exported")
+      ]
+    end)
+  end
+
+  @spec failure(Genotype.t()) :: [map()]
+  def failure(template) do
+    handle = Actor.open(template)
+    pids = DynamicSupervisor.which_children(handle.supervisor) |> Enum.map(&elem(&1, 1))
+    failed = try do
+      id = Genotype.one(template, :cortex).nids |> hd()
+      neuron = Map.fetch!(handle.by_id, id)
+      monitor = Process.monitor(neuron)
+      Process.exit(neuron, :kill)
+      receive do
+        {:DOWN, ^monitor, :process, ^neuron, _reason} -> :ok
+      after
+        5_000 -> raise "Timed out while confirming the intentional neuron failure"
+      end
+      try do
+        Actor.evaluate(handle)
+        false
+      rescue
+        error in RuntimeError -> String.contains?(Exception.message(error), "Evaluation aborted")
+      end
+    after
+      Actor.close(handle)
+    end
+    [Support.check!(failed, "A dead neuron causes an operational error, not a bad fitness"),
+     Support.check!(Enum.all?(pids, &(not Process.alive?(&1))), "Faulted phenotype cleanup stops surviving workers")]
+  end
+
+  @spec run(:actor | :tensor | :hybrid, Genotype.t(), Tape.t(), Config.t()) :: map()
+  defp run(:actor, template, tape, config), do: Trainer.run(Actor, template, tape, config)
+  defp run(:tensor, template, tape, config), do: Tensor.run(template, tape, config)
+  defp run(:hybrid, template, tape, config), do: Trainer.run(Hybrid, template, tape, config)
+
+end
+```
+
+```elixir
+{tbl_scape_steps, checks_scape} = Chapter07.Checks.source_scape()
+Chapter07.Tables.tabs(tbl_scape_steps, [:cycle, :input, :output, :fitness, :halt],
+  "ch_07_tbl_03_scape_feedback.csv")
+```
+
+```elixir
+limit = 2.0 * :math.pi()
+theta_fixture = [limit, limit, limit, -limit, -limit, limit, limit, limit, -limit]
+checks_backends = Enum.flat_map([Chapter07.Actor, Chapter07.Hybrid], fn backend ->
+  Chapter07.Checks.backend(backend, genotype_template, theta_fixture, Chapter07.Tape.row(tape, 1))
+end)
+
+x_xor = Nx.tensor(Enum.map(Chapter07.XOR.cases(), &elem(&1, 0)), type: :f64)
+y_xor = Nx.tensor(Enum.map(Chapter07.XOR.cases(), &elem(&1, 1)), type: :f64)
+y_fixture = Chapter07.Tensor.forward(Nx.tensor(theta_fixture, type: :f64), x_xor,
+  widths: layout.widths, input_width: layout.input_width)
+fixture_fitness = Chapter07.Tensor.fitness(y_fixture, y_xor) |> Nx.to_number()
+
+checks_static = [
+  Chapter07.Support.check!(layout.neurons == 3 and layout.parameters == 9, "Three neurons / nine parameters"),
+  Chapter07.Support.check!(Chapter07.Morphology.scapes(genotype_template) == [{:private, :xor_sim}],
+    "Sensor and actuator share one scape specification"),
+  Chapter07.Support.check!(Chapter07.Layout.flatten(Chapter07.Layout.restore(genotype_template, theta_fixture)) == theta_fixture,
+    "Genotype / parameter round-trip preserves order"),
+  Chapter07.Support.check!(abs(fixture_fitness - 188.95505963626906) < 1.0e-5, "Pure tensor fixture uses the source score"),
+  Chapter07.Support.check!(Nx.to_flat_list(Nx.select(Nx.greater_equal(y_fixture, 0.0), 1.0, -1.0)) ==
+    Nx.to_flat_list(y_xor), "Known fixture classifies the complete truth table"),
+  Chapter07.Support.check!(abs(Chapter07.XOR.fitness(predictions_audit) - 1.0 / (:math.sqrt(2.0) + 1.0e-5)) < 1.0e-12,
+    "Printed score audit retains both square roots")
+]
+
+checks_policies = Chapter07.Checks.policies(genotype_template, layout)
+tbl_contract_checks = checks_scape ++ checks_backends ++ checks_static ++ checks_policies
+Chapter07.Tables.tabs(tbl_contract_checks, [:check, :result], "ch_07_tbl_04_contract_checks.csv")
+```
+
+### Experiment 3 - Inspect one masked perturbation
+
+This is one proposal from the fixed template, not a search history. A `false`
+entry can result from either gate being closed. A selected value at the saturation
+boundary can also remain unchanged.
+
+```elixir
+theta_before = Chapter07.Layout.flatten(genotype_template)
+draw = Chapter07.Tape.row(tape, 1)
+theta_proposed = Chapter07.Tensor.perturb(Nx.tensor(theta_before, type: :f64),
+  Nx.tensor(draw.neuron_u, type: :f64), Nx.tensor(draw.parameter_u, type: :f64),
+  Nx.tensor(draw.delta, type: :f64), Nx.tensor(layout.owners, type: :s64),
+  Nx.tensor(layout.probabilities, type: :f64)) |> Nx.to_flat_list()
+
+tbl_mutation = Enum.zip([theta_before, theta_proposed, layout.owners])
+  |> Enum.with_index() |> Enum.map(fn {{before, proposed, owner}, parameter} ->
+    %{parameter: parameter, neuron: owner, before: before, proposed: proposed, changed: before != proposed}
+  end)
+Chapter07.Tables.tabs(tbl_mutation, [:parameter, :neuron, :before, :proposed, :changed],
+  "ch_07_tbl_05_masked_perturbation.csv")
+```
+
+### Experiment 4 - Run the three searches
+
+Each implementation receives the same **recorded tape**, not merely the same
+integer seed applied to unrelated random generators. The first tensor call may
+include numerical compilation/tracing overhead. Reported time includes that
+implementation's setup, execution, and result materialization, but not the shared
+tape generation. Treat it as an observed end-to-end measurement, not a pure-kernel
+speed benchmark.
+
+Floating-point accumulation can still differ between scalar and tensor execution.
+A near-tie can change a strict acceptance decision and later search history.
+Therefore, long-run trace equality is inspected, not imposed as a universal
+invariant. The deterministic policy checks above isolate exact bookkeeping.
+
+```elixir
+result_actor = Chapter07.Trainer.run(Chapter07.Actor, genotype_template, tape, config)
+result_tensor = Chapter07.Tensor.run(genotype_template, tape, config)
+result_hybrid = Chapter07.Trainer.run(Chapter07.Hybrid, genotype_template, tape, config)
+results = [actor: result_actor, tensor: result_tensor, hybrid: result_hybrid]
+
+tbl_runs = Enum.map(results, fn {implementation, result} ->
+  %{implementation: implementation, fitness: result.fitness,
+    target_reached: result.fitness >= config.fitness_target,
+    evaluations: result.evaluations, cycles: result.cycles, starts: result.runs,
+    restarts: result.restarts, stop_reason: result.reason, elapsed_ms: result.elapsed_ms}
+end)
+Chapter07.Tables.tabs(tbl_runs,
+  [:implementation, :fitness, :target_reached, :evaluations, :cycles, :starts, :restarts, :stop_reason, :elapsed_ms],
+  "ch_07_tbl_06_training_runs.csv")
+```
+
+An evaluation-limit result remains informative. Inspect its best score, predictions,
+and trace; do not relabel it as a successful solve or replace it with the known
+fixture. The returned genotype is the **global champion**, not necessarily the
+last local run or the last evaluated proposal.
+
+```elixir
+tbl_trace_all = Enum.flat_map(results, fn {implementation, result} ->
+  Enum.map(result.trace, &Map.put(&1, :implementation, Atom.to_string(implementation)))
+end)
+fig_training = Vl.new(width: 680, height: 290, title: "R7.4 - Best fitness across evaluations")
+  |> Vl.data_from_values(tbl_trace_all)
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "evaluation", type: :quantitative)
+  |> Vl.encode_field(:y, "global_best", type: :quantitative)
+  |> Vl.encode_field(:color, "implementation", type: :nominal)
+fig_training
+```
+
+The chart uses every recorded evaluation. The table below is a labeled snapshot:
+all fresh starts, every 25th evaluation, and each implementation's final evaluation.
+The separate full-trace download contains all rows.
+
+```elixir
+last_evaluation = Map.new(results, fn {implementation, result} ->
+  {Atom.to_string(implementation), result.evaluations}
+end)
+tbl_trace_sample = Enum.filter(tbl_trace_all, fn row ->
+  row.seed or rem(row.evaluation, 25) == 0 or row.evaluation == Map.fetch!(last_evaluation, row.implementation)
+end)
+trace_columns = [:implementation, :evaluation, :run, :fitness, :local_best, :global_best,
+  :accepted, :seed, :local_failures]
+Chapter07.Tables.tabs(tbl_trace_sample, trace_columns, "ch_07_tbl_07_trace_snapshot.csv")
+```
+
+```elixir
+Kino.Download.new(fn -> Chapter07.Tables.csv(tbl_trace_all, trace_columns) end,
+  filename: "ch_07_full_training_trace.csv", label: "Download every evaluation")
+```
+
+### Experiment 5 - Inspect the saved champions and persist one
+
+For a common audit, re-evaluate each returned parameter vector with the same tensor
+forward function. This table compares the **three saved champions**; it is not a
+claim that different champions must have identical outputs. The scoring function
+is rechecked against the reported best fitness.
+
+```elixir
+champion_predictions = Map.new(results, fn {implementation, result} ->
+  predictions = Chapter07.Tensor.forward(Nx.tensor(result.theta, type: :f64), x_xor,
+    widths: layout.widths, input_width: layout.input_width)
+  {implementation, Nx.to_flat_list(predictions)}
+end)
+tbl_champions = Chapter07.XOR.cases() |> Enum.with_index() |> Enum.map(fn {{[x1, x2], [target]}, index} ->
+  %{x1: x1, x2: x2, target: target, actor_champion: Enum.at(champion_predictions.actor, index),
+    tensor_champion: Enum.at(champion_predictions.tensor, index),
+    hybrid_champion: Enum.at(champion_predictions.hybrid, index)}
+end)
+Chapter07.Tables.tabs(tbl_champions, [:x1, :x2, :target, :actor_champion, :tensor_champion, :hybrid_champion],
+  "ch_07_tbl_08_champion_predictions.csv")
+```
+
+```elixir
+checks_search = Enum.flat_map(results, fn {implementation, result} ->
+  fitness = Chapter07.XOR.fitness(Enum.map(Map.fetch!(champion_predictions, implementation), &[&1]))
+  monotonic = result.trace |> Enum.map(& &1.global_best) |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.all?(fn [before, after_value] -> after_value >= before end)
+  [
+    Chapter07.Support.check!(result.evaluations <= config.evaluation_limit and
+      result.evaluations == length(result.trace), "#{implementation}: evaluation count matches trace"),
+    Chapter07.Support.check!(result.cycles == 4 * result.evaluations, "#{implementation}: cycle accounting"),
+    Chapter07.Support.check!(monotonic, "#{implementation}: archive fitness never decreases"),
+    Chapter07.Support.check!(abs(fitness - result.fitness) <= 1.0e-5 * max(1.0, abs(result.fitness)),
+      "#{implementation}: exported parameters reproduce reported fitness"),
+    Chapter07.Support.check!(Enum.all?(result.theta, &(abs(&1) <= 2.0 * :math.pi())),
+      "#{implementation}: every parameter remains within saturation limits")
+  ]
+end)
+
+path_ets = Path.join(System.tmp_dir!(), "ch_07_#{System.unique_integer([:positive])}.ets")
+round_trip = try do
+  :ok = Chapter07.Store.save!(result_actor.genotype, path_ets)
+  Chapter07.Store.load!(path_ets)
+after
+  File.rm(path_ets)
+end
+checks_storage = [
+  Chapter07.Support.check!(Chapter07.Layout.flatten(round_trip) == result_actor.theta,
+    "ETS save/load preserves trained parameters"),
+  Chapter07.Support.check!(Chapter07.Store.decode(Chapter07.Store.encode(result_actor.genotype)) == result_actor.genotype,
+    "Versioned checkpoint round-trip"),
+  Chapter07.Support.check!(is_binary(Chapter07.Tables.csv(tbl_runs, [:implementation, :fitness])),
+    "CSV download callback returns binary content")
+]
+tbl_search_checks = checks_search ++ checks_storage
+Chapter07.Tables.tabs(tbl_search_checks, [:check, :result], "ch_07_tbl_09_search_and_storage_checks.csv")
+```
+
+```elixir
+Kino.Download.new(fn -> Chapter07.Store.encode(result_actor.genotype) end,
+  filename: "ch_07_actor_champion.etf", label: "Download actor-trained champion genotype")
+```
+
+The versioned download contains a genotype, not an entire resumable trainer.
+Reproducing or resuming an experiment additionally needs its random tape or random
+state, configuration, counters, and relevant scape state. Only load checkpoints
+from trusted sources; `binary_to_term(..., [:safe])` is not a complete defense
+against arbitrary hostile files.
+
+### Experiment 6 - Operational failure is not low fitness
+
+Terminate one neuron, request evaluation, and require an operational error. Then
+close the whole phenotype. The supervisor may log the intentional termination.
+This is a failure-detection and cleanup check, not automatic recovery.
+
+```elixir
+tbl_failure_checks = Chapter07.Checks.failure(genotype_template)
+Chapter07.Tables.tabs(tbl_failure_checks, [:check, :result], "ch_07_tbl_10_failure_checks.csv")
+```
+
+## 7.8 Adding the benchmarker Module
+
+*Source: [S], pp. 223-226; Listing 7.11.*
+
+A benchmarker repeats the entire trainer, collects fitness, evaluations, cycles,
+and elapsed time, and reports minimum, maximum, mean, and standard deviation.
+We retain the source's **population standard deviation** with denominator $n$:
+
+$$
+\bar x=\frac{1}{n}\sum_i x_i,
+\qquad
+\sigma=\sqrt{\frac{1}{n}\sum_i(x_i-\bar x)^2}.
+$$
+
+The printed listing calls `std/1` but defines an `avg_std/1` entry point instead.
+Our implementation supplies one consistent `statistics/1` function. It rejects
+empty samples and gives zero standard deviation for a single value.
+
+**Remaster reporting rule:** budget-exhausted runs stay in the results. We also
+report how many runs reached the target. Mean evaluations across all runs is
+**mean consumed budget**, not mean evaluations-to-solution when some runs failed.
+The source's historical result table is not reproduced as a result of this code.
+
+```elixir
+defmodule Chapter07.Benchmarker do
+  alias Chapter07.{Actor, Config, Genotype, Hybrid, Layout, Tape, Tensor, Trainer}
+  @moduledoc "Repeated, bounded trials. Budget exhaustion remains in the reported sample."
+
+  @spec run(:actor | :tensor | :hybrid, Genotype.t(), Tape.t(), Config.t()) :: map()
+  def run(:actor, template, tape, config), do: Trainer.run(Actor, template, tape, config)
+  def run(:tensor, template, tape, config), do: Tensor.run(template, tape, config)
+  def run(:hybrid, template, tape, config), do: Trainer.run(Hybrid, template, tape, config)
+
+  @spec repeat(Genotype.t(), [non_neg_integer()], Config.t()) :: [map()]
+  def repeat(template, seeds, config) do
+    unless seeds != [], do: raise(ArgumentError, "at least one seed is required")
+    layout = Layout.new(template)
+    Enum.flat_map(Enum.with_index(seeds), fn {seed, index} ->
+      tape = Tape.new(layout, config.evaluation_limit, seed)
+      # Rotate execution order to avoid always running one implementation first.
+      order = [:actor, :tensor, :hybrid]
+      {left, right} = Enum.split(order, rem(index, 3))
+      Enum.map(right ++ left, fn implementation ->
+        result = run(implementation, template, tape, config)
+        %{implementation: implementation, seed: seed, fitness: result.fitness,
+          success: result.fitness >= config.fitness_target, evaluations: result.evaluations,
+          cycles: result.cycles, restarts: result.restarts, elapsed_ms: result.elapsed_ms,
+          reason: result.reason}
+      end)
+    end)
+  end
+
+  @spec statistics([number()]) :: map()
+  def statistics(values) do
+    unless values != [], do: raise(ArgumentError, "cannot summarize an empty sample")
+    count = length(values)
+    mean = Enum.sum(values) / count
+    variance = Enum.reduce(values, 0.0, fn x, sum -> sum + (x - mean) * (x - mean) end) / count
+    %{mean: mean, std: :math.sqrt(variance), min: Enum.min(values), max: Enum.max(values)}
+  end
+
+  @spec summarize([map()]) :: [map()]
+  def summarize(rows) do
+    rows |> Enum.group_by(& &1.implementation) |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.flat_map(fn {implementation, group} ->
+      successes = Enum.count(group, & &1.success)
+      Enum.map([:fitness, :evaluations, :cycles, :elapsed_ms], fn metric ->
+        stats = statistics(Enum.map(group, &Map.fetch!(&1, metric)))
+        Map.merge(stats, %{implementation: implementation, metric: metric, runs: length(group),
+          successes: successes, success_rate: successes / length(group)})
+      end)
+    end)
+  end
+end
+```
+
+### Experiment 7 - Repeat bounded searches with paired seeds
+
+The default below uses three seeds and a 600-evaluation budget to keep the notebook
+bounded. Increase the number of seeds for a substantive study. The source's
+example used 100 trials with a target and no evaluation limit; that is a different
+experimental protocol.
+
+The implementation order rotates by seed. All methods for a seed use the same
+tape. Timings include setup, conversions, and any compilation/tracing incurred by
+the call. They are not normalized CPU/GPU kernel timings. In particular,
+BinaryBackend measurements cannot establish accelerator speedups.
+
+```elixir
+benchmark_config = Chapter07.Config.new(evaluation_limit: 600, local_patience: 80,
+  restart_patience: 5, fitness_target: 100.0)
+benchmark_seeds = [11, 22, 33]
+tbl_benchmark_runs = Chapter07.Benchmarker.repeat(genotype_template, benchmark_seeds, benchmark_config)
+Chapter07.Tables.tabs(tbl_benchmark_runs,
+  [:implementation, :seed, :fitness, :success, :evaluations, :cycles, :restarts, :elapsed_ms, :reason],
+  "ch_07_tbl_11_benchmark_runs.csv")
+```
+
+```elixir
+tbl_benchmark_summary = Chapter07.Benchmarker.summarize(tbl_benchmark_runs)
+Chapter07.Tables.tabs(tbl_benchmark_summary,
+  [:implementation, :metric, :runs, :successes, :success_rate, :mean, :std, :min, :max],
+  "ch_07_tbl_12_benchmark_summary.csv")
+```
+
+```elixir
+fig_benchmark = Vl.new(width: 680, height: 280, title: "R7.5 - Consumed evaluations, including budget exhaustion")
+  |> Vl.data_from_values(tbl_benchmark_runs)
+  |> Vl.mark(:point, filled: true, size: 90)
+  |> Vl.encode_field(:x, "implementation", type: :nominal)
+  |> Vl.encode_field(:y, "evaluations", type: :quantitative)
+  |> Vl.encode_field(:color, "success", type: :nominal)
+  |> Vl.encode_field(:tooltip, "seed", type: :nominal)
+fig_benchmark
+```
+
+For a fair architecture study, hold the genotype, observations, fitness definition,
+random input, and budgets constant. Separate cold-start timing from warmed
+execution when that distinction matters. If strict decisions diverge, inspect the
+first differing evaluation before interpreting a timing or convergence difference.
+
+## 7.9 Summary
+
+*Source: [S], pp. 226-227.*
+
+We now have a fixed-topology network that can be optimized by an external process,
+a standard task interface, random restarts with a global champion, and repeated
+experiments with recorded statistics. In Sher's terminology this is **external
+training**, not the lifetime neural plasticity discussed earlier.
+
+| Thesis | Antithesis | Synthesis |
+| --- | --- | --- |
+| Individual neural processes hold parameters and exchange signals | A tensor state machine holds parameters and performs the complete search | A network actor owns tensor parameters while outside tasks manage search |
+| Scape feedback closes each action cycle | A batch evaluates XOR's independent cases | A worker evaluates the same batch and returns episode-level feedback |
+| Backup/restore are acknowledged process operations | Rejection retains the previous tensor | Backup/restore switch between accepted and proposed tensor values |
+| Failure is detected at runtime process boundaries | No application-level actor lifecycle in the numerical core | Failure boundaries are coarser than one neuron |
+
+**GES remains the algorithmic framework.** Generation proposes weights, Evaluation
+measures performance through the scape, and Selection decides acceptance and
+archive replacement. Thesis-Antithesis-Synthesis remains the implementation and
+comparison framework. Neither framework implies that the hybrid must win.
+
+### Final checks
+
+These aggregate the earlier checks and validate the benchmark accounting. They
+intentionally do not assert a particular random run's success, a speed ranking,
+or exact equality of long floating-point search histories.
+
+```elixir
+stats_example = Chapter07.Benchmarker.statistics([1.0, 2.0, 3.0])
+checks_benchmark = [
+  Chapter07.Support.check!(abs(stats_example.mean - 2.0) < 1.0e-12, "Benchmark mean"),
+  Chapter07.Support.check!(abs(stats_example.std - :math.sqrt(2.0 / 3.0)) < 1.0e-12,
+    "Benchmark SD uses the source's denominator N"),
+  Chapter07.Support.check!(Chapter07.Benchmarker.statistics([7.0]).std == 0.0,
+    "Single-run population SD is zero"),
+  Chapter07.Support.check!(length(tbl_benchmark_runs) == 3 * length(benchmark_seeds),
+    "No bounded benchmark runs were omitted"),
+  Chapter07.Support.check!(Enum.all?(tbl_benchmark_runs, fn row ->
+    row.cycles == 4 * row.evaluations and row.evaluations <= benchmark_config.evaluation_limit
+  end), "Every benchmark run respects cycle and evaluation accounting")
+]
+tbl_all_checks = tbl_contract_checks ++ tbl_search_checks ++ tbl_failure_checks ++ checks_benchmark
+Chapter07.Tables.tabs(tbl_all_checks, [:check, :result], "ch_07_tbl_13_all_checks.csv")
+```
+
+### Exercises
+
+| Exercise | Change | What to inspect |
+| --- | --- | --- |
+| Patience versus total work | Change `local_patience` while keeping the total evaluation budget fixed | Number of starts, accepted improvements, and target success rate |
+| Mutation granularity | Inspect neuron and parameter gates separately | Correlated changes within a neuron; no-op proposals |
+| Strict versus neutral acceptance | Build a separately labeled variant that accepts ties | Plateaus, failure counters, and changed search semantics |
+| Error definition | Add a separately named MSE evaluator to all three backends | Recalibrate the target; do not reuse the printed-score target blindly |
+| Batching boundary | Replace XOR with a task whose next observation depends on the action | Which operations must remain sequential? |
+| Runtime granularity | Compare per-neuron and per-network workers | Messaging, conversion, lifecycle, and failure boundaries |
+
+Keep the default `[2]` fixture when running the supplied fixed-size fixture and
+scripted-policy checks. To study another hidden topology, construct it with
+`Morphology.construct/3`, create a matching `Layout` and tape, and use the general
+trainer/tensor interfaces; adapt the hard-coded fixture tests separately.
+
+### Source-to-remaster decisions
+
+| Source location | What the source contains | Explicit remaster treatment |
+| --- | --- | --- |
+| pp. 188-190 | Local patience, restart patience, random starts, masked perturbation | Preserve the two levels; use clear zero-based consecutive-failure counters |
+| p. 190 | Local patience proportional to square root of network size | Expose a parameter; 80 is a notebook choice, not a printed multiplier |
+| pp. 203-204 | ETS with tuple record keys | Store `{id, map}` entries; close temporary tables explicitly |
+| pp. 206-207 | Trainer startup and loop arities disagree in the printed listing | Supply a consistent function/task interface |
+| pp. 208-209 | Terminal evaluation count and explanatory variable names are inconsistent | Count every completed evaluation; reset failure counters, not total evaluations |
+| p. 212 | A per-case square root followed by another square root; called MSE | Preserve the executable score and name it printed/source fitness |
+| p. 214 | `EFAcc` versus `HFAcc`; misspelled `termiante` | Use one halt path and supervised teardown |
+| pp. 216-218 | Current/backup weights and scalar bias handling | Represent bias explicitly, preserve mutation eligibility and denominator |
+| p. 219 | Zero-vector substitution for invalid sensor width | Abort the evaluation rather than score fabricated input |
+| pp. 220-222 | Mixed error thresholds, one reported run, discussion of saturation | Derive thresholds from the actual score; label the fixture and avoid a universal maximum claim |
+| pp. 224-225 | `std/1` calls versus `avg_std/1` definition; variance denominator N | One checked statistics function with the same denominator |
+| Across the chapter | Process-local randomness, global registered names, unbounded defaults | Recorded draws, explicit handles, bounded reproducible experiments |
+| Across the comparison | No Nx implementation in the original | Clearly labeled tensor and hybrid remaster additions |
+
+An acknowledged runtime backup is not a durable checkpoint. A genotype export is
+not a complete training-session checkpoint. A supervisor detecting a crash is not
+a repaired neural graph. These distinctions remain important in later chapters.
+
+### References
+
+**[S]** Gene I. Sher. *Handbook of Neuroevolution Through Erlang*. Springer, 2013.
+Chapter 7, "Adding the Stochastic Hill-Climber Learning Algorithm," pp. 187-227.
+DOI: `10.1007/978-1-4614-4463-3_7`. The uploaded 41-page chapter is the basis for
+its terminology, section sequence, algorithm, interfaces, and source audit.
+
+The software references below support the **new implementation**, not Sher's
+2013 account. Dependency versions remain pinned to the earlier notebooks.
+
+| Key | Official implementation reference | Used for |
+| --- | --- | --- |
+| D1 | [Nx](https://nx.hexdocs.pm/Nx.html) and [Nx.Defn](https://nx.hexdocs.pm/Nx.Defn.html) | Tensor shapes, numerical definitions, backends |
+| D2 | [Nx.Defn.Kernel](https://nx.hexdocs.pm/Nx.Defn.Kernel.html) | Fixed-shape loop state and compile-time transforms |
+| D3 | [Erlang ETS](https://www.erlang.org/doc/apps/stdlib/ets.html) | Table ownership and file persistence |
+| D4 | [GenServer](https://hexdocs.pm/elixir/GenServer.html) | Client/server callbacks and regular messages |
+| D5 | [Task.Supervisor](https://hexdocs.pm/elixir/Task.Supervisor.html) | Explicitly supervised task lifetimes |
+| D6 | [Kino.Layout](https://hexdocs.pm/kino/Kino.Layout.html) and [Kino.Download](https://hexdocs.pm/kino/Kino.Download.html) | Tabbed computed tables and binary downloads |
+
+**Next: Chapter 8.** Replace a sequence of independent fresh starts with a
+population and introduce structural mutation. Until then, this chapter changes
+**weights and biases**, not topology.
+
+**End of Chapter 7.**
+
