@@ -1,0 +1,3415 @@
+# Chapter 8. Developing a Simple Neuroevolutionary Platform
+
+```elixir
+Mix.install([
+  {:nx, "1.0.0"},
+  {:kino, "0.19.1"},
+  {:kino_vega_lite, "0.1.13"}
+])
+
+Nx.default_backend(Nx.BinaryBackend)
+Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+alias VegaLite, as: Vl
+
+# SPDX-License-Identifier: GPL-3.0-only
+# Source-derived portions: Copyright (C) 2012 Gene Sher, DXNN Research Group.
+# Original contact: CorticalComputer@gmail.com
+# Elixir/Nx adaptation, tests, and explanatory changes: 2026-11-16.
+# The complete GPL v3 text is embedded at the end of this file and in the companion bundle.
+```
+
+## Reader's guide
+
+**Neuroevolution through Elixir**  
+Part II - Neuroevolution: Taking the First Step
+
+**The central idea:** Chapter 7 searched for weights in one chosen topology.
+Chapter 8 keeps a population and changes the topology itself.
+
+This notebook follows Gene I. Sher's Chapter 8, **printed pp. 229-346**.
+References marked **[S]** refer to the supplied 118-page PDF; PDF page 1 is
+printed p. 229. The original section numbering is retained, including the
+population monitor and neural runtime inside **8.5.15-8.5.17**.
+
+The source's architecture, mutation families, recurrence rule, and selection
+method are explained first. The executable Elixir, Nx, and hybrid comparison,
+new diagrams, tests, and GES notation are **remaster additions**. Explicit
+implementation departures are collected in the source-audit table near the end.
+This is not an official edition or a verbatim replacement for the textbook.
+
+### One evolutionary experiment, three execution models
+
+| Pass | Execution model | What it actually implements |
+| --- | --- | --- |
+| Thesis | Ordinary Elixir data and neural actors | Scalar mutations, per-node signal processing, local search, and a population monitor |
+| Antithesis | Nx numerical definitions | Structural mutation, recurrence, local search, selection, offspring creation, archiving, and stopping inside `defn` |
+| Synthesis | Coarse actor workers containing Nx | Actors coordinate generations; each agent's complete local tuning job runs through the Nx core |
+
+All three share recorded random draws and a common parameter layout. This removes
+random scheduling as a source of differences. It does not remove floating-point
+rounding: a near tie can still change a strict selection decision.
+
+### Scope of the executable comparison
+
+The source describes an extensible platform. This notebook implements a **bounded
+research prototype**: fixed-capacity node storage, at most two values per sensory
+or actuator vector, the XOR morphology, and 128 recorded mutation events per
+lineage. Empty slots can become neurons or interfaces; a fixed storage shape does
+**not** mean a fixed network topology. Capacity exhaustion is reported, not hidden.
+
+The default morphology has one two-value sensor and one one-value actuator.
+A separate, clearly labeled test morphology adds a reversed-input sensor, a
+constant sensor, and a two-channel diagnostic actuator. These exercise interface
+mutations; they do not introduce target-label inputs or change the XOR objective.
+
+There is **no crossover, dynamic NEAT-style speciation, neuron deletion, simulated
+robot world, or automatic recovery from every failure** in this implementation.
+Those features must not be inferred from the broader architecture discussion.
+
+### Run this notebook
+
+Evaluate cells in order, beginning with setup. No earlier notebook is required.
+The pinned dependencies match Chapters 2-7. Use an Elixir runtime compatible with
+Nx 1.0.0. Network access is needed for the initial package installation, unless
+packages are cached. There is no downloaded training dataset.
+
+The reference runtime is CPU `Nx.BinaryBackend`, `Nx.Defn.Evaluator`, and `f64`.
+The numerical population loop is deliberately sequential over agents. Selection
+and graph arithmetic use tensors, but this is **not a claim of GPU acceleration
+or population-wide vectorized evaluation**. A different backend is a separate
+experiment. [D1, D2]
+
+The Mnesia experiment is **opt-in**. It refuses an already running Mnesia instance
+and never deletes an existing schema. Do not change this guard to experiment on a
+production database.
+
+Every named handwritten function has an `@spec`. Only computed data tables have
+**Interactive / Markdown / CSV** tabs. Explanatory tables remain Markdown.
+
+**Validation boundary:** independent Python/NumPy models passed the reference
+checks described at the end. The actual Elixir/Nx cells, actor scheduling, Mnesia
+lifecycle, and Livebook rendering have **not been executed in this authoring
+environment**. Run the executable checks before relying on the experiments.
+
+### Presentation and scalar functions
+
+`Tables` handles display only. `Functions` preserves the activation formulas in
+Listing 8.21, including its approximate exponential base, signed square root,
+signed quadratic, and bipolar sigmoid. Naming is canonicalized: `absolute` and
+`gaussian`, rather than mixing the source's `abs`/`gauss` aliases with other names.
+
+```elixir
+defmodule Chapter08.Tables do
+  @moduledoc false
+  @spec tabs([map()], [atom()], String.t()) :: Kino.Layout.t()
+  def tabs(rows, columns, filename) do
+    records = [columns | Enum.map(rows, fn r -> Enum.map(columns, &Map.fetch!(r, &1)) end)]
+    csv = Enum.map_join(records, "\r\n", fn row ->
+      Enum.map_join(row, ",", fn value ->
+        "\"" <> String.replace(to_string(value), "\"", "\"\"") <> "\""
+      end)
+    end) <> "\r\n"
+    [header | body] = Enum.map(records, &markdown_row/1)
+    divider = markdown_row(Enum.map(columns, fn _ -> "---" end))
+    markdown = Enum.join([header, divider | body], "\n")
+    Kino.Layout.tabs([
+      {"Interactive", Kino.DataTable.new(rows, keys: columns)},
+      {"Markdown", Kino.Markdown.new(markdown)},
+      {"CSV", Kino.Layout.grid([
+        Kino.Download.new(fn -> csv end, filename: filename, label: "Download CSV"),
+        Kino.Text.new(csv)
+      ])}
+    ])
+  end
+
+  @spec markdown_row([term()]) :: String.t()
+  defp markdown_row(values) do
+    "| " <> Enum.map_join(values, " | ", fn value ->
+      value |> to_string() |> String.replace("|", "\\|") |> String.replace("\n", "<br>")
+    end) <> " |"
+  end
+end
+
+defmodule Chapter08.Support do
+  @moduledoc false
+  @spec check!(boolean(), String.t()) :: map()
+  def check!(true, label), do: %{check: label, result: "PASS"}
+  def check!(false, label), do: raise("Check failed: #{label}")
+
+  @spec close?(term(), term(), number()) :: boolean()
+  def close?(a, b, tolerance) do
+    aa = List.flatten(List.wrap(a))
+    bb = List.flatten(List.wrap(b))
+    length(aa) == length(bb) and
+      (Enum.zip(aa, bb) |> Enum.all?(fn {x, y} -> abs(x - y) <= tolerance end))
+  end
+end
+
+defmodule Chapter08.Functions do
+  @moduledoc "Scalar versions of the source activation catalogue (Listing 8.21)."
+  @names [:tanh, :cos, :sin, :sgn, :bin, :trinary, :multiquadric,
+          :absolute, :linear, :quadratic, :gaussian, :sqrt, :log, :sigmoid, :sigmoid1]
+  @spec names() :: [atom()]
+  def names, do: @names
+  @spec code(atom()) :: non_neg_integer()
+  def code(name), do: Enum.find_index(@names, &(&1 == name)) || raise("Unknown activation")
+  @spec sign(number()) :: integer()
+  def sign(x) when x > 0, do: 1
+  def sign(x) when x < 0, do: -1
+  def sign(_x), do: 0
+  @spec clip(number(), number(), number()) :: number()
+  def clip(x, low, high), do: max(low, min(high, x))
+  @spec activate(non_neg_integer(), number()) :: number()
+  def activate(0, x), do: :math.tanh(x)
+  def activate(1, x), do: :math.cos(x)
+  def activate(2, x), do: :math.sin(x)
+  def activate(3, x), do: sign(x)
+  def activate(4, x), do: if(x > 0, do: 1.0, else: 0.0)
+  def activate(5, x), do: if(abs(x) < 0.33, do: 0.0, else: sign(x))
+  def activate(6, x), do: :math.sqrt(x * x + 0.01)
+  def activate(7, x), do: abs(x)
+  def activate(8, x), do: x
+  def activate(9, x), do: sign(x) * x * x
+  def activate(10, x) do
+    v = clip(x, -10.0, 10.0)
+    :math.pow(2.71828183, -v * v)
+  end
+  def activate(11, x), do: sign(x) * :math.sqrt(abs(x))
+  def activate(12, x), do: if(x == 0, do: 0.0, else: sign(x) * :math.log(abs(x)))
+  def activate(13, x), do: 2.0 / (1.0 + :math.pow(2.71828183, -clip(x, -10.0, 10.0))) - 1.0
+  def activate(14, x), do: x / (1.0 + abs(x))
+
+  @spec fitness([number()]) :: float()
+  def fitness(outputs) do
+    targets = [-1.0, 1.0, 1.0, -1.0]
+    unless length(outputs) == 4, do: raise(ArgumentError, "XOR requires four outputs")
+    error = Enum.zip(outputs, targets) |> Enum.reduce(0.0, fn {a, b}, s -> s + abs(a - b) end)
+    1.0 / (:math.sqrt(error) + 1.0e-5)
+  end
+
+  @spec cases() :: [[float()]]
+  def cases, do: [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]]
+end
+```
+
+## 8.1 The New Architecture
+
+*Source: [S], pp. 231-233; Fig. 8.1.*
+
+A trainer optimized one network at a time. A **population monitor** now coordinates
+many agents, waits for their evaluations, and produces the next generation.
+**Polis** supplies the infrastructure within which those populations exist.
+
+```mermaid
+flowchart TD
+    P[Polis: infrastructure] --> DB[Mnesia: persistent genotypes]
+    P --> W[Public scapes]
+    P --> M[Population monitor]
+    M --> A[Agent / exoself]
+    A --> NN[Sensor - neural network - actuator]
+    A --> PS[Private scape]
+    NN --> PS
+    NN --> W
+    A --> R[Evaluation results]
+    R --> S[Selection and mutation]
+    S --> DB
+    DB --> M
+```
+
+*Figure R8.1 - Responsibilities, not a claim that every box must be a separate
+process. New diagram based on the roles discussed around Fig. 8.1.*
+
+A **private scape** belongs to an evaluation. A **public scape** persists independently
+and can contain multiple agents. The executable XOR scape is private. The public
+scape registry below is infrastructure only; no shared artificial world is invented.
+
+Sher allows the statistics accumulator to be part of the population monitor and
+notes that Erlang already has error logging. We use a trace in the monitor and
+ordinary runtime diagnostics rather than adding empty logger processes.
+
+## 8.2 The New Data Structures
+
+*Source: [S], pp. 233-236.*
+
+| Structure | Responsibility | Important distinction |
+| --- | --- | --- |
+| Population | One experiment and its species | Do not mix unrelated experiments |
+| Species (`specie` in source code) | A group with inherited constraints | A grouping policy, not a biological claim |
+| Agent | Genome-level identity, generation, history, fitness | Not the same thing as one neuron |
+| Cortex | Signal-cycle coordination | Not the population selector |
+| Neuron | Activation, parameters, incoming and outgoing links | Recurrent outputs need explicit timing |
+| Sensor / actuator | Interface with a scape | Vector order and length are part of the contract |
+| Constraint | Allowed morphology and activation functions | Must remain valid after mutation |
+
+Sher proposes fingerprints for future topology-based grouping. The implementation
+in this chapter instead retains offspring in their **parent's species**, with seed
+species determined by constraints. We do the same. A changed fingerprint is a
+diagnostic, not an automatic request to create another species.
+
+The agent's lineage generation increases when it produces a mutated descendant.
+The population generation counts evaluation/selection rounds. A neuron's
+`generation` field records the generation in which a structural operation last
+touched it. These counters answer different questions.
+
+## 8.3 Developing the polis Module
+
+*Source: [S], pp. 236-242; Listings 8.1-8.2.*
+
+Polis starts infrastructure; the population monitor runs evolution. Mnesia stores
+seven kinds of records: sensor, actuator, neuron, cortex, agent, species, population.
+
+Our store keeps those seven categories in namespaced tables. Each row's key begins
+with an experiment ID. A whole population snapshot is committed in one transaction,
+with a version check to reject an outdated writer. A snapshot contains ordinary
+values, never live PIDs or device handles.
+
+**Remaster safety change:** the book exposes a schema-reset operation. This notebook
+does not. `Store.open/1` requires a new directory and an inactive Mnesia runtime.
+Deleting an experiment removes only its own records.
+
+Mnesia may retry transactions. Therefore, random sampling, process creation, and
+input validation happen **before** the transaction. The transaction performs only
+record reads and writes. `abort_probe/1` demonstrates rollback. [D3]
+
+The module definitions below do not start Mnesia. The optional experiment appears
+only after all implementations and tests have been defined.
+
+```elixir
+defmodule Chapter08.Store do
+  alias Chapter08.Genotype
+  @moduledoc "An opt-in, isolated Mnesia demonstration; never resets an existing schema."
+  @tables [:ch08_sensor, :ch08_actuator, :ch08_neuron, :ch08_cortex,
+           :ch08_agent, :ch08_specie, :ch08_population]
+  @spec open(String.t()) :: map()
+  def open(directory) do
+    _ = Application.load(:mnesia)
+    if :mnesia.system_info(:is_running) != :no,
+      do: raise("Mnesia is already running. Use a fresh Livebook runtime for this optional experiment.")
+    if File.exists?(directory), do: raise("Refusing to reuse an existing database directory")
+    File.mkdir_p!(directory)
+    old_dir = Application.fetch_env(:mnesia, :dir)
+    Application.put_env(:mnesia, :dir, String.to_charlist(directory))
+    :ok = :mnesia.create_schema([node()])
+    :ok = :mnesia.start()
+    Enum.each(@tables, fn table ->
+      {:atomic, :ok} = :mnesia.create_table(table,
+        attributes: [:key, :value], type: :set, disc_copies: [node()])
+    end)
+    :ok = :mnesia.wait_for_tables(@tables, 10_000)
+    %{directory: directory, old_dir: old_dir}
+  end
+
+  @spec save(term(), map(), non_neg_integer()) :: {:atomic, pos_integer()} | {:aborted, term()}
+  def save(run_id, snapshot, expected_version) do
+    # Validation and preparation happen OUTSIDE the retryable transaction.
+    Enum.each(snapshot.population, &Genotype.validate!/1)
+    entries = records(run_id, snapshot)
+    :mnesia.transaction(fn ->
+      current = case :mnesia.read({:ch08_population, {run_id, :snapshot}}) do
+        [] -> 0
+        [{_, _, {version, _state}}] -> version
+      end
+      if current != expected_version, do: :mnesia.abort(:stale_version)
+      clear_run(run_id)
+      Enum.each(entries, &:mnesia.write/1)
+      next = current + 1
+      :mnesia.write({:ch08_population, {run_id, :snapshot}, {next, snapshot}})
+      next
+    end)
+  end
+  @spec load(term()) :: {:atomic, {pos_integer(), map()}} | {:aborted, term()}
+  def load(run_id) do
+    :mnesia.transaction(fn ->
+      case :mnesia.read({:ch08_population, {run_id, :snapshot}}) do
+        [{_, _, payload}] -> payload
+        [] -> :mnesia.abort(:not_found)
+      end
+    end)
+  end
+  @spec delete(term()) :: {:atomic, :ok} | {:aborted, term()}
+  def delete(run_id), do: :mnesia.transaction(fn -> clear_run(run_id) end)
+  @spec clear_run(term()) :: :ok
+  defp clear_run(run_id) do
+    Enum.each(@tables, fn table ->
+      :mnesia.match_object({table, {run_id, :_}, :_})
+      |> Enum.each(fn {^table, key, _} -> :mnesia.delete({table, key}) end)
+    end)
+    :ok
+  end
+  @spec records(term(), map()) :: [tuple()]
+  defp records(run_id, snapshot) do
+    agents = Enum.flat_map(snapshot.population, fn g ->
+      node_records = Enum.map(Genotype.records(g), fn r ->
+        table = case r.kind do
+          :sensor -> :ch08_sensor
+          :neuron -> :ch08_neuron
+          :actuator -> :ch08_actuator
+        end
+        {table, {run_id, r.id}, r}
+      end)
+      cortex = %{agent_id: g.gid, sensor_ids: Genotype.slots(g, 1),
+                 neuron_ids: Genotype.slots(g, 2), actuator_ids: Genotype.slots(g, 3)}
+      [{:ch08_agent, {run_id, g.gid}, g}, {:ch08_cortex, {run_id, g.gid}, cortex} | node_records]
+    end)
+    species = snapshot.population |> Enum.group_by(& &1.species) |> Enum.map(fn {id, group} ->
+      {:ch08_specie, {run_id, id}, %{agent_ids: Enum.map(group, & &1.gid),
+        constraints: %{afs: hd(group).allowed_af, sensors: hd(group).allowed_sensor, actuators: hd(group).allowed_actuator}}}
+    end)
+    agents ++ species
+  end
+  @spec abort_probe(term()) :: {:aborted, atom()}
+  def abort_probe(run_id) do
+    :mnesia.transaction(fn ->
+      :mnesia.write({:ch08_agent, {run_id, :incomplete}, :should_not_survive})
+      :mnesia.abort(:deliberate_test)
+    end)
+  end
+  @spec close(map()) :: :ok
+  def close(handle) do
+    :stopped = :mnesia.stop()
+    case handle.old_dir do
+      {:ok, value} -> Application.put_env(:mnesia, :dir, value)
+      :error -> Application.delete_env(:mnesia, :dir)
+    end
+    :ok
+  end
+end
+
+defmodule Chapter08.Polis do
+  use GenServer
+  alias Chapter08.Store
+  @moduledoc "Infrastructure owner. Public-scape registration is separate from private episodes."
+  @spec start_link(String.t()) :: GenServer.on_start()
+  def start_link(directory), do: GenServer.start_link(__MODULE__, directory)
+  @impl true
+  @spec init(String.t()) :: {:ok, map()}
+  def init(directory), do: {:ok, %{store: Store.open(directory), public_scapes: %{}}}
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: {:reply, term(), map()}
+  def handle_call({:register_scape, name, pid}, _from, s) when is_pid(pid),
+    do: {:reply, :ok, %{s | public_scapes: Map.put(s.public_scapes, name, pid)}}
+  def handle_call({:get_scape, name}, _from, s), do: {:reply, Map.fetch(s.public_scapes, name), s}
+  def handle_call({:save, run_id, snapshot, expected}, _from, s),
+    do: {:reply, Store.save(run_id, snapshot, expected), s}
+  def handle_call({:load, run_id}, _from, s), do: {:reply, Store.load(run_id), s}
+  @impl true
+  @spec terminate(term(), map()) :: :ok
+  def terminate(_reason, s), do: Store.close(s.store)
+end
+```
+
+## 8.4 Updating the genotype Module
+
+*Source: [S], pp. 242-262.*
+
+The genotype must now support populations, constraints, cloning, and structural
+changes. A genome is still a description of a network; a process or tensor graph is
+one possible execution of that description.
+
+### 8.4.1 Moving from ETS to Mnesia
+
+The source changes the storage functions rather than changing every caller.
+We preserve that boundary: mutation works on a value, and `Store.save/3` commits a
+validated snapshot. A failed mutation produces no partial database writes.
+
+This separates two operations that should not be confused: **construct a candidate**
+and **publish a coherent new state**.
+
+### 8.4.2 A NN Based Adaptive Agent
+
+An agent owns a genotype and its experiment metadata. Its exoself coordinates
+local tuning and phenotype lifetime. In the actor implementation, the evaluator's
+process owns the neural workers. In the tensor version, the same responsibilities
+become explicit values and numerical state transitions.
+
+### 8.4.3 A New Neuron Id Structure; Adding Recursive Connections
+
+The source places sensors at layer -1, actuators at +1, and seed neurons at 0.
+A new layer can be placed between layers $a$ and $b$ using $(a+b)/2$.
+
+For a connection from neuron $i$ to neuron $j$:
+
+$$
+\ell_i < \ell_j \Rightarrow \text{current-cycle input},\qquad
+\ell_i \geq \ell_j \Rightarrow \text{previous-cycle input}.
+$$
+
+The equality case matters: same-layer links and self-links are recurrent in the
+source's `calculate_ROIds` implementation. Forward links form an acyclic order;
+recurrent links carry a one-cycle delay in our explicit execution contract.
+
+**Representation change:** source IDs combine a layer and a time-derived value.
+Here a node is identified by `{agent_id, slot}` and stores its layer separately.
+Cloning changes the agent ID; inserting a layer does not rename old nodes.
+
+**Numerical limit:** floating-point midpoints cannot provide infinitely many distinct
+layers. A splice is rejected when its new layer is not strictly between its endpoints.
+
+### 8.4.4 Seed Computational Intelligence
+
+Start with the smallest network allowed by the morphology. For XOR, that is one
+sensor, one unbiased neuron, and one actuator. Its activation is sampled from its
+species' allowed set. Structural evolution can add capacity later; this does not
+guarantee that it will discover the best topology.
+
+### 8.4.5 Constraints
+
+A constraint supplies allowed activations and interface templates. Our default
+XOR morphology permits only its original sensor and actuator. The extended test
+morphology is an explicit remaster fixture used to test `add_sensor` and
+`add_actuator`, not a change to the main task.
+
+### 8.4.6 The Updated genotype Module
+
+The source stores reciprocal link lists in records. For the three-way comparison,
+we use one **canonical edge table** and derive `input_idps`, `output_ids`, and
+`ro_ids` from it. This deliberately avoids stale reciprocal copies, including the
+special case of a neuron linked to itself.
+
+| Field | Meaning | Tensor shape after packing |
+| --- | --- | --- |
+| `kind`, `layer`, `af`, `width`, `tag` | Node identity within its slot and its behavior | `{M}` |
+| `edge` | Existing connections; row = destination, column = source | `{M,M}` |
+| `weight` | Up to two input-channel weights per connection | `{M,M,2}` |
+| `port` | Actuator channel, or zero for a non-actuator connection | `{M,M}` |
+| `bias_on`, `bias` | Presence of a bias and its value | `{M}` |
+| `allowed_*` | Inherited interface and activation constraints | Fixed masks |
+| `history`, `hist_n` | Successful operator events and occupied history length | `{128,5}`, `{}` |
+| `gid`, `parent`, `species`, `generation` | Agent identity and lineage | Scalars |
+
+Slots 0 and 1 are the primary XOR sensor and actuator. New elements use the first
+free slot. An edge of weight zero still **exists**; `edge`, not `weight`, determines
+connectivity. Actuator ports are explicit, so a splice can preserve output order.
+
+This layout is a deliberate bounded alternative to the source records. `records/1`
+provides their human-readable view. The actor arithmetic uses ordinary Elixir lists;
+`pack/1` and `unpack/1` are boundary conversions for Nx.
+
+```elixir
+defmodule Chapter08.Genotype do
+  alias Chapter08.Functions, as: F
+  @moduledoc "Portable slot-indexed genotype. Edge rows are destinations; columns are sources."
+  @type t :: %{required(atom()) => term()}
+  @float_fields [:layer, :bias, :weight]
+
+  @spec at(t(), atom(), [non_neg_integer()]) :: term()
+  def at(g, field, indices), do: Enum.reduce(indices, Map.fetch!(g, field), &Enum.at(&2, &1))
+  @spec put(t(), atom(), [non_neg_integer()], term()) :: t()
+  def put(g, field, indices, value), do: Map.update!(g, field, &put_nested(&1, indices, value))
+  @spec put_nested(term(), [non_neg_integer()], term()) :: term()
+  defp put_nested(_old, [], value), do: value
+  defp put_nested(list, [i | rest], value), do: List.update_at(list, i, &put_nested(&1, rest, value))
+
+  @spec slots(t(), integer()) :: [non_neg_integer()]
+  def slots(g, kind), do: Enum.filter(0..(length(g.kind) - 1), &(at(g, :kind, [&1]) == kind))
+  @spec width(t(), non_neg_integer()) :: non_neg_integer()
+  def width(g, i), do: at(g, :width, [i])
+  @spec inputs(t(), non_neg_integer()) :: [non_neg_integer()]
+  def inputs(g, i), do: Enum.filter(0..(length(g.kind) - 1), &(at(g, :edge, [i, &1]) == 1))
+  @spec outputs(t(), non_neg_integer()) :: [non_neg_integer()]
+  def outputs(g, i), do: Enum.filter(0..(length(g.kind) - 1), &(at(g, :edge, [&1, i]) == 1))
+  @spec recurrent?(t(), non_neg_integer(), non_neg_integer()) :: boolean()
+  def recurrent?(g, from, to) do
+    at(g, :kind, [from]) == 2 and at(g, :kind, [to]) == 2 and
+      at(g, :layer, [from]) >= at(g, :layer, [to])
+  end
+
+  @spec blank(pos_integer(), pos_integer(), pos_integer(), [atom()], boolean()) :: t()
+  def blank(capacity, id, species, afs, extended) when capacity >= 3 do
+    zero = List.duplicate(0, capacity)
+    zfloat = List.duplicate(0.0, capacity)
+    %{
+      gid: id, parent: 0, species: species, generation: 0,
+      kind: zero, layer: zfloat, af: zero, width: zero, tag: zero,
+      touched: zero, bias_on: zero, bias: zfloat,
+      edge: List.duplicate(zero, capacity), port: List.duplicate(zero, capacity),
+      weight: List.duplicate(List.duplicate([0.0, 0.0], capacity), capacity),
+      allowed_af: Enum.map(F.names(), &if(&1 in afs, do: 1, else: 0)),
+      allowed_sensor: if(extended, do: [1, 1, 1], else: [1, 0, 0]),
+      allowed_actuator: if(extended, do: [1, 1], else: [1, 0]),
+      history: List.duplicate([0, 0, 0, 0, 0], 128), hist_n: 0
+    }
+  end
+
+  @spec node(t(), non_neg_integer(), integer(), number(), integer(), integer(), integer()) :: t()
+  def node(g, i, kind, layer, af, width, tag) do
+    Enum.reduce([kind: kind, layer: layer * 1.0, af: af, width: width,
+                 tag: tag, touched: g.generation], g, fn {key, value}, acc ->
+      put(acc, key, [i], value)
+    end)
+  end
+
+  @spec seed(pos_integer(), pos_integer(), pos_integer(), [atom()], map(), boolean()) :: t()
+  def seed(capacity, id, species, afs, draw, extended) do
+    unless afs != [], do: raise(ArgumentError, "At least one activation is required")
+    af = F.code(Enum.at(afs, min(trunc(Enum.at(draw.u, 1) * length(afs)), length(afs) - 1)))
+    g = blank(capacity, id, species, afs, extended)
+        |> node(0, 1, -1.0, 0, 2, 0)
+        |> node(1, 3, 1.0, 0, 1, 0)
+        |> node(2, 2, 0.0, af, 1, 0)
+    {:ok, g} = link(g, 0, 2, at(draw, :noise, [2, 0]) |> Enum.map(&(&1 - 0.5)))
+    {:ok, g} = link(g, 2, 1, [0.0, 0.0])
+    g
+  end
+
+  @spec link(t(), non_neg_integer(), non_neg_integer(), [number()]) :: {:ok, t()} | {:error, atom()}
+  def link(g, from, to, weights) do
+    fk = at(g, :kind, [from])
+    tk = at(g, :kind, [to])
+    cond do
+      not ((fk in [1, 2] and tk == 2) or (fk == 2 and tk == 3)) -> {:error, :invalid_link}
+      at(g, :edge, [to, from]) == 1 -> {:error, :duplicate_link}
+      tk == 3 and length(inputs(g, to)) >= width(g, to) -> {:error, :actuator_full}
+      true ->
+        g = put(g, :edge, [to, from], 1)
+        g = if fk == 2, do: put(g, :touched, [from], g.generation), else: g
+        if tk == 2 do
+          padded = Enum.take(weights, width(g, from)) ++ List.duplicate(0.0, 2 - width(g, from))
+          {:ok, g |> put(:weight, [to, from], padded) |> put(:touched, [to], g.generation)}
+        else
+          used = Enum.map(inputs(g, to) -- [from], &at(g, :port, [to, &1]))
+          channel = Enum.find(1..width(g, to), &(&1 not in used))
+          {:ok, put(g, :port, [to, from], channel)}
+        end
+    end
+  end
+
+  @spec cut(t(), non_neg_integer(), non_neg_integer()) :: t()
+  def cut(g, from, to) do
+    unless at(g, :edge, [to, from]) == 1, do: raise(ArgumentError, "No such edge")
+    g |> put(:edge, [to, from], 0) |> put(:weight, [to, from], [0.0, 0.0])
+      |> put(:port, [to, from], 0)
+  end
+
+  @spec clone(t(), pos_integer()) :: t()
+  def clone(g, new_id), do: %{g | gid: new_id, parent: g.gid}
+
+  @spec fingerprint(t()) :: tuple()
+  def fingerprint(g) do
+    pattern = slots(g, 2) |> Enum.map(&at(g, :layer, [&1])) |> Enum.frequencies() |> Enum.sort()
+    sensor_tags = slots(g, 1) |> Enum.map(&{at(g, :tag, [&1]), width(g, &1)}) |> Enum.sort()
+    actuator_tags = slots(g, 3) |> Enum.map(&{at(g, :tag, [&1]), width(g, &1)}) |> Enum.sort()
+    ops = Enum.take(g.history, g.hist_n) |> Enum.map(&hd/1)
+    {pattern, sensor_tags, actuator_tags, ops}
+  end
+
+  @spec records(t()) :: [map()]
+  def records(g) do
+    Enum.map(slots(g, 1) ++ slots(g, 2) ++ slots(g, 3), fn i ->
+      %{
+        id: {g.gid, i}, kind: Enum.at([:unused, :sensor, :neuron, :actuator], at(g, :kind, [i])),
+        layer: at(g, :layer, [i]), generation: at(g, :touched, [i]),
+        af: Enum.at(F.names(), at(g, :af, [i])), vl: width(g, i),
+        input_idps: Enum.map(inputs(g, i), fn j ->
+          {{g.gid, j}, Enum.take(at(g, :weight, [i, j]), width(g, j))}
+        end),
+        output_ids: Enum.map(outputs(g, i), &{g.gid, &1}),
+        ro_ids: Enum.filter(outputs(g, i), &recurrent?(g, i, &1)) |> Enum.map(&{g.gid, &1}),
+        bias: if(at(g, :bias_on, [i]) == 1, do: at(g, :bias, [i]), else: nil)
+      }
+    end)
+  end
+
+  @spec validate!(t()) :: t()
+  def validate!(g) do
+    m = length(g.kind)
+    unless m >= 3 and slots(g, 2) != [] and at(g, :kind, [0]) == 1 and at(g, :kind, [1]) == 3,
+      do: raise(ArgumentError, "Missing minimal morphology")
+    Enum.each(0..(m - 1), fn to ->
+      kind = at(g, :kind, [to])
+      unless kind in 0..3, do: raise(ArgumentError, "Invalid node kind")
+      if kind == 2 do
+        unless at(g, :layer, [to]) > -1 and at(g, :layer, [to]) < 1 and width(g, to) == 1,
+          do: raise(ArgumentError, "Invalid neuron layer or width")
+        unless Enum.at(g.allowed_af, at(g, :af, [to])) == 1,
+          do: raise(ArgumentError, "Activation violates constraint")
+        unless inputs(g, to) != [], do: raise(ArgumentError, "Disconnected neuron")
+      end
+      if kind == 3 do
+        ports = Enum.map(inputs(g, to), &at(g, :port, [to, &1]))
+        unless length(ports) <= width(g, to) and Enum.uniq(ports) == ports and
+                 Enum.all?(ports, &(&1 in 1..width(g, to))),
+          do: raise(ArgumentError, "Invalid actuator ports")
+      end
+      Enum.each(inputs(g, to), fn from ->
+        fk = at(g, :kind, [from])
+        unless (fk in [1, 2] and kind == 2) or (fk == 2 and kind == 3),
+          do: raise(ArgumentError, "Invalid edge endpoints")
+      end)
+      if kind == 0 and (inputs(g, to) != [] or outputs(g, to) != []),
+        do: raise(ArgumentError, "Edge uses inactive slot")
+    end)
+    g
+  end
+
+  @spec pack(t()) :: %{atom() => Nx.Tensor.t()}
+  def pack(g), do: Map.new(g, fn {k, v} -> {k, Nx.tensor(v, type: if(k in @float_fields, do: :f64, else: :s64))} end)
+  @spec unpack(%{atom() => Nx.Tensor.t()}) :: t()
+  def unpack(g), do: Map.new(g, fn {k, v} -> {k, reshape(Nx.to_flat_list(v), Tuple.to_list(Nx.shape(v)))} end)
+  @spec reshape([number()], [non_neg_integer()]) :: term()
+  defp reshape([value], []), do: value
+  defp reshape(values, [_n]), do: values
+  defp reshape(values, [_n | rest]) do
+    chunk = Enum.product(rest)
+    Enum.chunk_every(values, chunk) |> Enum.map(&reshape(&1, rest))
+  end
+  @spec pack_population([t()]) :: map()
+  def pack_population(genomes) do
+    packed = Enum.map(genomes, &pack/1)
+    Map.new(hd(packed), fn {k, _v} -> {k, Nx.stack(Enum.map(packed, &Map.fetch!(&1, k)))} end)
+  end
+end
+
+defmodule Chapter08.Tape do
+  @moduledoc "All random draws are recorded before execution and shared by the three versions."
+  @type rng :: term()
+  @spec new(integer()) :: rng()
+  def new(seed), do: :rand.seed_s(:exsss, {seed + 1, seed + 17, seed + 101})
+  @spec values(non_neg_integer(), rng()) :: {[float()], rng()}
+  def values(0, state), do: {[], state}
+  def values(n, state) do
+    Enum.map_reduce(1..n, state, fn _, r ->
+      {u, r} = :rand.uniform_s(r)
+      {1.0 - u, r}
+    end)
+  end
+  @spec draw(pos_integer(), rng()) :: {map(), rng()}
+  def draw(m, state) do
+    {u, state} = values(12, state)
+    {gate, state} = values(m * m * 2, state)
+    {noise, state} = values(m * m * 2, state)
+    {bg, state} = values(m, state)
+    {bn, state} = values(m, state)
+    {ng, state} = values(m, state)
+    cube = fn v -> Enum.chunk_every(v, 2) |> Enum.chunk_every(m) end
+    {%{u: u, gate: cube.(gate), noise: cube.(noise), bias_gate: bg, bias_noise: bn, node_gate: ng}, state}
+  end
+  @spec draws(pos_integer(), non_neg_integer(), rng()) :: {[map()], rng()}
+  def draws(_m, 0, state), do: {[], state}
+  def draws(m, n, state), do: Enum.map_reduce(1..n, state, fn _, r -> draw(m, r) end)
+  @spec pack([map()]) :: map()
+  def pack(draws) do
+    Map.new(hd(draws), fn {k, _} -> {k, Nx.tensor(Enum.map(draws, &Map.fetch!(&1, k)), type: :f64)} end)
+  end
+end
+```
+
+```elixir
+{seed_draw, _rng} = Chapter08.Tape.draw(10, Chapter08.Tape.new(81))
+g_seed = Chapter08.Genotype.seed(10, 1, 1, [:tanh], seed_draw, false)
+Chapter08.Genotype.validate!(g_seed)
+
+tbl_nodes = Enum.map(Chapter08.Genotype.records(g_seed), fn node ->
+  %{id: inspect(node.id), kind: node.kind, layer: node.layer, width: node.vl,
+    inputs: inspect(node.input_idps), outputs: inspect(node.output_ids), bias: inspect(node.bias)}
+end)
+Chapter08.Tables.tabs(tbl_nodes, [:id, :kind, :layer, :width, :inputs, :outputs, :bias],
+  "ch_08_tbl_01_seed.csv")
+```
+
+Cloning preserves parameters and internal topology but changes every qualified
+node identity. The fingerprint omits those identities. Our compact fingerprint
+contains layer counts, interface signatures, and the operator sequence; it is not
+a graph-isomorphism test or a NEAT compatibility distance.
+
+```elixir
+g_clone = Chapter08.Genotype.clone(g_seed, 2)
+tbl_clone = Enum.map([g_seed, g_clone], fn g ->
+  %{agent: g.gid, parent: g.parent, species: g.species,
+    node_ids: inspect(Enum.map(Chapter08.Genotype.records(g), & &1.id)),
+    fingerprint: inspect(Chapter08.Genotype.fingerprint(g))}
+end)
+Chapter08.Tables.tabs(tbl_clone, [:agent, :parent, :species, :node_ids, :fingerprint],
+  "ch_08_tbl_02_clone.csv")
+```
+
+## 8.5 Developing the genotype_mutator
+
+*Source: [S], pp. 262-309; source module name: `genome_mutator`.*
+
+Sher discusses a broader catalog, including pruning, reset operations, and
+`insplicing`. The worked implementation in this chapter develops the following
+**12 operators**. We implement those 12; we do not silently add the entire catalog.
+
+| Operator | Primary change |
+| --- | --- |
+| `mutate_weights` | Perturb a selected neuron's parameters |
+| `add_bias`, `remove_bias` | Change whether a bias exists |
+| `mutate_af` | Replace an activation within the allowed set |
+| `add_outlink`, `add_inlink` | Add a connection from or into a chosen neuron |
+| `add_sensorlink`, `add_actuatorlink` | Prefer an existing interface when adding a link |
+| `add_neuron` | Add a neuron in an existing layer |
+| `outsplice` | Insert a neuron into a forward connection |
+| `add_sensor`, `add_actuator` | Integrate an unused morphology template |
+
+### 8.5.1 Precursor Connection Making and Breaking Functions
+
+*Source: [S], pp. 266-274.*
+
+The valid connection types are sensor-to-neuron, neuron-to-neuron, and
+neuron-to-actuator. Reject duplicate links and actuator inputs beyond its vector
+capacity. A self-link is a legal recurrent connection, not a duplicate of some
+other node's edge.
+
+Our `link/4` and `cut/3` operate on the canonical edge table. Its derived incoming
+and outgoing views therefore cannot disagree. A compound mutation builds a new
+value and publishes it only when **every** required link succeeds.
+
+The source prepends actuator inputs. We instead allocate the first unused action
+channel and retain that channel when splicing. This is an explicit output-order
+policy, important for vector-valued actuators.
+
+### 8.5.2 mutate_weights
+
+*Source: [S], pp. 274-276.*
+
+Choose one neuron. With $d$ stored parameters, including a present bias, independently
+perturb each with probability $1/\sqrt d$. The executable listing uses
+
+$$
+w' = \operatorname{clip}\left(w + (u-0.5)2\pi,\,-2\pi,\,2\pi\right),
+\qquad u\in[0,1).
+$$
+
+The earlier catalog says a smaller perturbation range; we follow the listing's
+macro and identify the discrepancy rather than silently mixing the two.
+A successful operator can leave all weights unchanged if its random mask is empty.
+
+### 8.5.3 add_bias & remove_bias
+
+*Source: [S], pp. 276-278.*
+
+Adding a bias requires its absence; removing it requires its presence. The new
+bias starts in $[-0.5,0.5)$. Presence is stored separately from value: an existing
+zero bias can later be tuned, whereas an absent bias cannot.
+
+### 8.5.4 mutate_af
+
+*Source: [S], pp. 278-279.*
+
+Choose an allowed activation different from the current one. When none exists,
+return `:not_applicable`. We do not use the printed fallback to `tanh` if it would
+violate the declared constraint. The operator is included in our explicit operator
+list even though the source's later list omits it.
+
+### 8.5.5 add_outlink
+
+*Source: [S], pp. 279-281.*
+
+Choose a neuron, then an unconnected neuron or actuator as its destination.
+A backward or same-layer neural connection is recurrent. A full actuator causes
+an atomic rejection, not a partially connected offspring.
+
+### 8.5.6 add_inlink
+
+*Source: [S], pp. 281-284.*
+
+Choose the receiving neuron first, then choose an unconnected sensor or neuron
+as its source. It is not the same sampling distribution as choosing the source first.
+
+### 8.5.7 add_sensorlink
+
+*Source: [S], pp. 284-285.*
+
+Choose an existing sensor first, then an unconnected neuron. This gives sensors
+an explicit opportunity to gain connections even when neurons are much more numerous.
+
+### 8.5.8 add_actuatorlink
+
+*Source: [S], pp. 285-287.*
+
+Choose an actuator first, then an unconnected neuron. The actuator must have a
+free channel. This operator is especially useful for a newly added actuator whose
+vector is only partly connected.
+
+### 8.5.9 add_neuron
+
+*Source: [S], pp. 287-289.*
+
+Choose an existing layer uniformly, allocate a neuron there, and choose its
+activation. Connect it from one existing source and to one existing destination.
+The new neuron is excluded from these endpoint pools. Both connections must succeed.
+
+Choosing a layer uniformly is different from choosing a neuron uniformly: a dense
+layer does not receive more probability merely because it contains more neurons.
+
+### 8.5.10 outsplice
+
+*Source: [S], pp. 289-294; Fig. 8.10.*
+
+Choose a neuron and one of its **forward** output connections. Remove that edge,
+insert a new neuron, and make two replacement connections. Use the next existing
+layer between the endpoints, or insert their midpoint if none exists.
+
+The new weights are sampled; this operator is **not function-preserving**. A new
+structure may initially perform poorly and benefit from subsequent local tuning.
+
+### 8.5.11 add_sensor
+
+*Source: [S], pp. 294-296.*
+
+Choose a morphology sensor template not already expressed in the agent. Allocate
+it and connect it to a neuron. Our test templates expose only the same observed
+input, its reversal, or a constant; no desired answer is supplied as a sensor.
+
+### 8.5.12 add_actuator
+
+*Source: [S], pp. 296-298.*
+
+Allocate an unused actuator template and connect one neuron to it. For a vector
+actuator this can leave unconnected channels. We explicitly fill them with zero.
+The diagnostic actuator in our extended fixture does not contribute to XOR fitness.
+
+### 8.5.13 Planning the Remaining Few Details of the Genotype Mutator Module
+
+*Source: [S], pp. 298-301.*
+
+**Random intensity mutation (RIM)** chooses how many successful operators to apply:
+
+$$
+K \sim \operatorname{UniformInteger}
+\left(1,\max\left(1,\operatorname{round}\sqrt N\right)\right),
+$$
+
+where $N$ is the parent's neuron count. The source retries inapplicable operators
+until $K$ successes occur. It also records successful operations in evolutionary
+history and updates the agent's generation.
+
+**Remaster bound:** each offspring receives a finite attempt tape. If it runs out
+before reaching $K$, all partial mutations are discarded and an unmutated clone
+is retained, with a reported fallback count. This fallback is not described as a
+successful RIM mutation. It avoids an infinite retry loop when capacity or
+constraints make operations impossible.
+
+A history entry is `[operator, source, new_slot, destination, generation]`.
+Unused role positions are -1. Node slots are local to the lineage; the full identity
+includes the agent ID. The recorded tape, not the short history alone, is needed
+for exact replay of random parameter choices.
+
+### 8.5.14 Implementing the genotype_mutator Module
+
+*Source: [S], pp. 301-309.*
+
+`mutate/3` performs one attempted operation. `rim/2` controls its bounded repetition.
+`perturb/2` is separate: it performs the local weight-tuning proposal used by the
+exoself. Local tuning uses the Chapter 7 synaptic-weight count, excluding the bias
+from that denominator while still allowing a present bias to change.
+
+```elixir
+defmodule Chapter08.Mutator do
+  alias Chapter08.{Genotype, Functions}
+  import Chapter08.Genotype, only: [at: 3, put: 4, slots: 2, inputs: 2, outputs: 2]
+  @moduledoc "Twelve source operators, applied atomically to immutable Elixir data."
+  @operators [:mutate_weights, :add_bias, :remove_bias, :mutate_af,
+              :add_outlink, :add_inlink, :add_sensorlink, :add_actuatorlink,
+              :add_neuron, :outsplice, :add_sensor, :add_actuator]
+  @spec operators() :: [atom()]
+  def operators, do: @operators
+  @spec pick([term()], float()) :: term()
+  def pick([], _u), do: throw(:not_applicable)
+  def pick(items, u), do: Enum.at(items, min(trunc(u * length(items)), length(items) - 1))
+  @spec free!(map()) :: non_neg_integer()
+  defp free!(g), do: pick(slots(g, 0), 0.0)
+  @spec link!(map(), non_neg_integer(), non_neg_integer(), map()) :: map()
+  defp link!(g, from, to, d) do
+    weights = Enum.map(at(d, :noise, [to, from]), &(&1 - 0.5))
+    case Genotype.link(g, from, to, weights) do
+      {:ok, next} -> next
+      {:error, _reason} -> throw(:not_applicable)
+    end
+  end
+
+  @spec mutate(map(), atom(), map()) :: {:ok, map()} | {:error, atom()}
+  def mutate(g, op, d) do
+    try do
+      if g.hist_n >= length(g.history), do: throw(:history_capacity)
+      {next, a, k, b} = operation(g, op, d)
+      event = [Enum.find_index(@operators, &(&1 == op)), a, k, b, g.generation]
+      {:ok, next |> put(:history, [g.hist_n], event) |> Map.put(:hist_n, g.hist_n + 1)}
+    catch
+      :throw, reason when reason in [:not_applicable, :history_capacity] -> {:error, reason}
+    end
+  end
+
+  @spec operation(map(), atom(), map()) :: {map(), integer(), integer(), integer()}
+  defp operation(g, :mutate_weights, d) do
+    a = pick(slots(g, 2), Enum.at(d.u, 1))
+    {perturb_node(g, a, d, true), a, -1, -1}
+  end
+  defp operation(g, :add_bias, d) do
+    a = pick(slots(g, 2), Enum.at(d.u, 1))
+    if at(g, :bias_on, [a]) == 1, do: throw(:not_applicable)
+    next = g |> put(:bias_on, [a], 1) |> put(:bias, [a], Enum.at(d.u, 5) - 0.5)
+             |> put(:touched, [a], g.generation)
+    {next, a, -1, -1}
+  end
+  defp operation(g, :remove_bias, d) do
+    a = pick(slots(g, 2), Enum.at(d.u, 1))
+    if at(g, :bias_on, [a]) == 0, do: throw(:not_applicable)
+    next = g |> put(:bias_on, [a], 0) |> put(:bias, [a], 0.0)
+             |> put(:touched, [a], g.generation)
+    {next, a, -1, -1}
+  end
+  defp operation(g, :mutate_af, d) do
+    a = pick(slots(g, 2), Enum.at(d.u, 1))
+    choices = Enum.filter(0..14, &(Enum.at(g.allowed_af, &1) == 1 and &1 != at(g, :af, [a])))
+    af = pick(choices, Enum.at(d.u, 2))
+    {g |> put(:af, [a], af) |> put(:touched, [a], g.generation), a, -1, -1}
+  end
+  defp operation(g, :add_outlink, d) do
+    a = pick(slots(g, 2), Enum.at(d.u, 1))
+    b = pick(Enum.sort(slots(g, 2) ++ slots(g, 3)) -- outputs(g, a), Enum.at(d.u, 2))
+    {link!(g, a, b, d), a, -1, b}
+  end
+  defp operation(g, :add_inlink, d) do
+    b = pick(slots(g, 2), Enum.at(d.u, 1))
+    a = pick(Enum.sort(slots(g, 1) ++ slots(g, 2)) -- inputs(g, b), Enum.at(d.u, 2))
+    {link!(g, a, b, d), a, -1, b}
+  end
+  defp operation(g, :add_sensorlink, d) do
+    a = pick(slots(g, 1), Enum.at(d.u, 1))
+    b = pick(slots(g, 2) -- outputs(g, a), Enum.at(d.u, 2))
+    {link!(g, a, b, d), a, -1, b}
+  end
+  defp operation(g, :add_actuatorlink, d) do
+    b = pick(slots(g, 3), Enum.at(d.u, 1))
+    a = pick(slots(g, 2) -- inputs(g, b), Enum.at(d.u, 2))
+    {link!(g, a, b, d), a, -1, b}
+  end
+  defp operation(g, :add_neuron, d) do
+    k = free!(g)
+    layers = slots(g, 2) |> Enum.map(&at(g, :layer, [&1])) |> Enum.uniq() |> Enum.sort()
+    layer = pick(layers, Enum.at(d.u, 1))
+    a = pick(Enum.sort(slots(g, 1) ++ slots(g, 2)), Enum.at(d.u, 2))
+    b = pick(Enum.sort(slots(g, 2) ++ slots(g, 3)), Enum.at(d.u, 3))
+    af = pick(Enum.filter(0..14, &(Enum.at(g.allowed_af, &1) == 1)), Enum.at(d.u, 4))
+    next = Genotype.node(g, k, 2, layer, af, 1, 0) |> link!(a, k, d) |> link!(k, b, d)
+    {next, a, k, b}
+  end
+  defp operation(g, :outsplice, d) do
+    k = free!(g)
+    a = pick(slots(g, 2), Enum.at(d.u, 1))
+    left = at(g, :layer, [a])
+    b = pick(Enum.filter(outputs(g, a), &(at(g, :layer, [&1]) > left)), Enum.at(d.u, 2))
+    right = at(g, :layer, [b])
+    middle = slots(g, 2) |> Enum.map(&at(g, :layer, [&1]))
+             |> Enum.filter(&(&1 > left and &1 < right)) |> Enum.sort()
+    layer = if middle == [], do: (left + right) / 2.0, else: hd(middle)
+    unless layer > left and layer < right, do: throw(:not_applicable)
+    af = pick(Enum.filter(0..14, &(Enum.at(g.allowed_af, &1) == 1)), Enum.at(d.u, 4))
+    old_port = at(g, :port, [b, a])
+    next = g |> Genotype.cut(a, b) |> Genotype.node(k, 2, layer, af, 1, 0)
+             |> link!(a, k, d) |> link!(k, b, d)
+    # Preserve the actuator channel instead of changing action-vector order.
+    next = if at(g, :kind, [b]) == 3, do: put(next, :port, [b, k], old_port), else: next
+    {next, a, k, b}
+  end
+  defp operation(g, :add_sensor, d) do
+    k = free!(g)
+    used = Enum.map(slots(g, 1), &at(g, :tag, [&1]))
+    tag = pick(Enum.filter(0..2, &(Enum.at(g.allowed_sensor, &1) == 1 and &1 not in used)), Enum.at(d.u, 1))
+    b = pick(slots(g, 2), Enum.at(d.u, 2))
+    width = Enum.at([2, 2, 1], tag)
+    next = Genotype.node(g, k, 1, -1.0, 0, width, tag) |> link!(k, b, d)
+    {next, -1, k, b}
+  end
+  defp operation(g, :add_actuator, d) do
+    k = free!(g)
+    used = Enum.map(slots(g, 3), &at(g, :tag, [&1]))
+    tag = pick(Enum.filter(0..1, &(Enum.at(g.allowed_actuator, &1) == 1 and &1 not in used)), Enum.at(d.u, 1))
+    a = pick(slots(g, 2), Enum.at(d.u, 2))
+    width = Enum.at([1, 2], tag)
+    next = Genotype.node(g, k, 3, 1.0, 0, width, tag) |> link!(a, k, d)
+    {next, a, k, -1}
+  end
+
+  @spec perturb_node(map(), non_neg_integer(), map(), boolean()) :: map()
+  def perturb_node(g, n, d, include_bias_in_count) do
+    count = Enum.sum(Enum.map(inputs(g, n), &Genotype.width(g, &1)))
+    denominator = count + if(include_bias_in_count, do: at(g, :bias_on, [n]), else: 0)
+    probability = 1.0 / :math.sqrt(max(1, denominator))
+    next = Enum.reduce(inputs(g, n), g, fn src, acc ->
+      Enum.reduce(0..(Genotype.width(g, src) - 1), acc, fn channel, acc ->
+        if at(d, :gate, [n, src, channel]) < probability do
+          value = at(acc, :weight, [n, src, channel]) +
+                  (at(d, :noise, [n, src, channel]) - 0.5) * 2.0 * :math.pi()
+          put(acc, :weight, [n, src, channel], Functions.clip(value, -2.0 * :math.pi(), 2.0 * :math.pi()))
+        else
+          acc
+        end
+      end)
+    end)
+    if at(g, :bias_on, [n]) == 1 and Enum.at(d.bias_gate, n) < probability do
+      value = at(g, :bias, [n]) + (Enum.at(d.bias_noise, n) - 0.5) * 2.0 * :math.pi()
+      put(next, :bias, [n], Functions.clip(value, -2.0 * :math.pi(), 2.0 * :math.pi()))
+    else
+      next
+    end
+  end
+
+  @spec perturb(map(), map()) :: map()
+  def perturb(g, d) do
+    neurons = slots(g, 2)
+    probability = 1.0 / :math.sqrt(length(neurons))
+    Enum.reduce(neurons, g, fn n, acc ->
+      if Enum.at(d.node_gate, n) < probability, do: perturb_node(acc, n, d, false), else: acc
+    end)
+  end
+
+  @spec rim(map(), [map()]) :: {map(), map()}
+  def rim(g, draws) when draws != [] do
+    cap = max(1, round(:math.sqrt(length(slots(g, 2)))))
+    target = 1 + trunc(hd(draws).u |> Enum.at(10) |> Kernel.*(cap))
+    base = %{g | generation: g.generation + 1}
+    {candidate, successes, attempts} =
+      Enum.reduce_while(draws, {base, 0, 0}, fn d, {current, successes, attempts} ->
+        op = Enum.at(@operators, trunc(Enum.at(d.u, 0) * length(@operators)))
+        {next, count} = case mutate(current, op, d) do
+          {:ok, next} -> {next, successes + 1}
+          {:error, _reason} -> {current, successes}
+        end
+        result = {next, count, attempts + 1}
+        if count == target, do: {:halt, result}, else: {:cont, result}
+      end)
+    success = successes == target
+    {if(success, do: candidate, else: base), %{success: success, target: target, applied: successes, attempts: attempts}}
+  end
+end
+```
+
+```elixir
+defmodule Chapter08.Fixtures do
+  alias Chapter08.{Genotype, Mutator, Tape}
+  @moduledoc "Hand-controlled fixtures are tests, never hidden members of the search population."
+  @spec draw(pos_integer()) :: map()
+  def draw(capacity) do
+    {d, _rng} = Tape.draw(capacity, Tape.new(808))
+    %{d | u: List.duplicate(0.0, 12),
+          gate: List.duplicate(List.duplicate([0.0, 0.0], capacity), capacity),
+          noise: List.duplicate(List.duplicate([0.75, 0.75], capacity), capacity),
+          bias_gate: List.duplicate(0.0, capacity), bias_noise: List.duplicate(0.75, capacity),
+          node_gate: List.duplicate(0.0, capacity)}
+  end
+  @spec seed(pos_integer(), boolean()) :: map()
+  def seed(capacity, extended), do: Genotype.seed(capacity, 1, 1, [:tanh, :cos, :sin], draw(capacity), extended)
+  @spec mutation(atom()) :: {map(), map()}
+  def mutation(op) do
+    g = seed(10, true)
+    d = draw(10)
+    case op do
+      :remove_bias ->
+        {g |> Genotype.put(:bias_on, [2], 1) |> Genotype.put(:bias, [2], 0.2), d}
+      :add_sensorlink ->
+        {:ok, g} = Mutator.mutate(g, :outsplice, d)
+        {g, d}
+      :add_actuatorlink ->
+        {:ok, g} = Mutator.mutate(g, :outsplice, d)
+        {:ok, g} = Mutator.mutate(g, :add_actuator, d)
+        {g, %{d | u: List.replace_at(d.u, 1, 0.75)}}
+      :add_neuron ->
+        {g, %{d | u: List.replace_at(d.u, 3, 0.75)}}
+      _ -> {g, d}
+    end
+  end
+  @spec recurrent() :: map()
+  def recurrent do
+    g = seed(10, false)
+        |> Genotype.put(:allowed_af, [8], 1)
+        |> Genotype.put(:af, [2], 8)
+        |> Genotype.put(:weight, [2, 0], [1.0, 0.0])
+    {:ok, g} = Genotype.link(g, 2, 2, [0.5, 0.0])
+    g
+  end
+  @spec known_xor() :: map()
+  def known_xor do
+    g = seed(10, false) |> Genotype.cut(2, 1)
+        |> Genotype.node(3, 2, 0.0, 0, 1, 0)
+        |> Genotype.node(4, 2, 0.5, 0, 1, 0)
+        |> Genotype.put(:weight, [2, 0], [3.0, 3.0])
+    {:ok, g} = Genotype.link(g, 0, 3, [-3.0, -3.0])
+    {:ok, g} = Genotype.link(g, 2, 4, [3.0, 0.0])
+    {:ok, g} = Genotype.link(g, 3, 4, [3.0, 0.0])
+    {:ok, g} = Genotype.link(g, 4, 1, [0.0, 0.0])
+    Enum.reduce([{2, 3.0}, {3, 3.0}, {4, -3.0}], g, fn {i, value}, acc ->
+      acc |> Genotype.put(:bias_on, [i], 1) |> Genotype.put(:bias, [i], value)
+    end)
+  end
+end
+```
+
+```elixir
+tbl_mutations = Enum.map(Chapter08.Mutator.operators(), fn op ->
+  {parent, draw} = Chapter08.Fixtures.mutation(op)
+  {:ok, child} = Chapter08.Mutator.mutate(parent, op, draw)
+  Chapter08.Genotype.validate!(child)
+  %{operator: op, neurons_before: length(Chapter08.Genotype.slots(parent, 2)),
+    neurons_after: length(Chapter08.Genotype.slots(child, 2)),
+    active_nodes_after: Enum.count(child.kind, &(&1 != 0)),
+    event: inspect(Enum.at(child.history, child.hist_n - 1))}
+end)
+Chapter08.Tables.tabs(tbl_mutations, [:operator, :neurons_before, :neurons_after, :active_nodes_after, :event],
+  "ch_08_tbl_03_mutations.csv")
+```
+
+This table uses designed fixtures so every operator can succeed once. The main
+search below starts from random minimal networks; it does not receive these
+prepared offspring or the hand-constructed XOR solution.
+
+### 8.5.15 Developing the population_monitor
+
+*Source: [S], pp. 309-327; Listing 8.18.*
+
+The monitor replaces the trainer. It evaluates all agents, waits at a generation
+barrier, selects within each species, and creates offspring by **cloning and
+mutation**. This chapter's implementation does not use crossover.
+
+#### Competition: quality, size, and offspring allocation
+
+For raw fitness $F_i$ and neuron count $N_i$, the source first ranks agents by
+
+$$
+R_i = \frac{F_i}{N_i^\alpha}.
+$$
+
+The prose suggests $\alpha=0.1$; the code's `EFF` macro is **0.05**. We use the code
+value. Retain the top approximately half as candidates for the next step.
+
+The source calculates a shared neuron-energy cost $C=\sum_iF_i/\sum_iN_i$ and an
+allotment $a_i=F_i/(CN_i)$. Its executable calculation does not round $a_i$ before
+normalization. With species size limit $P$:
+
+$$
+q_i = \frac{a_i}{\sum_{j\in V}a_j/P}
+    = P\frac{F_i/N_i}{\sum_{j\in V}F_j/N_j},
+$$
+
+where $V$ is the selected set. The cancellation of $C$ in the final expression is
+our algebraic observation, not a new fitness function.
+
+The source uses $\operatorname{round}(q_i)$ independently. A count of 0 removes
+the agent; 1 retains it; $k>1$ retains it and creates $k-1$ mutated clones.
+**These rounded counts need not sum to $P$.** Also, being in the top half does not
+guarantee survival if the final allotment is zero.
+
+**Declared comparison policy: exact-size competition.** Keep the same ranking and
+quotas, take each quota's floor, then allocate the remaining slots by descending
+fractional remainder. Ties use the population row order. This is an explicit
+largest-remainder modification, used by all three versions so tensor population
+shapes remain stable. `source_counts/4` retains the printed rounding rule for audit.
+
+The archive stores a complete best-raw-fitness genome independently of reproduction
+allocation. It is not just an ID that might refer to a subsequently deleted parent.
+A parent's fitted weights are inherited. Its recurrent activation state is not.
+
+```mermaid
+flowchart LR
+    P[Population genotypes] --> E[Evaluation and optional local tuning]
+    E --> A[Update raw-fitness archive]
+    E --> S[Select within inherited species]
+    S --> G[Retain / clone / RIM]
+    G --> P
+    A --> C[Checkpoint and stopping decision]
+```
+
+*Figure R8.2 - GES with an explicit archive. The local-search step makes the
+experiment memetic when enabled.*
+
+#### A monitor that can pause
+
+The actor and hybrid monitors launch monitored evaluation jobs. A failed job
+aborts the generation; it is not quietly assigned low fitness. Pause requests take
+effect at a completed-generation boundary. A paused snapshot may already contain
+the prepared next population; the archive and trace describe evaluated genomes.
+
+The implementation reserves the **maximum** cost of a complete generation before
+starting it: $P(1+L)$ evaluations, where $L$ is the local proposal cap. Actual use may
+be smaller because of patience. A remaining budget too small for that reservation
+stops the run instead of evaluating an unfair partial generation.
+
+```elixir
+defmodule Chapter08.Selection do
+  alias Chapter08.Genotype
+  @moduledoc "Source rounding for audit; exact-size competition for the controlled comparison."
+  @spec source_counts([float()], [pos_integer()], pos_integer(), number()) :: [non_neg_integer()]
+  def source_counts(fitness, sizes, limit, efficiency) do
+    ranked = Enum.zip(fitness, sizes) |> Enum.with_index()
+      |> Enum.sort_by(fn {{f, n}, i} -> {-f / :math.pow(n, efficiency), i} end)
+    kept = Enum.take(ranked, max(1, round(length(ranked) * 0.5)))
+    energy = Enum.sum(fitness) / Enum.sum(sizes)
+    allotments = Enum.map(kept, fn {{f, n}, i} -> {i, f / energy / n} end)
+    normalizer = Enum.sum(Enum.map(allotments, &elem(&1, 1))) / limit
+    Enum.reduce(allotments, List.duplicate(0, length(fitness)), fn {i, a}, acc ->
+      List.replace_at(acc, i, round(a / normalizer))
+    end)
+  end
+
+  @spec allocation([map()], [float()], number()) :: [{non_neg_integer(), boolean()}]
+  def allocation(population, scores, efficiency) do
+    groups = Enum.with_index(population) |> Enum.group_by(fn {g, _i} -> g.species end)
+    counts = Enum.reduce(groups, %{}, fn {_species, rows}, acc ->
+      size = length(rows)
+      ranked = Enum.sort_by(rows, fn {g, i} ->
+        {-Enum.at(scores, i) / :math.pow(length(Genotype.slots(g, 2)), efficiency), i}
+      end)
+      kept = Enum.take(ranked, max(1, round(size * 0.5)))
+      weights = Enum.map(kept, fn {g, i} -> {i, Enum.at(scores, i) / length(Genotype.slots(g, 2))} end)
+      total = Enum.sum(Enum.map(weights, &elem(&1, 1)))
+      unless total > 0, do: raise(ArgumentError, "Competition requires positive fitness")
+      quotas = Enum.map(weights, fn {i, w} -> {i, size * w / total} end)
+      floors = Map.new(quotas, fn {i, q} -> {i, trunc(:math.floor(q))} end)
+      left = size - Enum.sum(Map.values(floors))
+      bonuses = quotas |> Enum.sort_by(fn {i, q} -> {-(q - Map.fetch!(floors, i)), i} end)
+                       |> Enum.take(left) |> Enum.map(&elem(&1, 0)) |> MapSet.new()
+      Enum.reduce(floors, acc, fn {i, floor}, acc -> Map.put(acc, i, floor + if(MapSet.member?(bonuses, i), do: 1, else: 0)) end)
+    end)
+    population |> Enum.with_index() |> Enum.flat_map(fn {_g, i} ->
+      count = Map.get(counts, i, 0)
+      if count == 0, do: [], else: [{i, false} | List.duplicate({i, true}, count - 1)]
+    end)
+  end
+end
+
+defmodule Chapter08.Engine do
+  alias Chapter08.{Genotype, Mutator, Selection, Tape, Actor, Hybrid}
+  @moduledoc "Reference population state transitions. No process identities enter the genotype."
+  @spec config() :: map()
+  def config do
+    %{generations: 6, evaluations: 512, patience: 3, max_steps: 5,
+      goal: 100.0, stagnation: 6, efficiency: 0.05}
+  end
+  @spec validate_config!(map(), pos_integer()) :: map()
+  def validate_config!(c, population_size) do
+    unless c.generations > 0 and c.max_steps >= 0 and c.patience >= 0 and
+           c.stagnation > 0 and c.goal > 0 and c.evaluations >= population_size * (1 + c.max_steps),
+      do: raise(ArgumentError, "Budget must reserve at least one complete generation")
+    c
+  end
+  @spec initial([map()]) :: map()
+  def initial(population) do
+    %{population: population, archive: hd(population), best: -1.0, generation: 0,
+      evaluations: 0, stagnant: 0, failed_mutations: 0, trace: [], scores: [],
+      first_new_id: Enum.max(Enum.map(population, & &1.gid)) + 1}
+  end
+  @spec stop?(map(), map()) :: boolean()
+  def stop?(s, c) do
+    s.generation >= c.generations or s.best >= c.goal or s.stagnant >= c.stagnation or
+      s.evaluations + length(s.population) * (1 + c.max_steps) > c.evaluations
+  end
+  @spec evaluate([map()], [[map()]], map(), :actor | :hybrid) :: [{map(), float(), pos_integer()}]
+  def evaluate(population, tapes, c, mode) do
+    # A failed worker aborts this generation; it is not assigned an invented fitness.
+    Enum.zip(population, tapes)
+    |> Task.async_stream(fn {g, draws} -> tune(g, draws, c, mode) end,
+      ordered: true, max_concurrency: min(4, length(population)), timeout: 120_000, on_timeout: :kill_task)
+    |> Enum.map(fn
+      {:ok, result} -> result
+      {:exit, reason} -> raise "Operational evaluation failure: #{inspect(reason)}"
+    end)
+  end
+  @spec score(map(), :actor | :hybrid) :: float()
+  defp score(g, :actor), do: Actor.fitness(g)
+  defp score(g, :hybrid), do: Hybrid.fitness(g)
+  @spec tune(map(), [map()], map(), :actor | :hybrid) :: {map(), float(), pos_integer()}
+  def tune(g, draws, c, :hybrid), do: Hybrid.tune(g, draws, c)
+  def tune(g, draws, c, :actor) do
+    mode = :actor
+    initial_score = score(g, mode)
+    {best, fitness, _failed, evaluations} =
+      draws |> Enum.take(c.max_steps) |> Enum.reduce_while({g, initial_score, 0, 1}, fn d, {best, fitness, failed, evals} ->
+        if failed >= c.patience do
+          {:halt, {best, fitness, failed, evals}}
+        else
+          candidate = Mutator.perturb(best, d)
+          value = score(candidate, mode)
+          if value > fitness do
+            {:cont, {candidate, value, 0, evals + 1}}
+          else
+            {:cont, {best, fitness, failed + 1, evals + 1}}
+          end
+        end
+      end)
+    {best, fitness, evaluations}
+  end
+  @spec advance(map(), [{map(), float(), pos_integer()}], [[map()]], map()) :: map()
+  def advance(s, results, mutation_draws, c) do
+    population = Enum.map(results, &elem(&1, 0))
+    scores = Enum.map(results, &elem(&1, 1))
+    used = Enum.sum(Enum.map(results, &elem(&1, 2)))
+    winner = Enum.with_index(scores) |> Enum.max_by(fn {f, i} -> {f, -i} end) |> elem(1)
+    best_now = Enum.at(scores, winner)
+    improved = best_now > s.best
+    best = max(s.best, best_now)
+    archive = if improved, do: Enum.at(population, winner), else: s.archive
+    mean_size = Enum.sum(Enum.map(population, &(length(Genotype.slots(&1, 2))))) / length(population)
+    row = %{generation: s.generation, best: best, mean: Enum.sum(scores) / length(scores),
+            mean_neurons: mean_size, evaluations: s.evaluations + used, mutation_fallbacks: s.failed_mutations}
+    next = %{s | population: population, scores: scores, archive: archive, best: best,
+                 generation: s.generation + 1, evaluations: s.evaluations + used,
+                 stagnant: if(improved, do: 0, else: s.stagnant + 1), trace: s.trace ++ [row]}
+    if stop?(next, c) do
+      next
+    else
+      slots = Selection.allocation(population, scores, c.efficiency)
+      {children, failed} = slots |> Enum.with_index() |> Enum.map_reduce(s.failed_mutations, fn {{parent, clone?}, j}, failed ->
+        g = Enum.at(population, parent)
+        if clone? do
+          id = s.first_new_id + s.generation * length(population) + j
+          {child, result} = Mutator.rim(Genotype.clone(g, id), Enum.at(mutation_draws, j))
+          {child, failed + if(result.success, do: 0, else: 1)}
+        else
+          {g, failed}
+        end
+      end)
+      %{next | population: children, failed_mutations: failed}
+    end
+  end
+
+  @spec tapes(pos_integer(), pos_integer(), map(), pos_integer(), integer()) :: {map(), map()}
+  def tapes(m, p, c, mutation_attempts, seed) do
+    rng = Tape.new(seed)
+    {local, rng} = Enum.map_reduce(1..c.generations, rng, fn _, rng ->
+      Enum.map_reduce(1..p, rng, fn _, rng -> Tape.draws(m, max(1, c.max_steps), rng) end)
+    end)
+    {mutation, _rng} = Enum.map_reduce(1..c.generations, rng, fn _, rng ->
+      Enum.map_reduce(1..p, rng, fn _, rng -> Tape.draws(m, mutation_attempts, rng) end)
+    end)
+    host = %{local: local, mutation: mutation}
+    packed = Map.new(host, fn {name, generations} ->
+      keys = hd(hd(hd(generations))) |> Map.keys()
+      tensors = Map.new(keys, fn key ->
+        values = Enum.map(generations, fn rows -> Enum.map(rows, fn draws -> Enum.map(draws, &Map.fetch!(&1, key)) end) end)
+        {key, Nx.tensor(values, type: :f64)}
+      end)
+      {name, tensors}
+    end)
+    {host, packed}
+  end
+end
+
+defmodule Chapter08.PopulationMonitor do
+  use GenServer
+  alias Chapter08.Engine
+  @moduledoc "Responsive generation-level controller with pause/resume and monitored evaluation."
+  @spec start_link({[map()], map(), map(), :actor | :hybrid} | {:resume, map(), :actor | :hybrid}) :: GenServer.on_start()
+  def start_link(args), do: GenServer.start_link(__MODULE__, args)
+  @impl true
+  @spec init(tuple()) :: {:ok, map()} | {:ok, map(), {:continue, atom()}}
+  def init({:resume, snapshot, mode}) do
+    core = Map.drop(snapshot, [:config, :tapes])
+    init_core(core, snapshot.tapes, snapshot.config, mode)
+  end
+  def init({population, tapes, config, mode}) do
+    init_core(Engine.initial(population), tapes, config, mode)
+  end
+  @spec init_core(map(), map(), map(), :actor | :hybrid) :: {:ok, map()} | {:ok, map(), {:continue, atom()}}
+  defp init_core(core, tapes, config, mode) do
+    Engine.validate_config!(config, length(core.population))
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+    status = if Engine.stop?(core, config), do: :done, else: :running
+    s = %{core: core, tapes: tapes, config: config, mode: mode,
+          task_supervisor: task_supervisor, task: nil, timer: nil, status: status,
+          pause_requested: false, waiter: nil, error: nil}
+    if status == :done, do: {:ok, s}, else: {:ok, s, {:continue, :next}}
+  end
+  @impl true
+  @spec handle_continue(atom(), map()) :: {:noreply, map()}
+  def handle_continue(:next, s) do
+    task = Task.Supervisor.async_nolink(s.task_supervisor, fn ->
+      Engine.evaluate(s.core.population, Enum.at(s.tapes.local, s.core.generation), s.config, s.mode)
+    end)
+    timer = Process.send_after(self(), {:evaluation_timeout, task.ref}, 180_000)
+    {:noreply, %{s | task: task, timer: timer}}
+  end
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()} | {:reply, term(), map(), {:continue, atom()}}
+  def handle_call(:await, _from, %{status: :done} = s), do: {:reply, {:ok, s.core}, s}
+  def handle_call(:await, _from, %{status: :error} = s), do: {:reply, {:error, s.error}, s}
+  def handle_call(:await, from, s), do: {:noreply, %{s | waiter: from}}
+  def handle_call(:snapshot, _from, %{status: status} = s) when status in [:paused, :done],
+    do: {:reply, {:ok, s.core}, s}
+  def handle_call(:snapshot, _from, s), do: {:reply, {:error, :not_at_boundary}, s}
+  def handle_call(:pause, _from, s), do: {:reply, :ok, %{s | pause_requested: true}}
+  def handle_call(:resume, _from, %{status: :paused} = s),
+    do: {:reply, :ok, %{s | status: :running, pause_requested: false}, {:continue, :next}}
+  def handle_call(:resume, _from, s), do: {:reply, {:error, :not_paused}, s}
+  @impl true
+  @spec handle_info(term(), map()) :: {:noreply, map()} | {:noreply, map(), {:continue, atom()}}
+  def handle_info({ref, result}, %{task: %{ref: ref}} = s) do
+    Process.demonitor(ref, [:flush])
+    Process.cancel_timer(s.timer)
+    core = Engine.advance(s.core, result, Enum.at(s.tapes.mutation, s.core.generation), s.config)
+    s = %{s | core: core, task: nil, timer: nil}
+    cond do
+      Engine.stop?(core, s.config) -> {:noreply, finish(s, :done, {:ok, core})}
+      s.pause_requested -> {:noreply, %{s | status: :paused}}
+      true -> {:noreply, s, {:continue, :next}}
+    end
+  end
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{task: %{ref: ref}} = s) do
+    Process.cancel_timer(s.timer)
+    {:noreply, finish(%{s | error: reason, task: nil}, :error, {:error, reason})}
+  end
+  def handle_info({:evaluation_timeout, ref}, %{task: %{ref: ref}} = s) do
+    Task.shutdown(s.task, :brutal_kill)
+    {:noreply, finish(%{s | error: :timeout, task: nil}, :error, {:error, :timeout})}
+  end
+  def handle_info(_message, s), do: {:noreply, s}
+  @spec finish(map(), atom(), term()) :: map()
+  defp finish(s, status, reply) do
+    if s.waiter, do: GenServer.reply(s.waiter, reply)
+    %{s | status: status, waiter: nil}
+  end
+  @impl true
+  @spec terminate(term(), map()) :: :ok
+  def terminate(_reason, s) do
+    if s.task, do: Task.shutdown(s.task, :brutal_kill)
+    if Process.alive?(s.task_supervisor), do: Supervisor.stop(s.task_supervisor)
+    :ok
+  end
+  @spec run([map()], map(), map(), :actor | :hybrid) :: map()
+  def run(population, tapes, config, mode) do
+    {:ok, pid} = start_link({population, tapes, config, mode})
+    await_and_stop(pid)
+  end
+  @spec run_from_snapshot(map(), :actor | :hybrid) :: map()
+  def run_from_snapshot(snapshot, mode) do
+    {:ok, pid} = start_link({:resume, snapshot, mode})
+    await_and_stop(pid)
+  end
+  @spec await_and_stop(pid()) :: map()
+  defp await_and_stop(pid) do
+    try do
+      case GenServer.call(pid, :await, 600_000) do
+        {:ok, core} -> core
+        {:error, reason} -> raise "Population aborted: #{inspect(reason)}"
+      end
+    after
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end
+  end
+end
+```
+
+```elixir
+audit_population = Enum.map(1..6, &%{g_seed | gid: &1})
+audit_scores = [20.0, 10.0, 10.0, 1.0, 1.0, 1.0]
+source_counts = Chapter08.Selection.source_counts(audit_scores, List.duplicate(1, 6), 6, 0.05)
+exact_slots = Chapter08.Selection.allocation(audit_population, audit_scores, 0.05)
+exact_counts = Enum.frequencies_by(exact_slots, &elem(&1, 0))
+tbl_allocation = Enum.with_index(audit_scores) |> Enum.map(fn {fitness, i} ->
+  %{agent: i + 1, fitness: fitness, source_count: Enum.at(source_counts, i),
+    exact_count: Map.get(exact_counts, i, 0)}
+end)
+Chapter08.Tables.tabs(tbl_allocation, [:agent, :fitness, :source_count, :exact_count],
+  "ch_08_tbl_04_allocation.csv")
+```
+
+The source counts are **3, 2, 2, 0, 0, 0**: seven agents for a limit of six.
+The exact-size counts are **3, 2, 1, 0, 0, 0**. This test demonstrates a rounding
+property; it does not claim that the alternative policy improves optimization.
+
+### 8.5.16 Updating the exoself Module
+
+*Source: [S], pp. 327-337; Listing 8.19, Figs. 8.14-8.15.*
+
+The exoself evaluates a network, optionally tunes its weights, saves the best
+parameters, and reports fitness to the population monitor. The local decision is
+still strict improvement: accept a better proposal; otherwise retain the best.
+
+Set local patience to zero to perform **one baseline evaluation and no tuning**.
+This gives the genetic version. Positive patience enables the memetic version.
+A separate proposal cap bounds runtime even when improvement repeatedly resets
+patience. No claim of reaching a local or global optimum follows from stagnation.
+
+The Chapter 7 printed XOR score is carried forward:
+
+$$
+F=\frac{1}{\sqrt{\sum_{r=1}^4 |\widehat y_r-y_r|}+10^{-5}}.
+$$
+
+This is not MSE. All three versions use the same score and case order. An episode
+resets recurrent memory once at its start, not between its four rows. Consequently,
+a recurrent agent is evaluated on a **sequence**. A high score alone does not prove
+an order-independent XOR rule. Test permutations and per-row resets before making
+that stronger claim.
+
+#### Reset is part of evaluation
+
+In the source, recurrent neurons send initial zeros to break a deadlock. At the end
+of an episode, old recurrent messages may still be waiting. The exoself pauses all
+neurons, gathers acknowledgments, flushes buffers, and restarts the network.
+
+Our actor implementation instead prepares every worker with a new **epoch**,
+clears its explicit signal buffer, then seeds zero-valued recurrent messages only
+after the preparation barrier. Messages from another epoch cannot enter the new
+buffer. Repeated sender messages cannot replace the first accepted signal.
+
+```mermaid
+flowchart LR
+    X[Input at cycle t] --> A[Lower layer at t]
+    A --> B[Higher layer at t]
+    B --> Y[Action at t]
+    B -- one-cycle delay --> R[Feedback for cycle t+1]
+    R --> A
+```
+
+*Figure R8.3 - Forward computation and delayed feedback are different edges.*
+
+**Timing clarification:** we add an explicit tick gate and completion barrier for
+all active nodes, including a recurrent-only component. This prevents a closed
+feedback component from running ahead of the logical episode. It is a synchronous
+cycle interpretation of Sher's recurrent-edge rule, not a claim that every
+untagged asynchronous execution of the printed program has identical timing.
+
+### 8.5.17 Updating the neuron Module
+
+*Source: [S], pp. 337-345; Listings 8.20-8.21.*
+
+The neuron now supports heterogeneous activations, recurrent inputs, and clean
+reset boundaries. The three implementations below share the same equation:
+
+$$
+y_j(t)=\phi_j\!\left(
+ b_j + \sum_{i:\ell_i<\ell_j}w_{ji}y_i(t)
+     + \sum_{i:\ell_i\geq\ell_j}w_{ji}y_i(t-1)
+     + \text{sensory contributions at }t\right).
+$$
+
+Only **existing** edges participate. The initial delayed signals are zero.
+A missing bias contributes zero but remains different from a tunable zero bias.
+
+#### A. Thesis - modern actor-based Elixir
+
+Sensors request observations from their private scape. Neurons gather ordered
+vectors and fan out scalar outputs. Actuators assemble their declared channels;
+the primary actuator sends the XOR result to the scape. The calling evaluation
+process acts as cortex, advancing only after the cycle barrier.
+
+Each local-search proposal builds and closes its own small phenotype. This is a
+**notebook lifecycle simplification**, not the book's persistent in-place weight
+backup protocol. It makes rejected parameters and recurrent state impossible to
+reuse accidentally, but adds process-startup cost. That cost remains in timings.
+
+Neuron arithmetic in this version contains no Nx call. Supervisors own temporary
+workers; unexpected failure aborts evaluation rather than silently changing the
+neural computation. These are fault-detection boundaries, not biological robustness.
+
+```elixir
+defmodule Chapter08.Actor.Scape do
+  use GenServer, restart: :temporary
+  @moduledoc "Private recorded-input scape. Sensing does not advance the episode."
+  @spec start_link(term()) :: GenServer.on_start()
+  def start_link(_arg), do: GenServer.start_link(__MODULE__, nil)
+  @impl true
+  @spec init(term()) :: {:ok, map()}
+  def init(_arg), do: {:ok, %{epoch: nil, xs: [], step: 0, outputs: []}}
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: {:reply, term(), map()}
+  def handle_call({:reset, epoch, xs}, _from, _s),
+    do: {:reply, :ok, %{epoch: epoch, xs: xs, step: 0, outputs: []}}
+  def handle_call({:sense, epoch, step}, _from, s) when epoch == s.epoch and step >= 0 and step < length(s.xs),
+    do: {:reply, {:ok, Enum.at(s.xs, step)}, s}
+  def handle_call({:act, epoch, step, output}, _from, s) when epoch == s.epoch and step == s.step do
+    next = %{s | step: step + 1, outputs: [output | s.outputs]}
+    {:reply, {:ok, next.step == length(s.xs)}, next}
+  end
+  def handle_call(:outputs, _from, s), do: {:reply, Enum.reverse(s.outputs), s}
+  def handle_call(_message, _from, s), do: {:reply, {:error, :episode_order}, s}
+end
+
+defmodule Chapter08.Actor.Unit do
+  use GenServer, restart: :temporary
+  alias Chapter08.{Genotype, Functions}
+  @moduledoc "One sensor, neuron, or actuator. This module performs no Nx operations."
+  @spec start_link({map(), non_neg_integer(), pid(), pid()}) :: GenServer.on_start()
+  def start_link(args), do: GenServer.start_link(__MODULE__, args)
+  @impl true
+  @spec init({map(), non_neg_integer(), pid(), pid()}) :: {:ok, map()}
+  def init({g, id, owner, scape}) do
+    {:ok, %{g: g, id: id, owner: owner, scape: scape, routes: %{}, epoch: nil,
+            step: 0, open: false, fired: false, pending: %{}}}
+  end
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: {:reply, term(), map()}
+  def handle_call({:wire, routes}, _from, s), do: {:reply, :ok, %{s | routes: routes}}
+  def handle_call({:prepare, epoch}, _from, s) do
+    {:reply, :ok, %{s | epoch: epoch, step: 0, open: false, fired: false, pending: %{}}}
+  end
+  def handle_call(:seed, _from, s) do
+    for to <- Genotype.outputs(s.g, s.id), Genotype.recurrent?(s.g, s.id, to) do
+      GenServer.cast(Map.fetch!(s.routes, to), {:signal, s.epoch, 0, s.id, [0.0]})
+    end
+    {:reply, :ok, s}
+  end
+  @impl true
+  @spec handle_cast(term(), map()) :: {:noreply, map()}
+  def handle_cast({:tick, epoch, step}, s) when epoch == s.epoch do
+    {:noreply, fire(%{s | step: step, open: true, fired: false})}
+  end
+  def handle_cast({:signal, epoch, step, from, vector}, s) when epoch == s.epoch do
+    expected = from in Genotype.inputs(s.g, s.id)
+    timely = step in [s.step, s.step + 1] and not (step == s.step and s.fired)
+    width_ok = expected and is_list(vector) and length(vector) == Genotype.width(s.g, from)
+    if expected and timely and not width_ok, do: raise(ArgumentError, "Wrong signal width")
+    next = if expected and timely do
+      %{s | pending: Map.put_new(s.pending, {step, from}, vector)}
+    else
+      s
+    end
+    {:noreply, fire(next)}
+  end
+  def handle_cast(_stale_or_unknown, s), do: {:noreply, s}
+
+  @spec fire(map()) :: map()
+  defp fire(%{open: false} = s), do: s
+  defp fire(%{fired: true} = s), do: s
+  defp fire(s) do
+    incoming = Genotype.inputs(s.g, s.id)
+    if Enum.all?(incoming, &Map.has_key?(s.pending, {s.step, &1})) do
+      output = calculate(s, Genotype.at(s.g, :kind, [s.id]))
+      Enum.each(Genotype.outputs(s.g, s.id), fn to ->
+        delay = if Genotype.recurrent?(s.g, s.id, to), do: 1, else: 0
+        GenServer.cast(Map.fetch!(s.routes, to), {:signal, s.epoch, s.step + delay, s.id, output})
+      end)
+      send(s.owner, {:node_done, s.epoch, s.step, s.id})
+      pending = Map.drop(s.pending, Enum.map(incoming, &{s.step, &1}))
+      %{s | fired: true, pending: pending}
+    else
+      s
+    end
+  end
+
+  @spec calculate(map(), integer()) :: [number()]
+  defp calculate(s, 1) do
+    {:ok, [x0, x1]} = GenServer.call(s.scape, {:sense, s.epoch, s.step})
+    case Genotype.at(s.g, :tag, [s.id]) do
+      0 -> [x0, x1]
+      1 -> [x1, x0]
+      2 -> [1.0]
+    end
+  end
+  defp calculate(s, 2) do
+    z = Enum.reduce(Genotype.inputs(s.g, s.id), 0.0, fn from, total ->
+      x = Map.fetch!(s.pending, {s.step, from})
+      w = Genotype.at(s.g, :weight, [s.id, from]) |> Enum.take(length(x))
+      total + (Enum.zip(x, w) |> Enum.reduce(0.0, fn {a, b}, acc -> acc + a * b end))
+    end)
+    z = z + Genotype.at(s.g, :bias, [s.id]) * Genotype.at(s.g, :bias_on, [s.id])
+    [Functions.activate(Genotype.at(s.g, :af, [s.id]), z)]
+  end
+  defp calculate(s, 3) do
+    output = Enum.map(1..Genotype.width(s.g, s.id), fn channel ->
+      from = Enum.find(Genotype.inputs(s.g, s.id), &(Genotype.at(s.g, :port, [s.id, &1]) == channel))
+      if from == nil, do: 0.0, else: hd(Map.fetch!(s.pending, {s.step, from}))
+    end)
+    if s.id == 1 do
+      {:ok, _halt?} = GenServer.call(s.scape, {:act, s.epoch, s.step, hd(output)})
+    end
+    output
+  end
+end
+
+defmodule Chapter08.Actor do
+  alias Chapter08.{Genotype, Functions}
+  alias Chapter08.Actor.{Unit, Scape}
+  @moduledoc "Cortex: one logical-cycle barrier, including recurrent-only components."
+  @spec start(map()) :: map()
+  def start(g) do
+    Genotype.validate!(g)
+    {:ok, supervisor} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    try do
+      {:ok, scape} = DynamicSupervisor.start_child(supervisor, {Scape, nil})
+      ids = Enum.sort(Genotype.slots(g, 1) ++ Genotype.slots(g, 2) ++ Genotype.slots(g, 3))
+      workers = Map.new(ids, fn id ->
+        {:ok, pid} = DynamicSupervisor.start_child(supervisor, {Unit, {g, id, self(), scape}})
+        {id, pid}
+      end)
+      Enum.each(workers, fn {_id, pid} -> :ok = GenServer.call(pid, {:wire, workers}) end)
+      monitors = Map.new([scape | Map.values(workers)], fn pid -> {Process.monitor(pid), pid} end)
+      %{supervisor: supervisor, scape: scape, workers: workers, monitors: monitors}
+    rescue
+      error ->
+        Supervisor.stop(supervisor)
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  @spec run(map(), [[number()]]) :: [number()]
+  def run(handle, xs) do
+    unless Enum.all?(xs, &(is_list(&1) and length(&1) == 2)),
+      do: raise(ArgumentError, "This morphology requires two inputs")
+    epoch = make_ref()
+    :ok = GenServer.call(handle.scape, {:reset, epoch, xs})
+    Enum.each(handle.workers, fn {_id, pid} -> :ok = GenServer.call(pid, {:prepare, epoch}) end)
+    Enum.each(handle.workers, fn {_id, pid} -> :ok = GenServer.call(pid, :seed) end)
+    xs |> Enum.with_index() |> Enum.each(fn {_x, step} ->
+      Enum.each(handle.workers, fn {_id, pid} -> GenServer.cast(pid, {:tick, epoch, step}) end)
+      deadline = System.monotonic_time(:millisecond) + 5_000
+      pending = Map.new(handle.workers, fn {id, _} -> {id, true} end)
+      gather(pending, handle.monitors, epoch, step, deadline)
+    end)
+    GenServer.call(handle.scape, :outputs)
+  end
+
+  @spec gather(map(), map(), reference(), non_neg_integer(), integer()) :: :ok
+  defp gather(pending, _monitors, _epoch, _step, _deadline) when map_size(pending) == 0, do: :ok
+  defp gather(pending, monitors, epoch, step, deadline) do
+    remaining = max(0, deadline - System.monotonic_time(:millisecond))
+    receive do
+      {:node_done, ^epoch, ^step, id} -> gather(Map.delete(pending, id), monitors, epoch, step, deadline)
+      {:DOWN, ref, :process, pid, reason} when is_map_key(monitors, ref) ->
+        raise "Operational failure: #{inspect(pid)}: #{inspect(reason)}"
+    after
+      remaining -> raise "Evaluation timed out; missing nodes #{inspect(Map.keys(pending))}"
+    end
+  end
+
+  @spec stop(map()) :: :ok
+  def stop(handle) do
+    if Process.alive?(handle.supervisor), do: Supervisor.stop(handle.supervisor)
+    Enum.each(handle.monitors, fn {ref, _pid} -> Process.demonitor(ref, [:flush]) end)
+    :ok
+  end
+  @spec predict(map(), [[number()]]) :: [number()]
+  def predict(g, xs) do
+    handle = start(g)
+    try do
+      run(handle, xs)
+    after
+      stop(handle)
+    end
+  end
+  @spec fitness(map()) :: float()
+  def fitness(g), do: g |> predict(Functions.cases()) |> Functions.fitness()
+end
+```
+
+#### B. Antithesis - the numerical platform
+
+A genotype becomes a map of tensors. Mutation changes tensor values and masks;
+node capacity and history capacity remain fixed. Failed operations select the
+original complete map, so a half-spliced topology cannot escape.
+
+`step/3` processes neurons in layer order, taking same-layer and backward inputs
+from the previous state. It does **not** update every neuron from the previous
+state indiscriminately, which would add unwanted delays to forward paths.
+
+`evolve/4` contains the population loop, local tuning, constraint-preserving
+selection, cloning, RIM, the best-genome archive, and stopping conditions. Ordinary
+Elixir is used to prepare inputs and display results. `deftransform` helpers arrange
+statically known map fields while tracing; they do not make runtime evolutionary
+decisions on the host. [D1, D2]
+
+The many explicit masks are intentional. In `Nx.select/3`, a non-scalar predicate
+must have the intended result shape; an `{M,1}` mask is explicitly broadcast before
+selecting `{M,2}` values. Loop-carried arrays retain their shape and type. [D1, D2]
+
+```elixir
+defmodule Chapter08.Tensor do
+  import Nx.Defn
+  @moduledoc "Bounded numerical graph, twelve mutations, local search, and population GES."
+  @type tensors :: %{atom() => Nx.Tensor.t()}
+
+  @spec choose(Nx.Tensor.t(), tensors(), tensors()) :: tensors()
+  deftransform choose(flag, yes, no) do
+    Map.new(yes, fn {key, value} ->
+      {key, Nx.select(Nx.broadcast(flag, Nx.shape(value)), value, Map.fetch!(no, key))}
+    end)
+  end
+  @spec take_map(tensors(), Nx.Tensor.t()) :: tensors()
+  deftransform take_map(map, i), do: Map.new(map, fn {k, v} -> {k, Nx.take(v, i, axis: 0)} end)
+  @spec put_map(tensors(), Nx.Tensor.t(), tensors()) :: tensors()
+  deftransform put_map(map, i, item) do
+    Map.new(map, fn {k, v} ->
+      start = [i | List.duplicate(0, Nx.rank(v) - 1)]
+      {k, Nx.put_slice(v, start, Nx.new_axis(Map.fetch!(item, k), 0))}
+    end)
+  end
+  @spec draw_at(tensors(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: tensors()
+  deftransform draw_at(tape, generation, agent, attempt) do
+    tape |> take_map(generation) |> take_map(agent) |> take_map(attempt)
+  end
+
+  @spec set1(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t() | number()) :: Nx.Tensor.t()
+  defn set1(vector, i, value), do: Nx.select(Nx.iota(Nx.shape(vector)) == i, value, vector)
+  @spec set2(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t() | number()) :: Nx.Tensor.t()
+  defn set2(matrix, i, j, value) do
+    {rows, cols} = Nx.shape(matrix)
+    mask = (Nx.iota({rows, 1}, axis: 0) == i) and (Nx.iota({1, cols}, axis: 1) == j)
+    Nx.select(mask, value, matrix)
+  end
+  @spec set_row(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn set_row(matrix, i, value) do
+    {rows, cols} = Nx.shape(matrix)
+    mask = Nx.broadcast(Nx.iota({rows, 1}, axis: 0) == i, {rows, cols})
+    Nx.select(mask, Nx.broadcast(value, {rows, cols}), matrix)
+  end
+  @spec set_weight(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn set_weight(weights, to, from, value) do
+    {m, _, d} = Nx.shape(weights)
+    mask = (Nx.iota({m, 1, 1}, axis: 0) == to) and (Nx.iota({1, m, 1}, axis: 1) == from)
+    Nx.select(Nx.broadcast(mask, {m, m, d}), Nx.broadcast(value, {m, m, d}), weights)
+  end
+  @spec pick(Nx.Tensor.t(), Nx.Tensor.t()) :: {Nx.Tensor.t(), Nx.Tensor.t()}
+  defn pick(mask, u) do
+    mask = Nx.as_type(mask, :s64)
+    count = Nx.sum(mask)
+    rank = Nx.as_type(Nx.floor(u * count), :s64) + 1
+    index = Nx.argmax((Nx.cumulative_sum(mask) == rank) and (mask == 1))
+    {index, count > 0}
+  end
+
+  @spec activation(Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn activation(code, x) do
+    v = Nx.clip(x, -10.0, 10.0)
+    sign = Nx.sign(x)
+    values = Nx.stack([
+      Nx.tanh(x), Nx.cos(x), Nx.sin(x), sign,
+      Nx.select(x > 0, 1.0, 0.0), Nx.select(Nx.abs(x) < 0.33, 0.0, sign),
+      Nx.sqrt(x * x + 0.01), Nx.abs(x), x, sign * x * x,
+      Nx.pow(2.71828183, -v * v), sign * Nx.sqrt(Nx.abs(x)),
+      Nx.select(x == 0, 0.0, sign * Nx.log(Nx.max(Nx.abs(x), 1.0e-300))),
+      2.0 / (1.0 + Nx.pow(2.71828183, -v)) - 1.0, x / (1.0 + Nx.abs(x))
+    ])
+    Nx.take(values, code)
+  end
+
+  @spec step(tensors(), Nx.Tensor.t(), Nx.Tensor.t()) :: {Nx.Tensor.t(), Nx.Tensor.t()}
+  defn step(g, x, previous) do
+    m = Nx.axis_size(g.kind, 0)
+    x0 = Nx.take(x, 0)
+    x1 = Nx.take(x, 1)
+    col0 = Nx.select(g.tag == 2, 1.0, Nx.select(g.tag == 1, x1, x0))
+    col1 = Nx.select(g.tag == 2, 0.0, Nx.select(g.tag == 1, x0, x1))
+    values = Nx.stack([col0, col1], axis: 1)
+    values = Nx.select(Nx.broadcast(Nx.new_axis(g.kind == 1, 1), {m, 2}), values, 0.0)
+    done = Nx.broadcast(Nx.tensor(0, type: :s64), {m})
+    {_, values, _} = while {i = 0, values, done}, i < m do
+      pending = (g.kind == 2) and (done == 0)
+      n = Nx.argmin(Nx.select(pending, g.layer, 2.0))
+      valid = Nx.any(pending)
+      layer = Nx.take(g.layer, n)
+      fresh = (g.kind == 1) or (g.layer < layer)
+      signal = Nx.select(Nx.broadcast(Nx.new_axis(fresh, 1), {m, 2}), values, previous)
+      row_weights = Nx.take(g.weight, n, axis: 0)
+      row_edges = Nx.new_axis(Nx.take(g.edge, n, axis: 0), 1)
+      z = Nx.sum(signal * row_weights * row_edges) + Nx.take(g.bias, n) * Nx.take(g.bias_on, n)
+      y = activation(Nx.take(g.af, n), z)
+      updated = set_row(values, n, Nx.stack([y, Nx.tensor(0.0, type: :f64)]))
+      values = Nx.select(Nx.broadcast(valid, {m, 2}), updated, values)
+      done = Nx.select(Nx.broadcast(valid, {m}), set1(done, n, 1), done)
+      {i + 1, values, done}
+    end
+    neural = Nx.reshape(Nx.slice_along_axis(values, 0, 1, axis: 1), {1, m})
+    neural = Nx.broadcast(neural, {m, m})
+    out0 = Nx.sum(Nx.select((g.edge == 1) and (g.port == 1), neural, 0.0), axes: [1])
+    out1 = Nx.sum(Nx.select((g.edge == 1) and (g.port == 2), neural, 0.0), axes: [1])
+    actuator = Nx.stack([out0, out1], axis: 1)
+    values = Nx.select(Nx.broadcast(Nx.new_axis(g.kind == 3, 1), {m, 2}), actuator, values)
+    {Nx.take(out0, 1), values}
+  end
+
+  @spec rollout(tensors(), Nx.Tensor.t()) :: {Nx.Tensor.t(), Nx.Tensor.t()}
+  defn rollout(g, xs) do
+    steps = Nx.axis_size(xs, 0)
+    m = Nx.axis_size(g.kind, 0)
+    h = Nx.broadcast(Nx.tensor(0.0, type: :f64), {m, 2})
+    predictions = Nx.broadcast(Nx.tensor(0.0, type: :f64), {steps})
+    {_, h, predictions} = while {t = 0, h, predictions}, t < steps do
+      {y, h} = step(g, Nx.take(xs, t, axis: 0), h)
+      {t + 1, h, set1(predictions, t, y)}
+    end
+    {predictions, h}
+  end
+  @spec fitness(tensors()) :: Nx.Tensor.t()
+  defn fitness(g) do
+    xs = Nx.tensor([[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]], type: :f64)
+    target = Nx.tensor([-1.0, 1.0, 1.0, -1.0], type: :f64)
+    {predictions, _} = rollout(g, xs)
+    1.0 / (Nx.sqrt(Nx.sum(Nx.abs(predictions - target))) + 1.0e-5)
+  end
+
+  @spec node(tensors(), Nx.Tensor.t(), integer(), Nx.Tensor.t() | number(), Nx.Tensor.t() | number(), Nx.Tensor.t() | number(), Nx.Tensor.t() | number()) :: tensors()
+  defn node(g, k, kind, layer, af, width, tag) do
+    %{g | kind: set1(g.kind, k, kind), layer: set1(g.layer, k, layer),
+          af: set1(g.af, k, af), width: set1(g.width, k, width), tag: set1(g.tag, k, tag),
+          touched: set1(g.touched, k, g.generation)}
+  end
+  @spec link(tensors(), Nx.Tensor.t(), Nx.Tensor.t(), tensors()) :: {tensors(), Nx.Tensor.t()}
+  defn link(g, from, to, d) do
+    fk = Nx.take(g.kind, from)
+    tk = Nx.take(g.kind, to)
+    edges = Nx.take(g.edge, to, axis: 0)
+    ports = Nx.take(g.port, to, axis: 0)
+    valid = (((fk == 1) or (fk == 2)) and (tk == 2)) or ((fk == 2) and (tk == 3))
+    valid = valid and (Nx.take(edges, from) == 0) and ((tk != 3) or (Nx.sum(edges) < Nx.take(g.width, to)))
+    channel = Nx.select(Nx.any((ports == 1) and (edges == 1)), 2, 1)
+    weight = Nx.take(Nx.take(d.noise, to, axis: 0), from, axis: 0) - 0.5
+    weight = Nx.select(Nx.iota({2}) < Nx.take(g.width, from), weight, 0.0)
+    weight = Nx.select(Nx.broadcast(tk == 2, {2}), weight, 0.0)
+    touched = Nx.select(Nx.broadcast(fk == 2, Nx.shape(g.touched)), set1(g.touched, from, g.generation), g.touched)
+    touched = Nx.select(Nx.broadcast(tk == 2, Nx.shape(g.touched)), set1(touched, to, g.generation), touched)
+    next = %{g | edge: set2(g.edge, to, from, 1), weight: set_weight(g.weight, to, from, weight),
+                  port: set2(g.port, to, from, Nx.select(tk == 3, channel, 0)), touched: touched}
+    {choose(valid, next, g), valid}
+  end
+  @spec cut(tensors(), Nx.Tensor.t(), Nx.Tensor.t()) :: tensors()
+  defn cut(g, from, to) do
+    %{g | edge: set2(g.edge, to, from, 0), port: set2(g.port, to, from, 0),
+          weight: set_weight(g.weight, to, from, Nx.tensor([0.0, 0.0], type: :f64))}
+  end
+
+  @spec perturb_rows(tensors(), tensors(), Nx.Tensor.t(), Nx.Tensor.t() | integer()) :: tensors()
+  defn perturb_rows(g, d, selected, count_bias) do
+    m = Nx.axis_size(g.kind, 0)
+    channels = Nx.iota({1, 1, 2}, axis: 2)
+    valid = (Nx.new_axis(g.edge, 2) == 1) and (channels < Nx.reshape(g.width, {1, m, 1}))
+    valid = valid and Nx.reshape(g.kind == 2, {m, 1, 1})
+    count = Nx.sum(Nx.as_type(valid, :f64), axes: [1, 2]) + count_bias * g.bias_on
+    probability = 1.0 / Nx.sqrt(Nx.max(count, 1.0))
+    mask = valid and Nx.reshape(selected, {m, 1, 1}) and (d.gate < Nx.reshape(probability, {m, 1, 1}))
+    updated = Nx.clip(g.weight + (d.noise - 0.5) * 6.283185307179586, -6.283185307179586, 6.283185307179586)
+    weights = Nx.select(mask, updated, g.weight)
+    bmask = (g.bias_on == 1) and selected and (d.bias_gate < probability)
+    biases = Nx.select(bmask, Nx.clip(g.bias + (d.bias_noise - 0.5) * 6.283185307179586,
+                                    -6.283185307179586, 6.283185307179586), g.bias)
+    %{g | weight: weights, bias: biases}
+  end
+  @spec perturb(tensors(), tensors()) :: tensors()
+  defn perturb(g, d) do
+    neurons = g.kind == 2
+    selected = neurons and (d.node_gate < 1.0 / Nx.sqrt(Nx.sum(Nx.as_type(neurons, :f64))))
+    perturb_rows(g, d, selected, 0)
+  end
+
+  @spec layer_choice(tensors(), Nx.Tensor.t()) :: Nx.Tensor.t()
+  defn layer_choice(g, u) do
+    m = Nx.axis_size(g.kind, 0)
+    rows = Nx.iota({m, 1}, axis: 0)
+    cols = Nx.iota({1, m}, axis: 1)
+    same = Nx.new_axis(g.layer, 1) == Nx.new_axis(g.layer, 0)
+    earlier = Nx.any(same and (cols < rows) and Nx.new_axis(g.kind == 2, 0), axes: [1])
+    unique = (g.kind == 2) and not earlier
+    rank = Nx.sum(Nx.as_type((Nx.new_axis(g.layer, 0) < Nx.new_axis(g.layer, 1)) and
+                             Nx.new_axis(unique, 0), :s64), axes: [1])
+    desired = Nx.as_type(Nx.floor(u * Nx.sum(Nx.as_type(unique, :s64))), :s64)
+    chosen = Nx.argmax(unique and (rank == desired))
+    Nx.take(g.layer, chosen)
+  end
+
+  @spec mutate(tensors(), Nx.Tensor.t() | integer(), tensors()) :: {tensors(), Nx.Tensor.t()}
+  defn mutate(g, op, d) do
+    m = Nx.axis_size(g.kind, 0)
+    ids = Nx.iota({m}, type: :s64)
+    neurons = g.kind == 2
+    sensors = g.kind == 1
+    actuators = g.kind == 3
+    {n, n_ok} = pick(neurons, Nx.take(d.u, 1))
+    {free, free_ok} = pick(g.kind == 0, 0.0)
+    {af_new, af_ok} = pick(g.allowed_af == 1, Nx.take(d.u, 4))
+    {next, ok, a, k, b} = cond do
+      op == 0 ->
+        {perturb_rows(g, d, ids == n, 1), n_ok, n, -1, -1}
+      op == 1 ->
+        valid = n_ok and (Nx.take(g.bias_on, n) == 0)
+        next = %{g | bias_on: set1(g.bias_on, n, 1), bias: set1(g.bias, n, Nx.take(d.u, 5) - 0.5),
+                      touched: set1(g.touched, n, g.generation)}
+        {next, valid, n, -1, -1}
+      op == 2 ->
+        valid = n_ok and (Nx.take(g.bias_on, n) == 1)
+        next = %{g | bias_on: set1(g.bias_on, n, 0), bias: set1(g.bias, n, 0.0),
+                      touched: set1(g.touched, n, g.generation)}
+        {next, valid, n, -1, -1}
+      op == 3 ->
+        choices = (g.allowed_af == 1) and (Nx.iota({15}) != Nx.take(g.af, n))
+        {af, valid} = pick(choices, Nx.take(d.u, 2))
+        {%{g | af: set1(g.af, n, af), touched: set1(g.touched, n, g.generation)}, valid and n_ok, n, -1, -1}
+      op == 4 ->
+        {to, valid} = pick((neurons or actuators) and (Nx.take(g.edge, n, axis: 1) == 0), Nx.take(d.u, 2))
+        {next, linked} = link(g, n, to, d)
+        {next, valid and linked and n_ok, n, -1, to}
+      op == 5 ->
+        {from, valid} = pick((sensors or neurons) and (Nx.take(g.edge, n, axis: 0) == 0), Nx.take(d.u, 2))
+        {next, linked} = link(g, from, n, d)
+        {next, valid and linked and n_ok, from, -1, n}
+      op == 6 ->
+        {from, valid_from} = pick(sensors, Nx.take(d.u, 1))
+        {to, valid_to} = pick(neurons and (Nx.take(g.edge, from, axis: 1) == 0), Nx.take(d.u, 2))
+        {next, linked} = link(g, from, to, d)
+        {next, valid_from and valid_to and linked, from, -1, to}
+      op == 7 ->
+        {to, valid_to} = pick(actuators, Nx.take(d.u, 1))
+        {from, valid_from} = pick(neurons and (Nx.take(g.edge, to, axis: 0) == 0), Nx.take(d.u, 2))
+        {next, linked} = link(g, from, to, d)
+        {next, valid_from and valid_to and linked, from, -1, to}
+      op == 8 ->
+        layer = layer_choice(g, Nx.take(d.u, 1))
+        {from, valid_from} = pick(sensors or neurons, Nx.take(d.u, 2))
+        {to, valid_to} = pick(neurons or actuators, Nx.take(d.u, 3))
+        next = node(g, free, 2, layer, af_new, 1, 0)
+        {next, link_a} = link(next, from, free, d)
+        {next, link_b} = link(next, free, to, d)
+        {next, free_ok and af_ok and valid_from and valid_to and link_a and link_b, from, free, to}
+      op == 9 ->
+        left = Nx.take(g.layer, n)
+        {to, valid_to} = pick((Nx.take(g.edge, n, axis: 1) == 1) and (g.layer > left), Nx.take(d.u, 2))
+        right = Nx.take(g.layer, to)
+        middle = neurons and (g.layer > left) and (g.layer < right)
+        layer = Nx.select(Nx.any(middle), Nx.reduce_min(Nx.select(middle, g.layer, 2.0)), (left + right) / 2.0)
+        old_port = Nx.take(Nx.take(g.port, to, axis: 0), n)
+        next = cut(g, n, to) |> node(free, 2, layer, af_new, 1, 0)
+        {next, link_a} = link(next, n, free, d)
+        {next, link_b} = link(next, free, to, d)
+        next = choose(Nx.take(g.kind, to) == 3, %{next | port: set2(next.port, to, free, old_port)}, next)
+        valid = n_ok and free_ok and af_ok and valid_to and link_a and link_b and (layer > left) and (layer < right)
+        {next, valid, n, free, to}
+      op == 10 ->
+        used = Nx.any(Nx.new_axis(sensors, 1) and (Nx.new_axis(g.tag, 1) == Nx.iota({1, 3}, axis: 1)), axes: [0])
+        {tag, tag_ok} = pick((g.allowed_sensor == 1) and not used, Nx.take(d.u, 1))
+        {to, valid_to} = pick(neurons, Nx.take(d.u, 2))
+        width = Nx.take(Nx.tensor([2, 2, 1], type: :s64), tag)
+        next = node(g, free, 1, -1.0, 0, width, tag)
+        {next, linked} = link(next, free, to, d)
+        {next, tag_ok and free_ok and valid_to and linked, -1, free, to}
+      true ->
+        used = Nx.any(Nx.new_axis(actuators, 1) and (Nx.new_axis(g.tag, 1) == Nx.iota({1, 2}, axis: 1)), axes: [0])
+        {tag, tag_ok} = pick((g.allowed_actuator == 1) and not used, Nx.take(d.u, 1))
+        {from, valid_from} = pick(neurons, Nx.take(d.u, 2))
+        width = Nx.take(Nx.tensor([1, 2], type: :s64), tag)
+        next = node(g, free, 3, 1.0, 0, width, tag)
+        {next, linked} = link(next, from, free, d)
+        {next, tag_ok and free_ok and valid_from and linked and (op == 11), from, free, -1}
+    end
+    ok = ok and (g.hist_n < Nx.axis_size(g.history, 0))
+    event = Nx.as_type(Nx.stack([op, a, k, b, g.generation]), :s64)
+    next = %{next | history: set_row(next.history, g.hist_n, event), hist_n: g.hist_n + 1}
+    {choose(ok, next, g), Nx.as_type(ok, :s64)}
+  end
+
+  @spec rim(tensors(), tensors()) :: {tensors(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()}
+  defn rim(g, draws) do
+    attempts_limit = Nx.axis_size(draws.u, 0)
+    first = take_map(draws, 0)
+    cap = Nx.max(1, Nx.as_type(Nx.round(Nx.sqrt(Nx.sum(Nx.as_type(g.kind == 2, :f64)))), :s64))
+    target = 1 + Nx.as_type(Nx.floor(Nx.take(first.u, 10) * cap), :s64)
+    base = %{g | generation: g.generation + 1}
+    {candidate, successes, attempts} = while {candidate = base, successes = Nx.tensor(0, type: :s64), attempts = 0},
+                                           (attempts < attempts_limit) and (successes < target) do
+      draw = take_map(draws, attempts)
+      op = Nx.as_type(Nx.floor(Nx.take(draw.u, 0) * 12), :s64)
+      {next, ok} = mutate(candidate, op, draw)
+      {next, successes + ok, attempts + 1}
+    end
+    success = successes == target
+    {choose(success, candidate, base), Nx.as_type(success, :s64), successes, attempts}
+  end
+
+  @spec tune(tensors(), tensors(), Nx.Tensor.t() | integer(), Nx.Tensor.t() | integer()) :: {tensors(), Nx.Tensor.t(), Nx.Tensor.t()}
+  defn tune(g, draws, patience, max_steps) do
+    initial_fitness = fitness(g)
+    {best, score, _, _, evaluations} =
+      while {best = g, score = initial_fitness, failed = 0, t = 0, evaluations = 1},
+            (t < max_steps) and (failed < patience) do
+        candidate = perturb(best, take_map(draws, t))
+        value = fitness(candidate)
+        better = value > score
+        {choose(better, candidate, best), Nx.select(better, value, score),
+         Nx.select(better, 0, failed + 1), t + 1, evaluations + 1}
+      end
+    {best, score, evaluations}
+  end
+
+  @spec allocation(Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t() | number()) :: {Nx.Tensor.t(), Nx.Tensor.t()}
+  defn allocation(fitness, sizes, species, efficiency) do
+    p = Nx.axis_size(fitness, 0)
+    row = Nx.iota({p, 1}, axis: 0)
+    col = Nx.iota({1, p}, axis: 1)
+    same = Nx.new_axis(species, 1) == Nx.new_axis(species, 0)
+    group_size = Nx.sum(Nx.as_type(same, :s64), axes: [1])
+    score = fitness / Nx.pow(sizes, efficiency)
+    sr = Nx.new_axis(score, 1)
+    sc = Nx.new_axis(score, 0)
+    ahead = (sc > sr) or ((sc == sr) and (col < row))
+    rank = Nx.sum(Nx.as_type(same and ahead, :s64), axes: [1])
+    kept = rank < Nx.max(1, Nx.as_type(Nx.round(group_size * 0.5), :s64))
+    weight = Nx.select(kept, fitness / sizes, 0.0)
+    total = Nx.sum(Nx.select(same, Nx.broadcast(Nx.new_axis(weight, 0), {p, p}), 0.0), axes: [1])
+    quota = group_size * weight / total
+    base = Nx.as_type(Nx.floor(quota), :s64)
+    remaining = group_size - Nx.sum(Nx.select(same, Nx.broadcast(Nx.new_axis(base, 0), {p, p}), 0), axes: [1])
+    fraction = quota - base
+    fr = Nx.new_axis(fraction, 1)
+    fc = Nx.new_axis(fraction, 0)
+    ahead_fraction = (fc > fr) or ((fc == fr) and (col < row))
+    fraction_rank = Nx.sum(Nx.as_type(same and ahead_fraction and Nx.new_axis(kept, 0), :s64), axes: [1])
+    counts = base + Nx.as_type(kept and (fraction_rank < remaining), :s64)
+    cumulative = Nx.cumulative_sum(counts)
+    parents = Nx.argmax(Nx.new_axis(cumulative, 0) > Nx.iota({p, 1}, axis: 0), axis: 1)
+    start = cumulative - counts
+    clones = Nx.iota({p}) != Nx.take(start, parents)
+    {parents, Nx.as_type(clones, :s64)}
+  end
+
+  @spec evolve(tensors(), tensors(), tensors(), map()) :: map()
+  defn evolve(initial, local_tape, mutation_tape, config) do
+    p = Nx.axis_size(initial.kind, 0)
+    gmax = Nx.axis_size(local_tape.u, 0)
+    trace = Nx.broadcast(Nx.tensor(0.0, type: :f64), {gmax, 6})
+    archive = take_map(initial, 0)
+    reserve = p * (1 + config.max_steps)
+    state = %{population: initial, archive: archive, best: Nx.tensor(-1.0, type: :f64),
+              generation: Nx.tensor(0, type: :s64), evaluations: Nx.tensor(0, type: :s64),
+              stagnant: Nx.tensor(0, type: :s64), failed_mutations: Nx.tensor(0, type: :s64), scores: Nx.broadcast(Nx.tensor(0.0, type: :f64), {p}), trace: trace}
+    state = while state,
+                  (state.generation < config.generations) and (state.generation < gmax) and
+                  (state.evaluations + reserve <= config.evaluations) and
+                  (state.best < config.goal) and (state.stagnant < config.stagnation) do
+      population = state.population
+      scores = Nx.broadcast(Nx.tensor(0.0, type: :f64), {p})
+      {_, population, scores, evaluations} =
+        while {i = 0, population, scores, evaluations = state.evaluations}, i < p do
+          genome = take_map(population, i)
+          draws = local_tape |> take_map(state.generation) |> take_map(i)
+          {tuned, score, used} = tune(genome, draws, config.patience, config.max_steps)
+          {i + 1, put_map(population, i, tuned), set1(scores, i, score), evaluations + used}
+        end
+      winner = Nx.argmax(scores)
+      best_now = Nx.take(scores, winner)
+      improved = best_now > state.best
+      archive = choose(improved, take_map(population, winner), state.archive)
+      best = Nx.max(best_now, state.best)
+      stagnant = Nx.select(improved, 0, state.stagnant + 1)
+      sizes = Nx.sum(Nx.as_type(population.kind == 2, :f64), axes: [1])
+      row = Nx.stack([state.generation * 1.0, best, Nx.mean(scores), Nx.mean(sizes), evaluations * 1.0,
+                      state.failed_mutations * 1.0])
+      trace = set_row(state.trace, state.generation, row)
+      next_generation = state.generation + 1
+      continue = (next_generation < config.generations) and (next_generation < gmax) and
+                 (evaluations + reserve <= config.evaluations) and (best < config.goal) and
+                 (stagnant < config.stagnation)
+      {population, failed_mutations} = if continue do
+        {parents, clones} = allocation(scores, sizes, population.species, config.efficiency)
+        original = population
+        {_, offspring, failed} = while {j = 0, offspring = population, failed = state.failed_mutations}, j < p do
+          parent = take_map(original, Nx.take(parents, j))
+          clone = %{parent | gid: Nx.reduce_max(initial.gid) + 1 + state.generation * p + j, parent: parent.gid}
+          draws = mutation_tape |> take_map(state.generation) |> take_map(j)
+          {mutated, success, _, _} = rim(clone, draws)
+          is_clone = Nx.take(clones, j) == 1
+          child = choose(is_clone, mutated, parent)
+          {j + 1, put_map(offspring, j, child), failed + Nx.as_type(is_clone and (success == 0), :s64)}
+        end
+        {offspring, failed}
+      else
+        {population, state.failed_mutations}
+      end
+      %{state | population: population, archive: archive, best: best, generation: next_generation,
+                evaluations: evaluations, stagnant: stagnant, failed_mutations: failed_mutations, scores: scores, trace: trace}
+    end
+    state
+  end
+end
+```
+
+#### C. Synthesis - actors own tensor jobs
+
+The hybrid keeps the actor population monitor and ordinary Elixir graph mutation.
+Instead of one process per neuron, one temporary worker owns an agent's packed
+network and runs its entire local tuning job through Nx. This gives the process a
+meaningful lifecycle boundary without sending a message for every multiplication.
+
+The pure Nx call is not asynchronously pausable in this notebook; the monitor
+pause/resume interface belongs to the actor and hybrid versions.
+
+The worker configures its own Nx defaults: those defaults are process-local.
+The compiled numerical core is reused rather than reimplemented. This is one
+specific synthesis, not a claim that it is always the fastest architecture. [D2, D4]
+
+```elixir
+defmodule Chapter08.Hybrid do
+  use GenServer, restart: :temporary
+  alias Chapter08.{Genotype, Tensor, Functions, Tape}
+  @moduledoc "One coarse-grained evaluation worker owns the complete Nx graph."
+  @spec start_link(map()) :: GenServer.on_start()
+  def start_link(g), do: GenServer.start_link(__MODULE__, g)
+  @impl true
+  @spec init(map()) :: {:ok, map()}
+  def init(g) do
+    Nx.default_backend(Nx.BinaryBackend)
+    Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+    {:ok, Genotype.pack(g)}
+  end
+  @impl true
+  @spec handle_call(term(), GenServer.from(), map()) :: {:reply, term(), map()}
+  def handle_call(:fitness, _from, g), do: {:reply, Nx.to_number(Tensor.fitness(g)), g}
+  def handle_call({:tune, draws, config}, _from, g) do
+    {best, score, evaluations} = Tensor.tune(g, Tape.pack(draws), config.patience, config.max_steps)
+    result = {Genotype.unpack(best), Nx.to_number(score), Nx.to_number(evaluations)}
+    {:reply, result, best}
+  end
+  def handle_call({:predict, xs}, _from, g) do
+    {y, _state} = Tensor.rollout(g, Nx.tensor(xs, type: :f64))
+    {:reply, Nx.to_flat_list(y), g}
+  end
+  @spec tune(map(), [map()], map()) :: {map(), float(), pos_integer()}
+  def tune(g, draws, config) do
+    {:ok, supervisor} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    try do
+      {:ok, worker} = DynamicSupervisor.start_child(supervisor, {__MODULE__, g})
+      GenServer.call(worker, {:tune, draws, config}, 120_000)
+    after
+      Supervisor.stop(supervisor)
+    end
+  end
+  @spec predict(map(), [[number()]]) :: [number()]
+  def predict(g, xs) do
+    {:ok, supervisor} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    try do
+      {:ok, worker} = DynamicSupervisor.start_child(supervisor, {__MODULE__, g})
+      GenServer.call(worker, {:predict, xs}, 30_000)
+    after
+      Supervisor.stop(supervisor)
+    end
+  end
+  @spec fitness(map()) :: float()
+  def fitness(g), do: g |> predict(Functions.cases()) |> Functions.fitness()
+end
+```
+
+#### Experiment 1 - executable operator and numerical checks
+
+Run these before the population experiment. The constructed XOR circuit and the
+linear recurrent neuron are test fixtures, not results attributed to evolutionary
+search. The scalar and tensor implementations receive identical mutation draws.
+
+```elixir
+defmodule Chapter08.Checks do
+  alias Chapter08.{Genotype, Mutator, Tensor, Tape, Fixtures, Actor, Hybrid, Functions, Selection, Support}
+  @spec same_genome?(map(), map()) :: boolean()
+  def same_genome?(left, right) do
+    Enum.all?(left, fn {k, value} -> Support.close?(value, Map.fetch!(right, k), 1.0e-10) end)
+  end
+  @spec packed_draw(map()) :: map()
+  def packed_draw(d), do: Map.new(d, fn {k, v} -> {k, Nx.tensor(v, type: :f64)} end)
+
+  @spec mutations() :: [map()]
+  def mutations do
+    Enum.with_index(Mutator.operators()) |> Enum.map(fn {op, code} ->
+      {g, draw} = Fixtures.mutation(op)
+      {:ok, expected} = Mutator.mutate(g, op, draw)
+      {actual, success} = Tensor.mutate(Genotype.pack(g), Nx.tensor(code, type: :s64), packed_draw(draw))
+      actual = Genotype.unpack(actual)
+      Genotype.validate!(expected)
+      Genotype.validate!(actual)
+      Support.check!(Nx.to_number(success) == 1 and same_genome?(expected, actual), "Operator parity: #{op}")
+    end)
+  end
+
+  @spec core() :: [map()]
+  def core do
+    g = Fixtures.seed(10, false)
+    packed = Genotype.pack(g)
+    clone = Genotype.clone(g, 999)
+    parent_ids = Enum.map(Genotype.records(g), & &1.id)
+    clone_ids = Enum.map(Genotype.records(clone), & &1.id)
+    d = Fixtures.draw(10)
+    {:ok, bias} = Mutator.mutate(g, :add_bias, d)
+    {:ok, no_bias} = Mutator.mutate(bias, :remove_bias, d)
+    {:ok, spliced} = Mutator.mutate(g, :outsplice, d)
+    tiny = Fixtures.seed(3, false)
+    {unchanged, capacity_ok} = Tensor.mutate(Genotype.pack(tiny), 9, packed_draw(Fixtures.draw(3)))
+    impossible_draw = %{d | u: List.replace_at(d.u, 0, 10.1 / 12.0)}
+    {fallback, status} = Mutator.rim(g, List.duplicate(impossible_draw, 3))
+    {tensor_fallback, tensor_status, _applied, attempts} = Tensor.rim(packed, Tape.pack(List.duplicate(impossible_draw, 3)))
+    population = Enum.map(1..6, &%{g | gid: &1})
+    scores = [20.0, 10.0, 10.0, 1.0, 1.0, 1.0]
+    allocation = Selection.allocation(population, scores, 0.05)
+    {parents, clones} = Tensor.allocation(Nx.tensor(scores, type: :f64), Nx.broadcast(1.0, {6}),
+                                        Nx.broadcast(Nx.tensor(1, type: :s64), {6}), 0.05)
+    tensor_allocation = Enum.zip(Nx.to_flat_list(parents), Nx.to_flat_list(clones))
+                       |> Enum.map(fn {p, c} -> {p, c == 1} end)
+    activation_checks = Enum.with_index(Functions.names()) |> Enum.map(fn {name, code} ->
+      xs = [-2.0, -0.33, 0.0, 0.33, 2.0]
+      expected = Enum.map(xs, &Functions.activate(code, &1))
+      actual = Enum.map(xs, fn x -> Tensor.activation(code, Nx.tensor(x, type: :f64)) |> Nx.to_number() end)
+      Support.check!(Support.close?(expected, actual, 1.0e-10), "Activation parity: #{name}")
+    end)
+    [
+      Support.check!(length(Genotype.slots(g, 2)) == 1 and Enum.sum(g.bias_on) == 0, "Minimal seed has no bias"),
+      Support.check!(same_genome?(g, Genotype.unpack(packed)), "Genotype tensor round-trip"),
+      Support.check!(MapSet.disjoint?(MapSet.new(parent_ids), MapSet.new(clone_ids)), "Clone has disjoint qualified IDs"),
+      Support.check!(Genotype.fingerprint(g) == Genotype.fingerprint(clone), "Fingerprint ignores clone identity"),
+      Support.check!(Genotype.link(g, 2, 1, [0.0, 0.0]) == {:error, :duplicate_link}, "Duplicate link rejected"),
+      Support.check!(Genotype.at(no_bias, :bias_on, [2]) == 0 and Genotype.at(no_bias, :bias, [2]) == 0.0, "Bias removal clears presence and value"),
+      Support.check!(length(Genotype.slots(spliced, 2)) == 2 and Enum.member?(spliced.layer, 0.5), "Outsplice increases depth"),
+      Support.check!(Genotype.inputs(spliced, 1) == [3], "Outsplice reconnects the actuator"),
+      Support.check!(Nx.to_number(capacity_ok) == 0 and same_genome?(tiny, Genotype.unpack(unchanged)), "Capacity failure is atomic"),
+      Support.check!(Mutator.mutate(g, :add_sensor, d) == {:error, :not_applicable}, "Default XOR has no extra sensor"),
+      Support.check!(not status.success and status.attempts == 3 and fallback.hist_n == g.hist_n, "RIM retry cap rolls back partial mutations"),
+      Support.check!(Nx.to_number(tensor_status) == 0 and Nx.to_number(attempts) == 3 and same_genome?(fallback, Genotype.unpack(tensor_fallback)), "Tensor RIM fallback agrees"),
+      Support.check!(Enum.sum(Selection.source_counts(scores, List.duplicate(1, 6), 6, 0.05)) == 7, "Source rounding can exceed its limit"),
+      Support.check!(length(allocation) == 6 and allocation == tensor_allocation, "Exact-size allocation agrees"),
+      Support.check!(Genotype.at(g, :bias_on, [2]) == 0 and Genotype.slots(g, 2) == [2], "Parent remains unchanged")
+    ] ++ activation_checks
+  end
+
+  @spec neural() :: [map()]
+  def neural do
+    g = Fixtures.known_xor()
+    xs = Functions.cases()
+    actor = Actor.predict(g, xs)
+    {tensor, _state} = Tensor.rollout(Genotype.pack(g), Nx.tensor(xs, type: :f64))
+    tensor = Nx.to_flat_list(tensor)
+    hybrid = Hybrid.predict(g, xs)
+    recurrent = Fixtures.recurrent()
+    pulse = [[1.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+    handle = Actor.start(recurrent)
+    {first, second, stale_rejected, duplicate_ignored, worker_pids} = try do
+      first = Actor.run(handle, pulse)
+      second = Actor.run(handle, pulse)
+      neuron = Map.fetch!(handle.workers, 2)
+      epoch = make_ref()
+      :ok = GenServer.call(neuron, {:prepare, epoch})
+      GenServer.cast(neuron, {:signal, make_ref(), 0, 0, [999.0, 999.0]})
+      stale_rejected = map_size(:sys.get_state(neuron).pending) == 0
+      GenServer.cast(neuron, {:signal, epoch, 0, 0, [1.0, 0.0]})
+      GenServer.cast(neuron, {:signal, epoch, 0, 0, [999.0, 999.0]})
+      duplicate_ignored = Map.fetch!(:sys.get_state(neuron).pending, {0, 0}) == [1.0, 0.0]
+      {first, second, stale_rejected, duplicate_ignored, Map.values(handle.workers)}
+    after
+      Actor.stop(handle)
+    end
+    {tensor_pulse, _state} = Tensor.rollout(Genotype.pack(recurrent), Nx.tensor(pulse, type: :f64))
+    [
+      Support.check!(Support.close?(actor, tensor, 1.0e-10), "Actor and tensor feedforward parity"),
+      Support.check!(Support.close?(actor, hybrid, 1.0e-10), "Actor and hybrid feedforward parity"),
+      Support.check!(Enum.map(actor, &Functions.sign/1) == [-1, 1, 1, -1], "Constructed fixture classifies XOR"),
+      Support.check!(Support.close?(first, [1.0, 0.5, 0.25, 0.125], 1.0e-10), "Recurrent edge has one-cycle delay"),
+      Support.check!(Support.close?(first, Nx.to_flat_list(tensor_pulse), 1.0e-10), "Actor and tensor recurrent parity"),
+      Support.check!(first == second, "Episode reset prevents recurrent-state leakage"),
+      Support.check!(stale_rejected, "Foreign epoch cannot populate the signal buffer"),
+      Support.check!(duplicate_ignored, "Duplicate sender does not replace the first signal"),
+      Support.check!(Enum.all?(worker_pids, &(not Process.alive?(&1))), "Owned neural workers are cleaned up")
+    ]
+  end
+end
+```
+
+```elixir
+tbl_checks = Chapter08.Checks.mutations() ++ Chapter08.Checks.core() ++ Chapter08.Checks.neural()
+Chapter08.Tables.tabs(tbl_checks, [:check, :result], "ch_08_tbl_05_checks.csv")
+```
+
+#### Experiment 2 - inspect recurrent memory
+
+A linear neuron receives one pulse. Its self-connection has weight 0.5. After the
+pulse, its output should halve at each step. Re-evaluating the episode starts from
+zero memory again.
+
+```elixir
+g_memory = Chapter08.Fixtures.recurrent()
+x_memory = [[1.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+y_actor = Chapter08.Actor.predict(g_memory, x_memory)
+{y_tensor, _state} = Chapter08.Tensor.rollout(Chapter08.Genotype.pack(g_memory), Nx.tensor(x_memory, type: :f64))
+y_hybrid = Chapter08.Hybrid.predict(g_memory, x_memory)
+tbl_memory = Enum.zip([y_actor, Nx.to_flat_list(y_tensor), y_hybrid])
+  |> Enum.with_index(1) |> Enum.map(fn {{actor, tensor, hybrid}, step} ->
+    %{step: step, actor: actor, tensor: tensor, hybrid: hybrid}
+  end)
+Chapter08.Tables.tabs(tbl_memory, [:step, :actor, :tensor, :hybrid], "ch_08_tbl_06_memory.csv")
+```
+
+#### Experiment 3 - a bounded population run
+
+Each species starts with two minimal agents. Both use the same XOR task, but their
+activation constraints differ. Offspring remain in their parent's species. The
+random tape is prepared once and reused for all three executions.
+
+Six generations and a small local proposal cap make this a mechanism demonstration,
+not a competitive benchmark. **Failure to reach the goal is a valid reported
+outcome.** The hand-built test solution is never seeded into this population.
+
+For genetic-only evolution, set both `patience` and `max_steps` to zero **before**
+building the tapes. For a longer memetic experiment, increase the limits explicitly.
+
+```elixir
+config = Chapter08.Engine.config()
+capacity = 10
+constraints = [{1, [:tanh]}, {1, [:tanh]}, {2, [:tanh, :cos, :sin]}, {2, [:tanh, :cos, :sin]}]
+{population, _rng} = constraints |> Enum.with_index(1)
+  |> Enum.map_reduce(Chapter08.Tape.new(8007), fn {{species, afs}, id}, rng ->
+    {draw, rng} = Chapter08.Tape.draw(capacity, rng)
+    {Chapter08.Genotype.seed(capacity, id, species, afs, draw, false), rng}
+  end)
+Chapter08.Engine.validate_config!(config, length(population))
+{host_tape, tensor_tape} = Chapter08.Engine.tapes(capacity, length(population), config, 16, 8008)
+
+{us_actor, result_actor} = :timer.tc(fn ->
+  Chapter08.PopulationMonitor.run(population, host_tape, config, :actor)
+end)
+{us_tensor, result_tensor} = :timer.tc(fn ->
+  result = Chapter08.Tensor.evolve(Chapter08.Genotype.pack_population(population),
+    tensor_tape.local, tensor_tape.mutation, config)
+  _completed_score = Nx.to_number(result.best)
+  result
+end)
+{us_hybrid, result_hybrid} = :timer.tc(fn ->
+  Chapter08.PopulationMonitor.run(population, host_tape, config, :hybrid)
+end)
+
+tbl_runs = [
+  %{version: "Actor", best: result_actor.best, generations: result_actor.generation,
+    evaluations: result_actor.evaluations, fallback_mutations: result_actor.failed_mutations, milliseconds: us_actor / 1000.0},
+  %{version: "Nx", best: Nx.to_number(result_tensor.best), generations: Nx.to_number(result_tensor.generation),
+    evaluations: Nx.to_number(result_tensor.evaluations), fallback_mutations: Nx.to_number(result_tensor.failed_mutations), milliseconds: us_tensor / 1000.0},
+  %{version: "Hybrid", best: result_hybrid.best, generations: result_hybrid.generation,
+    evaluations: result_hybrid.evaluations, fallback_mutations: result_hybrid.failed_mutations, milliseconds: us_hybrid / 1000.0}
+] |> Enum.map(&Map.put(&1, :goal_reached, &1.best >= config.goal))
+Chapter08.Tables.tabs(tbl_runs, [:version, :best, :generations, :evaluations, :fallback_mutations, :goal_reached, :milliseconds],
+  "ch_08_tbl_07_population_runs.csv")
+```
+
+The elapsed values include implementation-specific lifecycle and numerical
+execution costs in this runtime. They are not hardware-independent speedups.
+A stronger performance study needs repeated seeds, warm-up, memory measurements,
+backend details, and matching work budgets.
+
+Two versions can produce nearly identical predictions but make different decisions
+at a numerical tie. Inspect their archive scores and traces; do not assume the same
+random tape guarantees a bit-for-bit identical evolutionary history.
+
+```elixir
+tensor_trace = result_tensor.trace |> Nx.to_flat_list() |> Enum.chunk_every(6)
+  |> Enum.take(Nx.to_number(result_tensor.generation))
+  |> Enum.map(fn [generation, best, mean, size, evaluations, fallbacks] ->
+    %{generation: generation, best: best, mean: mean, mean_neurons: size,
+      evaluations: evaluations, mutation_fallbacks: fallbacks}
+  end)
+tbl_trace = Enum.flat_map([
+  {"Actor", result_actor.trace}, {"Nx", tensor_trace}, {"Hybrid", result_hybrid.trace}
+], fn {version, rows} -> Enum.map(rows, &Map.put(&1, :version, version)) end)
+Chapter08.Tables.tabs(tbl_trace, [:version, :generation, :best, :mean, :mean_neurons, :evaluations, :mutation_fallbacks],
+  "ch_08_tbl_08_trace.csv")
+```
+
+```elixir
+fig_fitness = Vl.new(width: 650, height: 280, title: "R8.4 - Best observed fitness")
+  |> Vl.data_from_values(tbl_trace)
+  |> Vl.mark(:line, point: true)
+  |> Vl.encode_field(:x, "generation", type: :quantitative)
+  |> Vl.encode_field(:y, "best", type: :quantitative)
+  |> Vl.encode_field(:color, "version", type: :nominal)
+fig_fitness
+```
+
+```elixir
+fig_size = Vl.new(width: 650, height: 280, title: "R8.5 - Mean active neuron count")
+  |> Vl.data_from_values(tbl_trace)
+  |> Vl.mark(:line, point: true)
+  |> Vl.encode_field(:x, "generation", type: :quantitative)
+  |> Vl.encode_field(:y, "mean_neurons", type: :quantitative)
+  |> Vl.encode_field(:color, "version", type: :nominal)
+fig_size
+```
+
+An increasing neuron count is not automatically progress. The source's selection
+policy penalizes size, while local tuning gives changed topologies a chance to
+recover useful behavior. These are competing pressures, not a guarantee of
+unlimited complexification.
+
+#### Experiment 4 - audit the returned archives
+
+Re-evaluate each archive from fresh recurrent state. A record of the highest score
+is useful only if its associated genome reproduces that score under the same
+protocol. Record counts refer to logical neurons, not unused tensor slots.
+
+```elixir
+archives = [
+  {"Actor", result_actor.archive, result_actor.best},
+  {"Nx", Chapter08.Genotype.unpack(result_tensor.archive), Nx.to_number(result_tensor.best)},
+  {"Hybrid", result_hybrid.archive, result_hybrid.best}
+]
+tbl_archives = Enum.map(archives, fn {version, g, reported} ->
+  predicted = Chapter08.Hybrid.predict(g, Chapter08.Functions.cases())
+  replayed = Chapter08.Functions.fitness(predicted)
+  %{version: version, agent: g.gid, species: g.species, neurons: length(Chapter08.Genotype.slots(g, 2)),
+    reported_fitness: reported, replayed_fitness: replayed, absolute_difference: abs(reported - replayed),
+    predictions: inspect(predicted)}
+end)
+Chapter08.Tables.tabs(tbl_archives, [:version, :agent, :species, :neurons, :reported_fitness, :replayed_fitness, :absolute_difference, :predictions],
+  "ch_08_tbl_09_archives.csv")
+```
+
+Archive fitness replay is a diagnostic here, not an assertion that the network
+generalizes. The recurrent XOR protocol still uses the fixed source case order.
+Different tasks or morphologies may have incomparable fitness scales; do not merge
+their scores into one global ranking without a declared policy.
+
+#### Experiment 5 - operational failure is not poor fitness
+
+The next cell intentionally kills a neural worker. It catches the resulting
+operational error and closes the remaining owned processes. No evolutionary
+selection decision is made from that failure.
+
+```elixir
+failure_handle = Chapter08.Actor.start(Chapter08.Fixtures.seed(10, false))
+failure_detected = try do
+  victim = Map.fetch!(failure_handle.workers, 2)
+  ref = Enum.find_value(failure_handle.monitors, fn {ref, pid} -> if pid == victim, do: ref end)
+  Process.exit(victim, :kill)
+  receive do
+    {:DOWN, ^ref, :process, ^victim, :killed} -> :ok
+  after
+    5_000 -> raise "Failure injection did not terminate the worker"
+  end
+  try do
+    Chapter08.Actor.run(failure_handle, Chapter08.Functions.cases())
+    false
+  rescue
+    RuntimeError -> true
+  catch
+    :exit, _reason -> true
+  end
+after
+  Chapter08.Actor.stop(failure_handle)
+end
+
+tbl_failure = [Chapter08.Support.check!(failure_detected, "Dead worker is an operational failure, not a fitness score")]
+Chapter08.Tables.tabs(tbl_failure, [:check, :result], "ch_08_tbl_10_failure.csv")
+```
+
+#### Experiment 6 - optional Mnesia commit and rollback
+
+Set `run_storage_demo` to `true` only in a fresh runtime with no active Mnesia
+application. The experiment saves the population snapshot, checks it, deliberately
+aborts an incomplete write, and rejects an outdated version. It leaves the new
+database directory available for inspection. It does not delete a schema.
+
+A resumable checkpoint also needs the experiment configuration and tape position.
+Here the generation is the tape position, and the prepared tapes are included in
+the saved snapshot. `PopulationMonitor.run_from_snapshot/2` can resume a paused
+actor/hybrid boundary snapshot under its unchanged configuration and tapes; a
+completed snapshot remains complete. Extending a finished run is not implemented.
+This is intentionally bulky but unambiguous. A production
+system should store immutable tape files or a reproducible random-key schedule.
+
+```elixir
+run_storage_demo = false
+
+storage_output = if run_storage_demo do
+  directory = Path.join(System.tmp_dir!(), "neuroevolution_ch08_#{System.unique_integer([:positive])}")
+  {:ok, polis} = Chapter08.Polis.start_link(directory)
+  try do
+    snapshot = Map.merge(result_actor, %{config: config, tapes: host_tape})
+    {:atomic, 1} = GenServer.call(polis, {:save, "demo", snapshot, 0}, 30_000)
+    {:atomic, {1, loaded}} = GenServer.call(polis, {:load, "demo"}, 30_000)
+    {:aborted, :deliberate_test} = Chapter08.Store.abort_probe("demo")
+    {:atomic, leftovers} = :mnesia.transaction(fn -> :mnesia.read({:ch08_agent, {"demo", :incomplete}}) end)
+    stale = GenServer.call(polis, {:save, "demo", snapshot, 0}, 30_000)
+    tbl_storage = [
+      Chapter08.Support.check!(loaded == snapshot, "Snapshot round-trip includes archive and replay inputs"),
+      Chapter08.Support.check!(leftovers == [], "Aborted partial write leaves no record"),
+      Chapter08.Support.check!(stale == {:aborted, :stale_version}, "Stale snapshot writer is rejected")
+    ]
+    Kino.Layout.grid([
+      Kino.Text.new("Database directory: #{directory}"),
+      Chapter08.Tables.tabs(tbl_storage, [:check, :result], "ch_08_tbl_11_storage.csv")
+    ])
+  after
+    GenServer.stop(polis)
+  end
+else
+  Kino.Markdown.new("Mnesia demonstration skipped. Set `run_storage_demo = true` in a fresh runtime to run it.")
+end
+storage_output
+```
+
+## 8.6 Summary
+
+*Source: [S], pp. 345-346.*
+
+The source's main transition is complete: a single-network weight optimizer becomes
+a population-based topology-and-weight search. Its interfaces are still scapes,
+sensors, and actuators. Its new responsibilities are population ownership,
+structural mutation, constraints, and reproduction decisions.
+
+| Concept | What this notebook makes explicit |
+| --- | --- |
+| Generation | Clone an inherited design; apply a recorded sequence of valid mutations |
+| Evaluation | Run a declared episode; optionally tune weights; reset recurrent state |
+| Selection | Rank within constraints, allocate finite capacity, preserve a separate archive |
+| Actor execution | Signals and lifetimes are explicit processes |
+| Tensor execution | State and topology are explicit numerical arrays and masks |
+| Hybrid execution | Actors own coarse numerical jobs rather than individual multiply-adds |
+| Persistence | Commit coherent, PID-free experiment snapshots |
+
+The three implementations are alternatives under one declared computational
+contract. Their purpose is to reveal architectural tradeoffs, not to demonstrate
+that synthesis must beat both of its components.
+
+### Source audit and deliberate departures
+
+| Source location or issue | Treatment in this remaster |
+| --- | --- |
+| Broad mutation catalog, pp. 263-266 | Distinguish the catalog from the 12 worked operators; no implied implementation of pruning or crossover |
+| Record inconsistencies, pp. 241-258 | Use a coherent canonical table; derive reciprocal link lists; keep cloning identity separate from layer position |
+| Time-based floating IDs | Use qualified `{agent_id, slot}` identities |
+| Bias present versus bias value zero | Keep a separate presence mask |
+| Neuron weight perturbation range differs between catalog and listing | Follow executable listing: delta up to pi, saturation at two pi |
+| `mutate_af` fallback and omission from the later operator list | Reject an empty replacement set and include the described operator explicitly |
+| Actuator fan-in ordering during mutation | Use stable explicit ports and preserve a spliced channel |
+| Unbounded RIM retries | Bound attempts; roll back an incomplete RIM batch; report unmutated-clone fallback |
+| Planned fingerprint speciation versus implemented lineage grouping | Preserve parent species; fingerprints remain diagnostics |
+| `EFF` prose versus macro | Use macro value 0.05 |
+| Independent rounding in competition | Retain source rounding audit; use declared exact-size largest-remainder policy in comparisons |
+| `top3` alternative | Discussed by source but not used by this notebook; do not claim both selection strategies are implemented |
+| Innovation and evaluation counters | Separate best fitness, stagnant generations, and actual evaluations; include baseline and final evaluations |
+| Recurrent inbox reset | Use epochs, preparation acknowledgment, and explicit cycle gating instead of a catch-all mailbox flush |
+| Exoself persistent phenotype | Actor baseline rebuilds per proposal; hybrid retains a worker for a complete tuning job |
+| Arbitrary morphologies and unlimited growth | Execute a bounded two-channel XOR prototype; public worlds and capacity expansion remain outside scope |
+| Original XOR error called MSE | Retain the Chapter 7 printed score and name it accurately |
+
+### What has and has not been validated
+
+The authoring checks ran **50 independent Python/NumPy checks**, including
+**4,000 random mutation attempts followed by scalar-versus-dense recurrent
+rollout comparisons** and **1,000 random offspring-allocation cases**.
+All 12 operators were exercised successfully in those reference tests. Separate
+control-flow tests covered strict acceptance, local patience, evaluation budgets,
+archive retention, stagnation, and fresh offspring IDs.
+These use independent reference code and a different random generator, not an
+execution or proof of the Elixir implementation.
+
+The notebook itself contains operator-parity, activation-parity, clone, capacity,
+rollback, recurrent-memory, epoch, duplicate-signal, cleanup, and allocation tests.
+The Mnesia tests are opt-in. **Actual Elixir/Nx and Livebook execution remains
+unverified here.** Static checks cannot establish correctness of OTP scheduling,
+backend execution, or disk recovery.
+
+### Exercises for Chapter 9
+
+| Exercise | Question to investigate |
+| --- | --- |
+| Repeated mutation testing | Does every operator preserve graph invariants across many seeds? |
+| Recurrent XOR | Does changing case order alter the result? What happens with per-row reset? |
+| Capacity pressure | How often does a mutation fail because no slots remain? |
+| Genetic versus memetic | With an equal evaluation budget, what changes when local tuning is disabled? |
+| Complexity pressure | How do neuron count and raw fitness change when efficiency is zero? |
+| Architecture comparison | Which cost comes from computation, packing, process creation, or communication? |
+| Checkpoint protocol | Can a resumed boundary snapshot reproduce the remaining recorded experiment? |
+
+**Next:** Chapter 9 tests the operators and the platform in greater depth.
+As Sher emphasizes, a successful evolutionary run can conceal an implementation
+error: the population may exploit other operators instead of exposing the broken one.
+
+## 8.7 Reference and adaptation notes
+
+**[S]** Gene I. Sher. *Handbook of Neuroevolution Through Erlang*. Springer, 2013.
+Chapter 8, "Developing a Simple Neuroevolutionary Platform," pp. 229-346.
+DOI: `10.1007/978-1-4614-4463-3_8`.
+
+The source's final reference is to the Khepera robot (`k-team.com`). It supplies
+context for morphology examples; this notebook does not implement that robot.
+
+The original Erlang source is separately published at
+[CorticalComputer/Book_NeuroevolutionThroughErlang](https://github.com/CorticalComputer/Book_NeuroevolutionThroughErlang/tree/master/Ch_8).
+Its source headers identify **Gene Sher / DXNN Research Group, Copyright (C) 2012**
+and **GNU GPL version 3**. Source-derived executable code here is distributed under
+**GPL-3.0-only**, with the above modification notice. This does not relicense the
+textbook or establish permission to redistribute its prose or scanned figures.
+No textbook page images are embedded in this notebook.
+
+| Key | Official implementation source | Used for |
+| --- | --- | --- |
+| D1 | [Nx 1.0.0](https://nx.hexdocs.pm/1.0.0/Nx.html) | Tensor shapes, indexing, broadcasting, masks |
+| D2 | [Nx.Defn](https://nx.hexdocs.pm/1.0.0/Nx.Defn.html) and [Nx.Defn.Kernel](https://nx.hexdocs.pm/1.0.0/Nx.Defn.Kernel.html) | Numerical control flow, transforms, process-local options |
+| D3 | [Mnesia](https://www.erlang.org/doc/apps/mnesia/mnesia.html) | Transactions, retries, persistence operations |
+| D4 | [GenServer](https://hexdocs.pm/elixir/GenServer.html), [DynamicSupervisor](https://hexdocs.pm/elixir/DynamicSupervisor.html), [Task.Supervisor](https://hexdocs.pm/elixir/Task.Supervisor.html) | Process ownership, monitored jobs, lifecycle |
+| D5 | [Kino.Layout](https://kino.hexdocs.pm/Kino.Layout.html) and [Kino.DataTable](https://kino.hexdocs.pm/Kino.DataTable.html) | Three-tab data-table presentation |
+| D6 | [GNU GPL v3](https://www.gnu.org/licenses/gpl-3.0.html) | License for source-derived executable code |
+
+Documentation was checked during preparation of this remaster. The source PDF
+remains the basis for chapter organization and algorithm discussion; modern
+implementation choices and their limitations are labeled throughout.
+
+**End of Chapter 8.**
+
+<!--
+Full license copy for the executable code (GPL-3.0-only).
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+                            Preamble
+
+  The GNU General Public License is a free, copyleft license for
+software and other kinds of works.
+
+  The licenses for most software and other practical works are designed
+to take away your freedom to share and change the works.  By contrast,
+the GNU General Public License is intended to guarantee your freedom to
+share and change all versions of a program--to make sure it remains free
+software for all its users.  We, the Free Software Foundation, use the
+GNU General Public License for most of our software; it applies also to
+any other work released this way by its authors.  You can apply it to
+your programs, too.
+
+  When we speak of free software, we are referring to freedom, not
+price.  Our General Public Licenses are designed to make sure that you
+have the freedom to distribute copies of free software (and charge for
+them if you wish), that you receive source code or can get it if you
+want it, that you can change the software or use pieces of it in new
+free programs, and that you know you can do these things.
+
+  To protect your rights, we need to prevent others from denying you
+these rights or asking you to surrender the rights.  Therefore, you have
+certain responsibilities if you distribute copies of the software, or if
+you modify it: responsibilities to respect the freedom of others.
+
+  For example, if you distribute copies of such a program, whether
+gratis or for a fee, you must pass on to the recipients the same
+freedoms that you received.  You must make sure that they, too, receive
+or can get the source code.  And you must show them these terms so they
+know their rights.
+
+  Developers that use the GNU GPL protect your rights with two steps:
+(1) assert copyright on the software, and (2) offer you this License
+giving you legal permission to copy, distribute and/or modify it.
+
+  For the developers' and authors' protection, the GPL clearly explains
+that there is no warranty for this free software.  For both users' and
+authors' sake, the GPL requires that modified versions be marked as
+changed, so that their problems will not be attributed erroneously to
+authors of previous versions.
+
+  Some devices are designed to deny users access to install or run
+modified versions of the software inside them, although the manufacturer
+can do so.  This is fundamentally incompatible with the aim of
+protecting users' freedom to change the software.  The systematic
+pattern of such abuse occurs in the area of products for individuals to
+use, which is precisely where it is most unacceptable.  Therefore, we
+have designed this version of the GPL to prohibit the practice for those
+products.  If such problems arise substantially in other domains, we
+stand ready to extend this provision to those domains in future versions
+of the GPL, as needed to protect the freedom of users.
+
+  Finally, every program is threatened constantly by software patents.
+States should not allow patents to restrict development and use of
+software on general-purpose computers, but in those that do, we wish to
+avoid the special danger that patents applied to a free program could
+make it effectively proprietary.  To prevent this, the GPL assures that
+patents cannot be used to render the program non-free.
+
+  The precise terms and conditions for copying, distribution and
+modification follow.
+
+                       TERMS AND CONDITIONS
+
+  0. Definitions.
+
+  "This License" refers to version 3 of the GNU General Public License.
+
+  "Copyright" also means copyright-like laws that apply to other kinds of
+works, such as semiconductor masks.
+
+  "The Program" refers to any copyrightable work licensed under this
+License.  Each licensee is addressed as "you".  "Licensees" and
+"recipients" may be individuals or organizations.
+
+  To "modify" a work means to copy from or adapt all or part of the work
+in a fashion requiring copyright permission, other than the making of an
+exact copy.  The resulting work is called a "modified version" of the
+earlier work or a work "based on" the earlier work.
+
+  A "covered work" means either the unmodified Program or a work based
+on the Program.
+
+  To "propagate" a work means to do anything with it that, without
+permission, would make you directly or secondarily liable for
+infringement under applicable copyright law, except executing it on a
+computer or modifying a private copy.  Propagation includes copying,
+distribution (with or without modification), making available to the
+public, and in some countries other activities as well.
+
+  To "convey" a work means any kind of propagation that enables other
+parties to make or receive copies.  Mere interaction with a user through
+a computer network, with no transfer of a copy, is not conveying.
+
+  An interactive user interface displays "Appropriate Legal Notices"
+to the extent that it includes a convenient and prominently visible
+feature that (1) displays an appropriate copyright notice, and (2)
+tells the user that there is no warranty for the work (except to the
+extent that warranties are provided), that licensees may convey the
+work under this License, and how to view a copy of this License.  If
+the interface presents a list of user commands or options, such as a
+menu, a prominent item in the list meets this criterion.
+
+  1. Source Code.
+
+  The "source code" for a work means the preferred form of the work
+for making modifications to it.  "Object code" means any non-source
+form of a work.
+
+  A "Standard Interface" means an interface that either is an official
+standard defined by a recognized standards body, or, in the case of
+interfaces specified for a particular programming language, one that
+is widely used among developers working in that language.
+
+  The "System Libraries" of an executable work include anything, other
+than the work as a whole, that (a) is included in the normal form of
+packaging a Major Component, but which is not part of that Major
+Component, and (b) serves only to enable use of the work with that
+Major Component, or to implement a Standard Interface for which an
+implementation is available to the public in source code form.  A
+"Major Component", in this context, means a major essential component
+(kernel, window system, and so on) of the specific operating system
+(if any) on which the executable work runs, or a compiler used to
+produce the work, or an object code interpreter used to run it.
+
+  The "Corresponding Source" for a work in object code form means all
+the source code needed to generate, install, and (for an executable
+work) run the object code and to modify the work, including scripts to
+control those activities.  However, it does not include the work's
+System Libraries, or general-purpose tools or generally available free
+programs which are used unmodified in performing those activities but
+which are not part of the work.  For example, Corresponding Source
+includes interface definition files associated with source files for
+the work, and the source code for shared libraries and dynamically
+linked subprograms that the work is specifically designed to require,
+such as by intimate data communication or control flow between those
+subprograms and other parts of the work.
+
+  The Corresponding Source need not include anything that users
+can regenerate automatically from other parts of the Corresponding
+Source.
+
+  The Corresponding Source for a work in source code form is that
+same work.
+
+  2. Basic Permissions.
+
+  All rights granted under this License are granted for the term of
+copyright on the Program, and are irrevocable provided the stated
+conditions are met.  This License explicitly affirms your unlimited
+permission to run the unmodified Program.  The output from running a
+covered work is covered by this License only if the output, given its
+content, constitutes a covered work.  This License acknowledges your
+rights of fair use or other equivalent, as provided by copyright law.
+
+  You may make, run and propagate covered works that you do not
+convey, without conditions so long as your license otherwise remains
+in force.  You may convey covered works to others for the sole purpose
+of having them make modifications exclusively for you, or provide you
+with facilities for running those works, provided that you comply with
+the terms of this License in conveying all material for which you do
+not control copyright.  Those thus making or running the covered works
+for you must do so exclusively on your behalf, under your direction
+and control, on terms that prohibit them from making any copies of
+your copyrighted material outside their relationship with you.
+
+  Conveying under any other circumstances is permitted solely under
+the conditions stated below.  Sublicensing is not allowed; section 10
+makes it unnecessary.
+
+  3. Protecting Users' Legal Rights From Anti-Circumvention Law.
+
+  No covered work shall be deemed part of an effective technological
+measure under any applicable law fulfilling obligations under article
+11 of the WIPO copyright treaty adopted on 20 December 1996, or
+similar laws prohibiting or restricting circumvention of such
+measures.
+
+  When you convey a covered work, you waive any legal power to forbid
+circumvention of technological measures to the extent such circumvention
+is effected by exercising rights under this License with respect to
+the covered work, and you disclaim any intention to limit operation or
+modification of the work as a means of enforcing, against the work's
+users, your or third parties' legal rights to forbid circumvention of
+technological measures.
+
+  4. Conveying Verbatim Copies.
+
+  You may convey verbatim copies of the Program's source code as you
+receive it, in any medium, provided that you conspicuously and
+appropriately publish on each copy an appropriate copyright notice;
+keep intact all notices stating that this License and any
+non-permissive terms added in accord with section 7 apply to the code;
+keep intact all notices of the absence of any warranty; and give all
+recipients a copy of this License along with the Program.
+
+  You may charge any price or no price for each copy that you convey,
+and you may offer support or warranty protection for a fee.
+
+  5. Conveying Modified Source Versions.
+
+  You may convey a work based on the Program, or the modifications to
+produce it from the Program, in the form of source code under the
+terms of section 4, provided that you also meet all of these conditions:
+
+    a) The work must carry prominent notices stating that you modified
+    it, and giving a relevant date.
+
+    b) The work must carry prominent notices stating that it is
+    released under this License and any conditions added under section
+    7.  This requirement modifies the requirement in section 4 to
+    "keep intact all notices".
+
+    c) You must license the entire work, as a whole, under this
+    License to anyone who comes into possession of a copy.  This
+    License will therefore apply, along with any applicable section 7
+    additional terms, to the whole of the work, and all its parts,
+    regardless of how they are packaged.  This License gives no
+    permission to license the work in any other way, but it does not
+    invalidate such permission if you have separately received it.
+
+    d) If the work has interactive user interfaces, each must display
+    Appropriate Legal Notices; however, if the Program has interactive
+    interfaces that do not display Appropriate Legal Notices, your
+    work need not make them do so.
+
+  A compilation of a covered work with other separate and independent
+works, which are not by their nature extensions of the covered work,
+and which are not combined with it such as to form a larger program,
+in or on a volume of a storage or distribution medium, is called an
+"aggregate" if the compilation and its resulting copyright are not
+used to limit the access or legal rights of the compilation's users
+beyond what the individual works permit.  Inclusion of a covered work
+in an aggregate does not cause this License to apply to the other
+parts of the aggregate.
+
+  6. Conveying Non-Source Forms.
+
+  You may convey a covered work in object code form under the terms
+of sections 4 and 5, provided that you also convey the
+machine-readable Corresponding Source under the terms of this License,
+in one of these ways:
+
+    a) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by the
+    Corresponding Source fixed on a durable physical medium
+    customarily used for software interchange.
+
+    b) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by a
+    written offer, valid for at least three years and valid for as
+    long as you offer spare parts or customer support for that product
+    model, to give anyone who possesses the object code either (1) a
+    copy of the Corresponding Source for all the software in the
+    product that is covered by this License, on a durable physical
+    medium customarily used for software interchange, for a price no
+    more than your reasonable cost of physically performing this
+    conveying of source, or (2) access to copy the
+    Corresponding Source from a network server at no charge.
+
+    c) Convey individual copies of the object code with a copy of the
+    written offer to provide the Corresponding Source.  This
+    alternative is allowed only occasionally and noncommercially, and
+    only if you received the object code with such an offer, in accord
+    with subsection 6b.
+
+    d) Convey the object code by offering access from a designated
+    place (gratis or for a charge), and offer equivalent access to the
+    Corresponding Source in the same way through the same place at no
+    further charge.  You need not require recipients to copy the
+    Corresponding Source along with the object code.  If the place to
+    copy the object code is a network server, the Corresponding Source
+    may be on a different server (operated by you or a third party)
+    that supports equivalent copying facilities, provided you maintain
+    clear directions next to the object code saying where to find the
+    Corresponding Source.  Regardless of what server hosts the
+    Corresponding Source, you remain obligated to ensure that it is
+    available for as long as needed to satisfy these requirements.
+
+    e) Convey the object code using peer-to-peer transmission, provided
+    you inform other peers where the object code and Corresponding
+    Source of the work are being offered to the general public at no
+    charge under subsection 6d.
+
+  A separable portion of the object code, whose source code is excluded
+from the Corresponding Source as a System Library, need not be
+included in conveying the object code work.
+
+  A "User Product" is either (1) a "consumer product", which means any
+tangible personal property which is normally used for personal, family,
+or household purposes, or (2) anything designed or sold for incorporation
+into a dwelling.  In determining whether a product is a consumer product,
+doubtful cases shall be resolved in favor of coverage.  For a particular
+product received by a particular user, "normally used" refers to a
+typical or common use of that class of product, regardless of the status
+of the particular user or of the way in which the particular user
+actually uses, or expects or is expected to use, the product.  A product
+is a consumer product regardless of whether the product has substantial
+commercial, industrial or non-consumer uses, unless such uses represent
+the only significant mode of use of the product.
+
+  "Installation Information" for a User Product means any methods,
+procedures, authorization keys, or other information required to install
+and execute modified versions of a covered work in that User Product from
+a modified version of its Corresponding Source.  The information must
+suffice to ensure that the continued functioning of the modified object
+code is in no case prevented or interfered with solely because
+modification has been made.
+
+  If you convey an object code work under this section in, or with, or
+specifically for use in, a User Product, and the conveying occurs as
+part of a transaction in which the right of possession and use of the
+User Product is transferred to the recipient in perpetuity or for a
+fixed term (regardless of how the transaction is characterized), the
+Corresponding Source conveyed under this section must be accompanied
+by the Installation Information.  But this requirement does not apply
+if neither you nor any third party retains the ability to install
+modified object code on the User Product (for example, the work has
+been installed in ROM).
+
+  The requirement to provide Installation Information does not include a
+requirement to continue to provide support service, warranty, or updates
+for a work that has been modified or installed by the recipient, or for
+the User Product in which it has been modified or installed.  Access to a
+network may be denied when the modification itself materially and
+adversely affects the operation of the network or violates the rules and
+protocols for communication across the network.
+
+  Corresponding Source conveyed, and Installation Information provided,
+in accord with this section must be in a format that is publicly
+documented (and with an implementation available to the public in
+source code form), and must require no special password or key for
+unpacking, reading or copying.
+
+  7. Additional Terms.
+
+  "Additional permissions" are terms that supplement the terms of this
+License by making exceptions from one or more of its conditions.
+Additional permissions that are applicable to the entire Program shall
+be treated as though they were included in this License, to the extent
+that they are valid under applicable law.  If additional permissions
+apply only to part of the Program, that part may be used separately
+under those permissions, but the entire Program remains governed by
+this License without regard to the additional permissions.
+
+  When you convey a copy of a covered work, you may at your option
+remove any additional permissions from that copy, or from any part of
+it.  (Additional permissions may be written to require their own
+removal in certain cases when you modify the work.)  You may place
+additional permissions on material, added by you to a covered work,
+for which you have or can give appropriate copyright permission.
+
+  Notwithstanding any other provision of this License, for material you
+add to a covered work, you may (if authorized by the copyright holders of
+that material) supplement the terms of this License with terms:
+
+    a) Disclaiming warranty or limiting liability differently from the
+    terms of sections 15 and 16 of this License; or
+
+    b) Requiring preservation of specified reasonable legal notices or
+    author attributions in that material or in the Appropriate Legal
+    Notices displayed by works containing it; or
+
+    c) Prohibiting misrepresentation of the origin of that material, or
+    requiring that modified versions of such material be marked in
+    reasonable ways as different from the original version; or
+
+    d) Limiting the use for publicity purposes of names of licensors or
+    authors of the material; or
+
+    e) Declining to grant rights under trademark law for use of some
+    trade names, trademarks, or service marks; or
+
+    f) Requiring indemnification of licensors and authors of that
+    material by anyone who conveys the material (or modified versions of
+    it) with contractual assumptions of liability to the recipient, for
+    any liability that these contractual assumptions directly impose on
+    those licensors and authors.
+
+  All other non-permissive additional terms are considered "further
+restrictions" within the meaning of section 10.  If the Program as you
+received it, or any part of it, contains a notice stating that it is
+governed by this License along with a term that is a further
+restriction, you may remove that term.  If a license document contains
+a further restriction but permits relicensing or conveying under this
+License, you may add to a covered work material governed by the terms
+of that license document, provided that the further restriction does
+not survive such relicensing or conveying.
+
+  If you add terms to a covered work in accord with this section, you
+must place, in the relevant source files, a statement of the
+additional terms that apply to those files, or a notice indicating
+where to find the applicable terms.
+
+  Additional terms, permissive or non-permissive, may be stated in the
+form of a separately written license, or stated as exceptions;
+the above requirements apply either way.
+
+  8. Termination.
+
+  You may not propagate or modify a covered work except as expressly
+provided under this License.  Any attempt otherwise to propagate or
+modify it is void, and will automatically terminate your rights under
+this License (including any patent licenses granted under the third
+paragraph of section 11).
+
+  However, if you cease all violation of this License, then your
+license from a particular copyright holder is reinstated (a)
+provisionally, unless and until the copyright holder explicitly and
+finally terminates your license, and (b) permanently, if the copyright
+holder fails to notify you of the violation by some reasonable means
+prior to 60 days after the cessation.
+
+  Moreover, your license from a particular copyright holder is
+reinstated permanently if the copyright holder notifies you of the
+violation by some reasonable means, this is the first time you have
+received notice of violation of this License (for any work) from that
+copyright holder, and you cure the violation prior to 30 days after
+your receipt of the notice.
+
+  Termination of your rights under this section does not terminate the
+licenses of parties who have received copies or rights from you under
+this License.  If your rights have been terminated and not permanently
+reinstated, you do not qualify to receive new licenses for the same
+material under section 10.
+
+  9. Acceptance Not Required for Having Copies.
+
+  You are not required to accept this License in order to receive or
+run a copy of the Program.  Ancillary propagation of a covered work
+occurring solely as a consequence of using peer-to-peer transmission
+to receive a copy likewise does not require acceptance.  However,
+nothing other than this License grants you permission to propagate or
+modify any covered work.  These actions infringe copyright if you do
+not accept this License.  Therefore, by modifying or propagating a
+covered work, you indicate your acceptance of this License to do so.
+
+  10. Automatic Licensing of Downstream Recipients.
+
+  Each time you convey a covered work, the recipient automatically
+receives a license from the original licensors, to run, modify and
+propagate that work, subject to this License.  You are not responsible
+for enforcing compliance by third parties with this License.
+
+  An "entity transaction" is a transaction transferring control of an
+organization, or substantially all assets of one, or subdividing an
+organization, or merging organizations.  If propagation of a covered
+work results from an entity transaction, each party to that
+transaction who receives a copy of the work also receives whatever
+licenses to the work the party's predecessor in interest had or could
+give under the previous paragraph, plus a right to possession of the
+Corresponding Source of the work from the predecessor in interest, if
+the predecessor has it or can get it with reasonable efforts.
+
+  You may not impose any further restrictions on the exercise of the
+rights granted or affirmed under this License.  For example, you may
+not impose a license fee, royalty, or other charge for exercise of
+rights granted under this License, and you may not initiate litigation
+(including a cross-claim or counterclaim in a lawsuit) alleging that
+any patent claim is infringed by making, using, selling, offering for
+sale, or importing the Program or any portion of it.
+
+  11. Patents.
+
+  A "contributor" is a copyright holder who authorizes use under this
+License of the Program or a work on which the Program is based.  The
+work thus licensed is called the contributor's "contributor version".
+
+  A contributor's "essential patent claims" are all patent claims
+owned or controlled by the contributor, whether already acquired or
+hereafter acquired, that would be infringed by some manner, permitted
+by this License, of making, using, or selling its contributor version,
+but do not include claims that would be infringed only as a
+consequence of further modification of the contributor version.  For
+purposes of this definition, "control" includes the right to grant
+patent sublicenses in a manner consistent with the requirements of
+this License.
+
+  Each contributor grants you a non-exclusive, worldwide, royalty-free
+patent license under the contributor's essential patent claims, to
+make, use, sell, offer for sale, import and otherwise run, modify and
+propagate the contents of its contributor version.
+
+  In the following three paragraphs, a "patent license" is any express
+agreement or commitment, however denominated, not to enforce a patent
+(such as an express permission to practice a patent or covenant not to
+sue for patent infringement).  To "grant" such a patent license to a
+party means to make such an agreement or commitment not to enforce a
+patent against the party.
+
+  If you convey a covered work, knowingly relying on a patent license,
+and the Corresponding Source of the work is not available for anyone
+to copy, free of charge and under the terms of this License, through a
+publicly available network server or other readily accessible means,
+then you must either (1) cause the Corresponding Source to be so
+available, or (2) arrange to deprive yourself of the benefit of the
+patent license for this particular work, or (3) arrange, in a manner
+consistent with the requirements of this License, to extend the patent
+license to downstream recipients.  "Knowingly relying" means you have
+actual knowledge that, but for the patent license, your conveying the
+covered work in a country, or your recipient's use of the covered work
+in a country, would infringe one or more identifiable patents in that
+country that you have reason to believe are valid.
+
+  If, pursuant to or in connection with a single transaction or
+arrangement, you convey, or propagate by procuring conveyance of, a
+covered work, and grant a patent license to some of the parties
+receiving the covered work authorizing them to use, propagate, modify
+or convey a specific copy of the covered work, then the patent license
+you grant is automatically extended to all recipients of the covered
+work and works based on it.
+
+  A patent license is "discriminatory" if it does not include within
+the scope of its coverage, prohibits the exercise of, or is
+conditioned on the non-exercise of one or more of the rights that are
+specifically granted under this License.  You may not convey a covered
+work if you are a party to an arrangement with a third party that is
+in the business of distributing software, under which you make payment
+to the third party based on the extent of your activity of conveying
+the work, and under which the third party grants, to any of the
+parties who would receive the covered work from you, a discriminatory
+patent license (a) in connection with copies of the covered work
+conveyed by you (or copies made from those copies), or (b) primarily
+for and in connection with specific products or compilations that
+contain the covered work, unless you entered into that arrangement,
+or that patent license was granted, prior to 28 March 2007.
+
+  Nothing in this License shall be construed as excluding or limiting
+any implied license or other defenses to infringement that may
+otherwise be available to you under applicable patent law.
+
+  12. No Surrender of Others' Freedom.
+
+  If conditions are imposed on you (whether by court order, agreement or
+otherwise) that contradict the conditions of this License, they do not
+excuse you from the conditions of this License.  If you cannot convey a
+covered work so as to satisfy simultaneously your obligations under this
+License and any other pertinent obligations, then as a consequence you may
+not convey it at all.  For example, if you agree to terms that obligate you
+to collect a royalty for further conveying from those to whom you convey
+the Program, the only way you could satisfy both those terms and this
+License would be to refrain entirely from conveying the Program.
+
+  13. Use with the GNU Affero General Public License.
+
+  Notwithstanding any other provision of this License, you have
+permission to link or combine any covered work with a work licensed
+under version 3 of the GNU Affero General Public License into a single
+combined work, and to convey the resulting work.  The terms of this
+License will continue to apply to the part which is the covered work,
+but the special requirements of the GNU Affero General Public License,
+section 13, concerning interaction through a network will apply to the
+combination as such.
+
+  14. Revised Versions of this License.
+
+  The Free Software Foundation may publish revised and/or new versions of
+the GNU General Public License from time to time.  Such new versions will
+be similar in spirit to the present version, but may differ in detail to
+address new problems or concerns.
+
+  Each version is given a distinguishing version number.  If the
+Program specifies that a certain numbered version of the GNU General
+Public License "or any later version" applies to it, you have the
+option of following the terms and conditions either of that numbered
+version or of any later version published by the Free Software
+Foundation.  If the Program does not specify a version number of the
+GNU General Public License, you may choose any version ever published
+by the Free Software Foundation.
+
+  If the Program specifies that a proxy can decide which future
+versions of the GNU General Public License can be used, that proxy's
+public statement of acceptance of a version permanently authorizes you
+to choose that version for the Program.
+
+  Later license versions may give you additional or different
+permissions.  However, no additional obligations are imposed on any
+author or copyright holder as a result of your choosing to follow a
+later version.
+
+  15. Disclaimer of Warranty.
+
+  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
+APPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
+HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
+OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM
+IS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF
+ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
+
+  16. Limitation of Liability.
+
+  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
+THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
+GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF
+DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD
+PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),
+EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES.
+
+  17. Interpretation of Sections 15 and 16.
+
+  If the disclaimer of warranty and limitation of liability provided
+above cannot be given local legal effect according to their terms,
+reviewing courts shall apply local law that most closely approximates
+an absolute waiver of all civil liability in connection with the
+Program, unless a warranty or assumption of liability accompanies a
+copy of the Program in return for a fee.
+
+                     END OF TERMS AND CONDITIONS
+
+            How to Apply These Terms to Your New Programs
+
+  If you develop a new program, and you want it to be of the greatest
+possible use to the public, the best way to achieve this is to make it
+free software which everyone can redistribute and change under these terms.
+
+  To do so, attach the following notices to the program.  It is safest
+to attach them to the start of each source file to most effectively
+state the exclusion of warranty; and each file should have at least
+the "copyright" line and a pointer to where the full notice is found.
+
+    <one line to give the program's name and a brief idea of what it does.>
+    Copyright (C) <year>  <name of author>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Also add information on how to contact you by electronic and paper mail.
+
+  If the program does terminal interaction, make it output a short
+notice like this when it starts in an interactive mode:
+
+    <program>  Copyright (C) <year>  <name of author>
+    This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.
+    This is free software, and you are welcome to redistribute it
+    under certain conditions; type `show c' for details.
+
+The hypothetical commands `show w' and `show c' should show the appropriate
+parts of the General Public License.  Of course, your program's commands
+might be different; for a GUI interface, you would use an "about box".
+
+  You should also get your employer (if you work as a programmer) or school,
+if any, to sign a "copyright disclaimer" for the program, if necessary.
+For more information on this, and how to apply and follow the GNU GPL, see
+<https://www.gnu.org/licenses/>.
+
+  The GNU General Public License does not permit incorporating your program
+into proprietary programs.  If your program is a subroutine library, you
+may consider it more useful to permit linking proprietary applications with
+the library.  If this is what you want to do, use the GNU Lesser General
+Public License instead of this License.  But first, please read
+<https://www.gnu.org/licenses/why-not-lgpl.html>.
+
+-->
+
